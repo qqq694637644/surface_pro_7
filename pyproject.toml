@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sp7-powerlab"
+version = "0.2.0"
+description = "Reproducible Surface Pro 7 Linux battery-life experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "surface_pro_7 contributors" }]
+dependencies = []
+
+[project.scripts]
+sp7-powerlab = "sp7_powerlab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+experiments/*
+!experiments/.gitkeep
+powerlab.sqlite3
+.powerlab-active
+*.log
