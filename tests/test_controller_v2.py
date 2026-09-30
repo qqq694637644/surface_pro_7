@@ -180,3 +180,59 @@ def test_active_trial_blocks_normal_controller(project_root):
         assert not actuator.applied
     finally:
         db.close()
+
+
+def test_reconcile_clears_stale_sqlite_envelope_and_reapplies(project_root):
+    _config, db, _registry, actuator, controller = make_controller(project_root)
+    try:
+        db.set_meta("current_envelope", "INTERACTIVE_EFFICIENT")
+        actuator.state = {
+            "epp": {"policy0": "balance_power"},
+            "max_perf_pct": 40,
+            "turbo": True,
+        }
+        matched = controller.reconcile_actual_state("test drift")
+        assert matched is None
+        assert controller.current_envelope() is None
+
+        decision = controller.step(
+            sample(max_perf_pct=40),
+            demand(),
+            thermal(),
+        )
+        assert decision.action == "APPLIED"
+        assert actuator.state["max_perf_pct"] == 60
+        assert controller.current_envelope() == "INTERACTIVE_EFFICIENT"
+    finally:
+        db.close()
+
+
+def test_reconcile_matches_real_verified_hwp_state(project_root):
+    _config, db, _registry, actuator, controller = make_controller(project_root)
+    try:
+        db.set_meta("current_envelope", "INTERACTIVE_EFFICIENT")
+        actuator.state = {
+            "epp": {"policy0": "balance_power"},
+            "max_perf_pct": 50,
+            "turbo": True,
+        }
+        matched = controller.reconcile_actual_state("startup")
+        assert matched == "REMOTE_EFFICIENT"
+        assert controller.current_envelope() == "REMOTE_EFFICIENT"
+    finally:
+        db.close()
+
+
+def test_reconcile_does_not_guess_between_identical_verified_envelopes(project_root):
+    _config, db, _registry, actuator, controller = make_controller(project_root)
+    try:
+        db.set_meta("current_envelope", "INTERACTIVE_EFFICIENT")
+        actuator.state = {
+            "epp": {"policy0": "power"},
+            "max_perf_pct": 30,
+            "turbo": False,
+        }
+        assert controller.reconcile_actual_state("startup") is None
+        assert controller.current_envelope() is None
+    finally:
+        db.close()

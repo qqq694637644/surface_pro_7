@@ -1,12 +1,27 @@
 # MCP contract
 
-外部 Bash MCP 推荐每小时运行：
+## Capability boundary
+
+PowerLab 不允许把任意 Bash、Python/code execution、主 `sp7-powerlab` CLI 或
+`/run/sp7-powerlab/helper.sock` 暴露给 LLM。
+
+LLM/MCP 只应得到一个显式白名单工具面，后端只能调用：
 
 ~~~bash
-bash scripts/mcp-hourly.sh
+sp7-powerlab-agent observe
+sp7-powerlab-agent hourly
+sp7-powerlab-agent submit-decision runtime/llm-decision.json
 ~~~
 
-LLM 返回结构化 JSON。
+`scripts/mcp-hourly.sh` 也只调用这个 agent executable。agent 不接受 alternate config，
+`hourly` 不接受任意 output path，`submit-decision` 只允许读取项目 `runtime/` 下的 JSON。
+
+如果一个 MCP 能以 PowerLab 用户身份执行任意命令，那么它可以直接调用人类 CLI 或
+连接同 UID 的 helper socket；此时不存在可信的“人工批准”隔离。不要这样部署。
+
+## Decision contract
+
+LLM 返回结构化 JSON。它没有 human approval 字段。
 
 普通 no-op：
 
@@ -28,11 +43,7 @@ Envelope trial：
     "proposal": {
       "kind": "envelope",
       "baseline_envelope": "INTERACTIVE_EFFICIENT",
-      "changes": {"max_perf_pct": 50},
-      "validation": {
-        "min_block_seconds": 300,
-        "min_power_saving_w": 0.1
-      }
+      "changes": {"max_perf_pct": 50}
     }
   }
 }
@@ -54,22 +65,33 @@ Envelope trial：
 }
 ~~~
 
-应用：
+提交：
 
 ~~~bash
-sp7-powerlab llm-apply decision.json
+sp7-powerlab-agent submit-decision runtime/llm-decision.json
 ~~~
 
-LLM JSON 不能表达 shell command、任意 sysfs path、thermald hard trip、kernel cmdline 或 root command。
+LLM JSON 不能表达 shell command、任意 sysfs path、thermald hard trip、kernel cmdline
+或 root command。实验 JSON 会在运行时经过 packaged JSON Schema；实验 target、trial
+ID 和全部 validation/settling/通过门槛都只由本地代码与 config 生成，proposal 无权
+覆盖裁判标准。
 
-Level 2 的人工批准不是 JSON 字段，而是独立 CLI 动作：
+## Human approval
+
+Level 2 时，`submit-decision` 只把合法 proposal 保存到 `proposals/`，不会开始
+trial。用户审核文件后，在 LLM 不可访问的交互环境运行：
 
 ~~~bash
-sp7-powerlab llm-apply decision.json --approve
+sp7-powerlab trial start proposals/<reviewed-proposal>.json
 ~~~
 
-因此 LLM 无法在自己的 decision JSON 中伪造“已批准”。
+`VERIFIED_WINNER` 的人工 promotion 同样使用：
+
+~~~bash
+sp7-powerlab trial promote trial-xxxx
+~~~
 
 PROPOSE_WASTE_FIX 和 PROPOSE_MANUAL_RECALIBRATION 只会保存成人工审核文件。
 
-自动 trial 需要 automation level >= 3；auto promotion 还要求 level >= 4、auto_promote=true，而且 trial 已经是 VERIFIED_WINNER。
+自动 trial 需要 automation level >= 3；auto promotion 还要求 level >= 4、
+auto_promote=true，而且 trial 已经是 VERIFIED_WINNER。

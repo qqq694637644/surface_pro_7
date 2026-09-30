@@ -1,4 +1,7 @@
+import time
 from pathlib import Path
+
+import pytest
 
 from sp7_powerlab.calibration import CalibrationManager
 from sp7_powerlab.config import load_config, load_machine
@@ -105,5 +108,109 @@ def test_invalidation_resets_phase_order_even_with_old_db_history(project_root: 
             assert "cold_idle" in str(exc)
         else:
             raise AssertionError("invalidated calibration must restart phase order")
+    finally:
+        db.close()
+
+
+def add_calibration_row(db, ts, *, status, power, sensor="/sys/package"):
+    db.add_sample(
+        {
+            "ts": ts,
+            "wall_ts": str(ts),
+            "battery_status": status,
+            "battery_pct": 80,
+            "battery_power_w": power,
+            "battery_energy_wh": 30,
+            "battery_epoch": 1,
+            "package_temp_c": 35.0,
+            "thermal_sensor_path": sensor,
+            "temp_slope_c_per_min": -0.1,
+            "rapl_power_60s_w": 1.5,
+            "user_active": False,
+            "media_playing": False,
+            "resume_grace": False,
+        }
+    )
+
+
+def calibration_with_minimum(project_root: Path, seconds: int):
+    path = project_root / "config/powerlab.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "cold_idle_min_seconds = 0",
+            f"cold_idle_min_seconds = {seconds}",
+        ),
+        encoding="utf-8",
+    )
+    db = Database(project_root / "runtime/calibration-duration.sqlite3")
+    return db, CalibrationManager(project_root, db, load_config(project_root))
+
+
+def test_calibration_requires_valid_discharging_duration(project_root: Path):
+    db, manager = calibration_with_minimum(project_root, 20)
+    try:
+        active = manager.start("cold_idle")
+        start = time.time() - 100
+        db.conn.execute(
+            "UPDATE calibration_runs SET start_ts=? WHERE run_id=?",
+            (start, active["run_id"]),
+        )
+        db.conn.commit()
+        for offset in (0, 30, 60):
+            add_calibration_row(db, start + offset, status="Charging", power=35.0)
+        for offset in (80, 85, 90):
+            add_calibration_row(db, start + offset, status="Discharging", power=3.5)
+
+        with pytest.raises(RuntimeError, match="valid Discharging"):
+            manager.finish()
+    finally:
+        db.close()
+
+
+def test_calibration_statistics_exclude_charging_power(project_root: Path):
+    db, manager = calibration_with_minimum(project_root, 20)
+    try:
+        active = manager.start("cold_idle")
+        start = time.time() - 100
+        db.conn.execute(
+            "UPDATE calibration_runs SET start_ts=? WHERE run_id=?",
+            (start, active["run_id"]),
+        )
+        db.conn.commit()
+        for offset in (0, 10, 20):
+            add_calibration_row(db, start + offset, status="Charging", power=40.0)
+        for offset in (40, 55, 70):
+            add_calibration_row(db, start + offset, status="Discharging", power=3.5)
+
+        result = manager.finish()["result"]
+        assert result["sample_count"] == 3
+        assert result["valid_discharge_seconds"] == 30
+        assert result["battery_power_median_w"] == 3.5
+        machine = load_machine(project_root)
+        assert machine["thermal"]["sensor_path"] == "/sys/package"
+    finally:
+        db.close()
+
+
+def test_calibration_does_not_count_ac_interval_between_discharging_samples(
+    project_root: Path,
+):
+    db, manager = calibration_with_minimum(project_root, 20)
+    try:
+        active = manager.start("cold_idle")
+        start = time.time() - 100
+        db.conn.execute(
+            "UPDATE calibration_runs SET start_ts=? WHERE run_id=?",
+            (start, active["run_id"]),
+        )
+        db.conn.commit()
+        add_calibration_row(db, start, status="Discharging", power=3.5)
+        add_calibration_row(db, start + 10, status="Charging", power=40.0)
+        add_calibration_row(db, start + 20, status="Charging", power=40.0)
+        add_calibration_row(db, start + 30, status="Discharging", power=3.5)
+        add_calibration_row(db, start + 40, status="Discharging", power=3.5)
+
+        with pytest.raises(RuntimeError, match="valid Discharging"):
+            manager.finish()
     finally:
         db.close()

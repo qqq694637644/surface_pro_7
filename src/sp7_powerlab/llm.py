@@ -159,6 +159,17 @@ def _save_manual_proposal(
     return str(path)
 
 
+def _save_trial_proposal(root: Path, proposal: dict[str, Any]) -> str:
+    directory = root / "proposals"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{int(time.time())}-envelope-trial.json"
+    path.write_text(
+        json.dumps(proposal, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
 def apply_decision(
     decision: dict[str, Any],
     *,
@@ -166,7 +177,6 @@ def apply_decision(
     db: Database,
     registry: EnvelopeRegistry,
     trials: TrialManager,
-    approved: bool = False,
 ) -> dict[str, Any]:
     validate_decision(decision)
     action = str(decision["action"])
@@ -194,19 +204,13 @@ def apply_decision(
         errors = trials.validate_proposal(proposal)
         if errors:
             raise LLMDecisionError("; ".join(errors))
-        if approved and level < 2:
-            result.update(
-                {
-                    "status": "automation_level_too_low",
-                    "required_level": 2,
-                }
-            )
-        elif not approved and level < 3:
-            path = _save_manual_proposal(config.root, action, payload)
+        if level < 3:
+            path = _save_trial_proposal(config.root, proposal)
             result.update(
                 {
                     "status": "awaiting_human_approval",
                     "proposal_file": path,
+                    "required_level_for_autonomous_trial": 3,
                 }
             )
         else:
@@ -232,17 +236,9 @@ def apply_decision(
         trial_id = payload.get("trial_id")
         if not isinstance(trial_id, str):
             raise LLMDecisionError("PROMOTE_ENVELOPE requires payload.trial_id")
-        if approved and level < 2:
-            result.update(
-                {
-                    "status": "automation_level_too_low",
-                    "required_level": 2,
-                }
-            )
-        elif not approved and not (
-            level >= 4 and bool(config.get("automation.auto_promote", False))
-        ):
+        if not (level >= 4 and bool(config.get("automation.auto_promote", False))):
             result["status"] = "awaiting_human_approval"
+            result["trial_id"] = trial_id
         else:
             result["envelope"] = trials.promote(trial_id)
             result["status"] = "promoted"

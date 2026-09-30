@@ -1133,10 +1133,14 @@ Envelope 级实验如果包含多项变化，必须把完整 diff 当成一个�
 
 推荐结构：
 
-- A：当前 verified；
-- B：candidate；
-- A：回到 verified；
-- 后续新的 B：revalidation。
+- A1：当前 verified；
+- B1：candidate；
+- A2：回到 verified，完成第一次 crossover 判定；
+- 如果第一次判定胜出，revalidation 必须重新采一个新的 A3 baseline；
+- B2：只与同一轮新的 A3 比较，作为独立 revalidation。
+
+B1 的好结果不能进入 B2 的判分；A2 也不能在等待很久后继续作为 B2 的旧基线。
+只有 initial 和 revalidation 两轮都单独胜出，candidate 才能进入 VERIFIED_WINNER。
 
 尽量在：
 
@@ -1336,6 +1340,9 @@ LLM 不可以：
 
 - 直接写 sysfs；
 - 直接调用 sudo shell；
+- 获得任意 Bash / Python / code-execution capability；
+- 调用人类 \`sp7-powerlab trial start/promote\` capability；
+- 直接连接 root helper socket；
 - 改 thermald hard limit；
 - 自己宣布 trial 成功；
 - 绕过 data quality；
@@ -1372,6 +1379,10 @@ v2 root helper 重新实现，只暴露固定操作：
 - root-owned 独立安装；
 - systemd hardening；
 - 客户端 socket 只允许目标用户。
+
+这里的 socket UID 限制**不是 LLM approval boundary**。如果 LLM/MCP 也拥有该 UID
+下的任意 shell/code execution，它就能够绕过上层审批直接调用 helper。因此 LLM
+只能获得单独的窄 \`sp7-powerlab-agent\` capability。
 
 ---
 
@@ -1769,8 +1780,15 @@ Git 历史就是 v1 的档案。
 - sp7-powerlab trial promote
 - sp7-powerlab feedback
 - sp7-powerlab hourly
-- sp7-powerlab llm-apply
 - sp7-powerlab service status
+
+LLM/MCP 专用 CLI 与人类 CLI 分离，只暴露：
+
+- sp7-powerlab-agent observe
+- sp7-powerlab-agent hourly
+- sp7-powerlab-agent submit-decision
+
+agent CLI 不包含 trial start/promote、envelope 写操作或 root-helper。
 
 不保留 v1 alias。
 

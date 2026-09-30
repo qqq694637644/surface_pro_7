@@ -23,6 +23,7 @@ bash scripts/install-root-helper.sh
 3. systemd root service 只执行该副本。
 4. Unix socket 只允许安装时的目标 UID。
 5. helper 只暴露 inspect/snapshot/apply/restore HWP 操作。
+6. helper 不保留 CAP_SYS_ADMIN，CapabilityBoundingSet 和 AmbientCapabilities 均为空。
 
 日常 Git checkout 的修改不会自动变成 root 代码。
 
@@ -47,3 +48,6 @@ doctor 会报告已知冲突。
 - Level 4：满足条件时允许 auto-promotion。
 
 个人设备建议长期停留在 1–2，等真机数据充分后再提高。
+
+Level 2 的 MCP 必须只暴露 \`sp7-powerlab-agent\` 白名单能力；不得暴露任意 shell、
+主 CLI 或 helper socket。

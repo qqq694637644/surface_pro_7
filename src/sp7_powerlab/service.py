@@ -25,7 +25,7 @@ from .demand import DemandObserver
 from .envelopes import EnvelopeRegistry
 from .evaluation import valid_duration
 from .experiments import TrialManager
-from .hardware import inspect_hardware, system_fingerprint
+from .hardware import inspect_hardware, system_fingerprint, thermal_sensor_path
 from .helper import RootHelperClient
 from .storage import Database
 from .telemetry import TelemetryCollector
@@ -124,6 +124,8 @@ def prepare_stack(root: Path, config_path: Path | None = None) -> dict[str, Any]
     report = inspect_hardware(
         expected_product=str(identity.get("expected_product", "Surface Pro 7")),
         expected_cpu_substring=str(identity.get("expected_cpu_substring", "i5-1035G4")),
+        configured_thermal_sensor=str((machine.get("thermal") or {}).get("sensor_path") or "")
+        or None,
     )
     registry = EnvelopeRegistry(root, db)
     registry.load()
@@ -137,7 +139,11 @@ def prepare_stack(root: Path, config_path: Path | None = None) -> dict[str, Any]
         thermal_config=thermal_config,
     )
 
-    collector = TelemetryCollector(config)
+    collector = TelemetryCollector(
+        config,
+        thermal_sensor_override=str((machine.get("thermal") or {}).get("sensor_path") or "")
+        or None,
+    )
     demand = DemandObserver(machine=machine)
     thermal = ThermalObserver(machine, thermal_config)
     calibration = CalibrationManager(root, db, config)
@@ -184,9 +190,11 @@ class PowerLabService:
         self._last_thermal_state: str | None = None
         self._last_prune_ts = 0.0
         self._last_hardware_refresh_ts = time.time()
+        self._last_hwp_reconcile_ts = 0.0
         self._machine_mtime = self._mtime(self.root / "config" / "machine.toml")
         self._thermal_mtime = self._mtime(self.root / "config" / "thermal.toml")
         self._recover_interrupted_trial()
+        self._reconcile_hwp(time.time(), "service startup", force=True)
 
     def close(self) -> None:
         self.db.close()
@@ -205,6 +213,10 @@ class PowerLabService:
         self.stack["machine"] = machine
         self.stack["demand"].machine = machine
         self.stack["thermal"].machine = machine
+        collector = self.stack.get("collector")
+        if collector is not None and hasattr(collector, "sys_root"):
+            configured = str((machine.get("thermal") or {}).get("sensor_path") or "") or None
+            collector.thermal_path = thermal_sensor_path(collector.sys_root, configured)
         self.stack["controller"].calibration_valid = bool(
             (machine.get("calibration") or {}).get("valid", False)
         )
@@ -228,6 +240,15 @@ class PowerLabService:
                     "last_error": recovered.get("last_error"),
                 },
             )
+
+    def _reconcile_hwp(self, ts: float, reason: str, *, force: bool = False) -> None:
+        if self.db.active_trial():
+            return
+        interval = float(self.config.get("controller.reconcile_seconds", 60.0))
+        if not force and ts - self._last_hwp_reconcile_ts < interval:
+            return
+        self.stack["controller"].reconcile_actual_state(reason)
+        self._last_hwp_reconcile_ts = ts
 
     def _refresh_runtime_files(self) -> None:
         machine_path = self.root / "config" / "machine.toml"
@@ -262,6 +283,10 @@ class PowerLabService:
         report = inspect_hardware(
             expected_product=str(identity.get("expected_product", "Surface Pro 7")),
             expected_cpu_substring=str(identity.get("expected_cpu_substring", "i5-1035G4")),
+            configured_thermal_sensor=str(
+                (self.stack["machine"].get("thermal") or {}).get("sensor_path") or ""
+            )
+            or None,
         )
         actuator_available = False
         if hasattr(self.stack["actuator"], "inspect"):
@@ -394,6 +419,7 @@ class PowerLabService:
         self._refresh_runtime_files()
         sample = self.stack["collector"].sample()
         self._refresh_hardware_contract(float(sample["ts"]))
+        self._reconcile_hwp(float(sample["ts"]), "periodic runtime reconcile")
         epoch = self._battery_epoch(sample)
         demand = self.stack["demand"].observe(sample)
         thermal = self.stack["thermal"].observe(sample)

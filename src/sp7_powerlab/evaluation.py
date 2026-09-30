@@ -70,6 +70,11 @@ def summarize_block(
     media = [
         1.0 if row.get("media_playing") else 0.0 for row in valid_rows if "media_playing" in row
     ]
+    sustained = [
+        1.0 if row.get("local_compute_pressure") == "SUSTAINED" else 0.0
+        for row in valid_rows
+        if row.get("local_compute_pressure")
+    ]
     brightness = [
         float(row["brightness_pct"])
         for row in valid_rows
@@ -100,6 +105,23 @@ def summarize_block(
                 max_gap_seconds=max_gap_seconds,
             )
             if media
+            else None
+        ),
+        "sustained_compute_fraction": (
+            time_weighted_average(
+                [
+                    {
+                        **row,
+                        "_sustained_numeric": (
+                            1.0 if row.get("local_compute_pressure") == "SUSTAINED" else 0.0
+                        ),
+                    }
+                    for row in valid_rows
+                ],
+                "_sustained_numeric",
+                max_gap_seconds=max_gap_seconds,
+            )
+            if sustained
             else None
         ),
         "brightness_median": percentile(brightness, 0.5),
@@ -144,6 +166,8 @@ def compare_candidate(
     max_cpu_psi_delta: float = 2.0,
     max_io_psi_delta: float = 2.0,
     max_thermal_pressure_delta: float = 0.10,
+    max_media_drop: float = 0.05,
+    max_sustained_compute_delta: float = 0.10,
 ) -> dict[str, Any]:
     if not baseline_blocks or not candidate_blocks:
         return {"verdict": "INSUFFICIENT_DATA", "reasons": ["missing_blocks"]}
@@ -163,6 +187,10 @@ def compare_candidate(
     io_cand = means("avg_io_psi", candidate_blocks)
     thermal_base = means("max_thermal_pressure", baseline_blocks)
     thermal_cand = means("max_thermal_pressure", candidate_blocks)
+    media_base = means("media_playing_fraction", baseline_blocks)
+    media_cand = means("media_playing_fraction", candidate_blocks)
+    sustained_base = means("sustained_compute_fraction", baseline_blocks)
+    sustained_cand = means("sustained_compute_fraction", candidate_blocks)
 
     power_delta = cand_power - base_power
     reasons: list[str] = []
@@ -178,6 +206,19 @@ def compare_candidate(
         and thermal_cand - thermal_base > max_thermal_pressure_delta
     ):
         reasons.append("thermal_regression")
+    if (
+        media_base is not None
+        and media_cand is not None
+        and media_base >= 0.90
+        and media_base - media_cand > max_media_drop
+    ):
+        reasons.append("media_continuity_regression")
+    if (
+        sustained_base is not None
+        and sustained_cand is not None
+        and sustained_cand - sustained_base > max_sustained_compute_delta
+    ):
+        reasons.append("demand_backlog_regression")
 
     return {
         "verdict": "CANDIDATE_WINNER" if not reasons else "REJECT",
@@ -195,6 +236,14 @@ def compare_candidate(
         "thermal_pressure_delta": (
             thermal_cand - thermal_base
             if thermal_base is not None and thermal_cand is not None
+            else None
+        ),
+        "media_playing_delta": (
+            media_cand - media_base if media_base is not None and media_cand is not None else None
+        ),
+        "sustained_compute_delta": (
+            sustained_cand - sustained_base
+            if sustained_base is not None and sustained_cand is not None
             else None
         ),
     }

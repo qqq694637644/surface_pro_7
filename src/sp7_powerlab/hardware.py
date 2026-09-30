@@ -5,7 +5,7 @@ import platform
 import shutil
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 SYSFS = Path("/sys")
@@ -68,33 +68,73 @@ def rapl_energy_path(sys_root: Path = SYSFS) -> Path | None:
     return direct if direct.exists() else None
 
 
-def thermal_sensor_path(sys_root: Path = SYSFS) -> Path | None:
+def _configured_sensor_path(sys_root: Path, configured: str | None) -> Path | None:
+    if not configured:
+        return None
+    if configured == "/sys" or configured.startswith("/sys/"):
+        try:
+            relative = PurePosixPath(configured).relative_to("/sys")
+        except ValueError:
+            return None
+        candidate = sys_root.joinpath(*relative.parts)
+    else:
+        raw = Path(configured)
+        if raw.is_absolute():
+            return None
+        candidate = sys_root / raw
+    try:
+        relative = candidate.relative_to(sys_root)
+    except ValueError:
+        return None
+    parts = relative.parts
+    if (
+        len(parts) < 3
+        or parts[:2] != ("class", "thermal")
+        and parts[:2]
+        != (
+            "class",
+            "hwmon",
+        )
+    ):
+        return None
+    if candidate.name != "temp" and not (
+        candidate.name.startswith("temp") and candidate.name.endswith("_input")
+    ):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def thermal_sensor_path(
+    sys_root: Path = SYSFS,
+    configured: str | None = None,
+) -> Path | None:
     thermal = sys_root / "class" / "thermal"
     if thermal.exists():
         preferred: list[Path] = []
-        fallback: list[Path] = []
         for zone in sorted(thermal.glob("thermal_zone*")):
             temp = zone / "temp"
             if not temp.exists():
                 continue
             kind = (_read(zone / "type") or "").lower()
-            if any(token in kind for token in ("x86_pkg_temp", "cpu", "package")):
+            if any(token in kind for token in ("x86_pkg_temp", "package", "pkg_temp")):
                 preferred.append(temp)
-            else:
-                fallback.append(temp)
         if preferred:
             return preferred[0]
-        if fallback:
-            return fallback[0]
 
     hwmon = sys_root / "class" / "hwmon"
     if hwmon.exists():
         for node in sorted(hwmon.glob("hwmon*")):
             name = (_read(node / "name") or "").lower()
-            if name in {"coretemp", "k10temp"}:
-                for path in sorted(node.glob("temp*_input")):
-                    return path
-    return None
+            if name != "coretemp":
+                continue
+            for label_path in sorted(node.glob("temp*_label")):
+                label = (_read(label_path) or "").lower()
+                if "package id 0" not in label and "package" not in label:
+                    continue
+                input_path = label_path.with_name(label_path.name.replace("_label", "_input"))
+                if input_path.is_file():
+                    return input_path
+    return _configured_sensor_path(sys_root, configured)
 
 
 def intel_pstate_root(sys_root: Path = SYSFS) -> Path:
@@ -158,6 +198,7 @@ class HardwareReport:
     ownership_conflicts: list[str]
     errors: list[str]
     warnings: list[str]
+    thermal_sensor: str | None
 
     @property
     def writable(self) -> bool:
@@ -179,6 +220,7 @@ class HardwareReport:
             "ownership_conflicts": self.ownership_conflicts,
             "errors": self.errors,
             "warnings": self.warnings,
+            "thermal_sensor": self.thermal_sensor,
             "writable": self.writable,
             "control_capable": self.control_capable,
         }
@@ -190,16 +232,18 @@ def inspect_hardware(
     proc_root: Path = PROC,
     expected_product: str = "Surface Pro 7",
     expected_cpu_substring: str = "i5-1035G4",
+    configured_thermal_sensor: str | None = None,
 ) -> HardwareReport:
     product = dmi_value("product_name", sys_root) or "unknown"
     cpu = cpu_model(proc_root)
     bios = dmi_value("bios_version", sys_root)
+    thermal_path = thermal_sensor_path(sys_root, configured_thermal_sensor)
     caps = {
         "intel_pstate": intel_pstate_root(sys_root).exists(),
         "hwp_epp": hwp_available(sys_root),
         "turbo_control": (intel_pstate_root(sys_root) / "no_turbo").exists(),
         "battery": battery_directory(sys_root) is not None,
-        "thermal": thermal_sensor_path(sys_root) is not None,
+        "thermal": thermal_path is not None,
         "rapl": rapl_energy_path(sys_root) is not None,
         "systemd": systemd_available(),
     }
@@ -249,6 +293,7 @@ def inspect_hardware(
         ownership_conflicts=conflicts,
         errors=errors,
         warnings=warnings,
+        thermal_sensor=str(thermal_path) if thermal_path else None,
     )
 
 
@@ -266,5 +311,6 @@ def system_fingerprint(report: HardwareReport) -> dict[str, Any]:
         "kernel": report.kernel,
         "intel_pstate": report.capabilities.get("intel_pstate"),
         "hwp_epp": report.capabilities.get("hwp_epp"),
+        "thermal_sensor": report.thermal_sensor,
         "versions": versions,
     }

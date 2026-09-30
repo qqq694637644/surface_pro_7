@@ -52,6 +52,44 @@ class BatteryLifeController:
     def current_envelope(self) -> str | None:
         return self.db.get_meta("current_envelope")
 
+    @staticmethod
+    def _same_hwp_state(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        return (
+            left.get("max_perf_pct") == right.get("max_perf_pct")
+            and left.get("turbo") == right.get("turbo")
+            and (left.get("epp") or {}) == (right.get("epp") or {})
+        )
+
+    def reconcile_actual_state(self, reason: str) -> str | None:
+        previous = self.current_envelope()
+        try:
+            snapshot = self.actuator.snapshot()
+        except Exception as exc:
+            self.db.set_meta("current_envelope", None)
+            self.db.add_control_action(
+                action="RECONCILE_HWP",
+                envelope=None,
+                success=False,
+                reason=f"{reason}: {exc}",
+            )
+            return None
+        matched = self.registry.match_verified_snapshot(snapshot, preferred=previous)
+        self.db.set_meta("current_envelope", matched)
+        self.db.set_meta("last_hwp_reconcile_ts", self.clock())
+        if matched != previous:
+            self.db.add_control_action(
+                action="RECONCILE_HWP",
+                envelope=matched,
+                success=True,
+                reason=(
+                    f"{reason}: matched verified envelope"
+                    if matched
+                    else f"{reason}: actual HWP state is unmanaged"
+                ),
+                before=snapshot,
+            )
+        return matched
+
     def set_override(self, name: str) -> None:
         env = self.registry.get(name)
         if not env:
@@ -176,23 +214,51 @@ class BatteryLifeController:
 
         env = self.registry.get(desired)
         assert env is not None
+        before: dict[str, Any] | None = None
         try:
             before = self.actuator.snapshot()
             result = self.actuator.apply_envelope(env)
         except Exception as exc:
+            recovery_error: str | None = None
+            if before is not None:
+                try:
+                    actual = self.actuator.snapshot()
+                    if not self._same_hwp_state(actual, before):
+                        self.actuator.restore(before)
+                    verify = self.actuator.snapshot()
+                    if not self._same_hwp_state(verify, before):
+                        raise RuntimeError("restored HWP state does not match pre-apply snapshot")
+                except Exception as recovery_exc:
+                    recovery_error = str(recovery_exc)
+            matched = self.reconcile_actual_state("controller apply failure")
+            failure_reason = str(exc)
+            if recovery_error:
+                failure_reason += f"; rollback integrity failure: {recovery_error}"
+                self.hardware_writable = False
+                self.db.set_meta("current_envelope", None)
+                self.db.add_incident(
+                    "waste",
+                    {
+                        "start_ts": now,
+                        "severity": "high",
+                        "reason": "HWP apply failed and exact rollback could not be verified",
+                        "error": str(exc),
+                        "rollback_error": recovery_error,
+                    },
+                )
             self.db.add_control_action(
                 action="APPLY_ENVELOPE",
                 envelope=desired,
                 success=False,
-                reason=str(exc),
-                before=locals().get("before"),
+                reason=failure_reason,
+                before=before,
             )
             decision = ControllerDecision(
                 ts=now,
                 desired_envelope=desired,
-                applied_envelope=current,
-                read_only=False,
-                reason=f"apply failed: {exc}",
+                applied_envelope=matched,
+                read_only=bool(recovery_error),
+                reason=f"apply failed: {failure_reason}",
                 action="FAILED",
             )
             self.db.add_controller_state(decision.as_dict())

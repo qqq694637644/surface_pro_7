@@ -147,14 +147,13 @@ proposal 示例：
 {
   "kind": "envelope",
   "baseline_envelope": "INTERACTIVE_EFFICIENT",
-  "changes": {"max_perf_pct": 50},
-  "validation": {
-    "min_block_seconds": 300,
-    "settle_seconds": 60,
-    "min_power_saving_w": 0.1
-  }
+  "changes": {"max_perf_pct": 50}
 }
 ~~~
+
+实验判定阈值由本机 \`config/powerlab.toml\` 和本地代码控制。proposal 不能携带
+validation、target 或自定义 trial ID，也不能覆盖 block 时长、settling、最小节能收益、
+PSI/thermal/brightness/gap 门槛或实验匹配条件。
 
 启动：
 
@@ -163,7 +162,9 @@ proposal 示例：
 sp7-powerlab trial start proposals/example.json
 ~~~
 
-v2 使用 A baseline → B candidate → A baseline → 独立 B revalidation。
+v2 使用 A1 baseline → B1 candidate → A2 baseline 完成第一次 crossover；第一次胜出后，
+再重新采 A3 baseline → B2 candidate。B2 只和同一轮 A3 比，B1 的结果不会进入 B2
+判分。
 
 要验证另一个完整命名 envelope（例如 REMOTE_EFFICIENT），使用：
 
@@ -198,8 +199,8 @@ sp7-powerlab feedback sluggish --trial-id trial-xxxx --notes "滚动明显变慢
 ## 每小时 LLM
 
 ~~~bash
-sp7-powerlab hourly --output runtime/hourly-pack-v2.json
-sp7-powerlab llm-apply runtime/llm-decision.json
+sp7-powerlab-agent hourly > runtime/hourly-pack-v2.json
+sp7-powerlab-agent submit-decision runtime/llm-decision.json
 ~~~
 
 LLM 允许动作：
@@ -214,13 +215,21 @@ LLM 允许动作：
 - PROMOTE_ENVELOPE
 - PROPOSE_MANUAL_RECALIBRATION
 
-默认情况下，LLM proposal 不会自动开始实验。
+**不要把任意 Bash/Python、主 \`sp7-powerlab\` CLI 或 root-helper socket 暴露给
+LLM/MCP。** LLM-facing capability 只允许调用 \`sp7-powerlab-agent\` 的
+\`observe\` / \`hourly\` / \`submit-decision\`。
 
-Level 2 人工批准使用独立参数，批准权不放在 LLM JSON 中：
+Level 2 下，agent 提交的 trial proposal 只会保存成待审核文件。真正的人类批准通过
+LLM 不可调用的主 CLI 完成：
 
 ~~~bash
-sp7-powerlab llm-apply runtime/llm-decision.json --approve
+sp7-powerlab trial start proposals/<reviewed-proposal>.json
+sp7-powerlab trial promote trial-xxxx
 ~~~
+
+如果 MCP 拥有同 UID 的任意 shell/code execution，它就天然可以调用主 CLI 或直接连接
+helper socket；这种部署**不具备**“人工批准”的技术安全边界，不能用于 Level 2 assisted
+trial。
 
 ## 长期知识
 

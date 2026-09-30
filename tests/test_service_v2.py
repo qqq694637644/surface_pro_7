@@ -31,6 +31,17 @@ class FakeActuator:
         return {"after": envelope}
 
 
+class FakeController:
+    def __init__(self):
+        self.calibration_valid = True
+        self.hardware_writable = True
+        self.reconciles = 0
+
+    def reconcile_actual_state(self, _reason):
+        self.reconciles += 1
+        return "INTERACTIVE_EFFICIENT"
+
+
 def make_stack(project_root: Path, *, active_state: str):
     config = load_config(project_root)
     db = Database(project_root / "runtime/service.sqlite3")
@@ -82,7 +93,7 @@ def make_stack(project_root: Path, *, active_state: str):
         "demand": SimpleNamespace(machine=machine),
         "thermal": SimpleNamespace(machine=machine, thermal_config=thermal_config),
         "calibration": SimpleNamespace(),
-        "controller": SimpleNamespace(calibration_valid=True, hardware_writable=True),
+        "controller": FakeController(),
         "trials": trials,
         "waste": SimpleNamespace(),
         "report": SimpleNamespace(),
@@ -140,7 +151,7 @@ def test_runtime_machine_refresh_updates_observers(project_root: Path, monkeypat
         "demand": SimpleNamespace(machine=machine),
         "thermal": SimpleNamespace(machine=machine, thermal_config=thermal_config),
         "calibration": SimpleNamespace(),
-        "controller": SimpleNamespace(calibration_valid=True, hardware_writable=True),
+        "controller": FakeController(),
         "trials": TrialManager(config, db, registry, FakeActuator()),
         "waste": SimpleNamespace(),
         "report": SimpleNamespace(),

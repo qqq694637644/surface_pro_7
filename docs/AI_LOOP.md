@@ -4,7 +4,9 @@ LLM 不做实时 controller。
 
 ## 每小时输入
 
-knowledge pack 包含 BAT W / drain、demand、thermal、verified envelope、control actions、waste/thermal incidents、trial blocks/results、用户反馈、rejection memory、system fingerprint 和 calibration version。
+knowledge pack 包含 BAT W / drain、demand、thermal、verified envelope、control
+actions、waste/thermal incidents、trial blocks/results、用户反馈、rejection memory、
+system fingerprint 和 calibration version。
 
 ## 允许动作
 
@@ -27,11 +29,19 @@ LLM 必须优先：
 3. 再考虑 HWP envelope tuning。
 4. 最后才考虑会牺牲 UX 的方案。
 
-LLM proposal 不是 reward。PowerLab 只接受真实 BAT 数据的 A/B/A + revalidation 结果。
-
-candidate 只有同时满足 BAT W 下降、PSI/体验不恶化、thermal 不恶化且无用户负反馈，才能成为 VERIFIED_WINNER。
+LLM proposal 不是 reward。PowerLab 先用 A1/B1/A2 完成第一次 crossover；第一次胜出后，
+必须重新采 A3，再用 A3/B2 做独立 revalidation。B2 不复用 B1 的好结果，也不使用等待很久
+以前的旧 baseline。candidate 只有两轮都单独满足 BAT W 下降、PSI/体验不恶化、thermal
+不恶化且无用户负反馈，才能成为 VERIFIED_WINNER。
 
 稳定运行时最常见动作应该是 NO_CHANGE。
 
-Level 2 的“人工批准”不属于 LLM decision JSON。用户通过
-`sp7-powerlab llm-apply decision.json --approve` 独立授权；模型自己输出任何 approval 字段都会被 schema/validator 拒绝。
+## Approval boundary
+
+LLM 只接触 `sp7-powerlab-agent` 的窄 capability，不接触 Bash/Python、主
+`sp7-powerlab` CLI 或 root-helper socket。Level 2 的 proposal 只能落盘等待审核；
+用户在独立的人类 capability 中运行 `sp7-powerlab trial start ...` 或
+`sp7-powerlab trial promote ...`。
+
+如果把任意 shell 暴露给同 UID 的 LLM，人工批准边界即失效，这种部署不属于受支持的
+Level 2 模式。

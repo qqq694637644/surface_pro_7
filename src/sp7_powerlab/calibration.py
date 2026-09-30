@@ -28,6 +28,26 @@ def _numbers(rows: list[dict[str, Any]], key: str) -> list[float]:
     return [float(row[key]) for row in rows if isinstance(row.get(key), (int, float))]
 
 
+def _valid_discharging_duration(
+    rows: list[dict[str, Any]],
+    max_gap_seconds: float,
+) -> float:
+    total = 0.0
+    for previous, current in zip(rows, rows[1:], strict=False):
+        dt = float(current["ts"]) - float(previous["ts"])
+        if not (0 < dt <= max_gap_seconds):
+            continue
+        if not (
+            previous.get("battery_status") == "Discharging"
+            and current.get("battery_status") == "Discharging"
+            and not previous.get("resume_grace")
+            and not current.get("resume_grace")
+        ):
+            continue
+        total += dt
+    return total
+
+
 def _quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -69,6 +89,9 @@ def write_machine(root: Path, machine: dict[str, Any]) -> None:
     ):
         lines.append(f"{key} = {float(baselines.get(key) or 0.0):.6f}")
     lines.extend(["", "[thermal]"])
+    sensor_path = thermal.get("sensor_path")
+    if sensor_path:
+        lines.append(f"sensor_path = {_quote(str(sensor_path))}")
     for key in (
         "soft_temp_c",
         "pressure_temp_c",
@@ -120,16 +143,6 @@ class CalibrationManager:
         min_seconds = 0.0
         if self.config is not None:
             min_seconds = float(self.config.get(f"calibration.{phase}_min_seconds", 0.0))
-        elapsed = time.time() - float(active["start_ts"])
-        if elapsed < min_seconds:
-            raise RuntimeError(
-                f"calibration phase {phase} requires at least {min_seconds:.0f}s; "
-                f"only {elapsed:.0f}s elapsed"
-            )
-        powers = _numbers(rows, "battery_power_w")
-        temps = _numbers(rows, "package_temp_c")
-        rapl = _numbers(rows, "rapl_power_60s_w")
-        slopes = _numbers(rows, "temp_slope_c_per_min")
         epochs = {
             int(row["battery_epoch"])
             for row in rows
@@ -137,13 +150,43 @@ class CalibrationManager:
         }
         if len(epochs) > 1:
             raise RuntimeError("battery epoch changed during calibration")
+        valid_discharge = [
+            row
+            for row in rows
+            if row.get("battery_status") == "Discharging" and not row.get("resume_grace")
+        ]
+        if len(valid_discharge) < 3:
+            raise RuntimeError("calibration requires battery Discharging samples")
+        sensor_paths = {
+            str(row["thermal_sensor_path"])
+            for row in valid_discharge
+            if row.get("thermal_sensor_path")
+        }
+        if len(sensor_paths) > 1:
+            raise RuntimeError("thermal sensor changed during calibration")
+        max_gap = (
+            float(self.config.get("collector.max_gap_seconds", 45.0))
+            if self.config is not None
+            else 45.0
+        )
+        discharge_seconds = _valid_discharging_duration(rows, max_gap)
+        if discharge_seconds < min_seconds:
+            raise RuntimeError(
+                f"calibration phase {phase} requires at least {min_seconds:.0f}s of valid "
+                f"Discharging telemetry; only {discharge_seconds:.0f}s is valid"
+            )
+        powers = _numbers(valid_discharge, "battery_power_w")
+        temps = _numbers(valid_discharge, "package_temp_c")
+        rapl = _numbers(valid_discharge, "rapl_power_60s_w")
+        slopes = _numbers(valid_discharge, "temp_slope_c_per_min")
         if len(powers) < 3 or len(temps) < 3 or len(rapl) < 3:
             raise RuntimeError("calibration requires stable BAT, thermal, and RAPL telemetry")
-        valid_discharge = [row for row in rows if row.get("battery_status") == "Discharging"]
-        if phase != "bounded_burst" and len(valid_discharge) < 3:
-            raise RuntimeError("calibration requires battery Discharging samples")
-        active_fraction = sum(bool(row.get("user_active")) for row in rows) / len(rows)
-        media_fraction = sum(bool(row.get("media_playing")) for row in rows) / len(rows)
+        active_fraction = sum(bool(row.get("user_active")) for row in valid_discharge) / len(
+            valid_discharge
+        )
+        media_fraction = sum(bool(row.get("media_playing")) for row in valid_discharge) / len(
+            valid_discharge
+        )
         if phase == "cold_idle" and active_fraction > 0.20:
             raise RuntimeError("cold_idle calibration requires the user to remain idle")
         if phase == "normal_interactive" and active_fraction < 0.80:
@@ -162,7 +205,8 @@ class CalibrationManager:
 
         result = {
             "phase": phase,
-            "sample_count": len(rows),
+            "sample_count": len(valid_discharge),
+            "valid_discharge_seconds": discharge_seconds,
             "start_ts": active["start_ts"],
             "end_ts": time.time(),
             "battery_power_median_w": _percentile(powers, 0.5),
@@ -184,6 +228,8 @@ class CalibrationManager:
         calibration["completed_phases"] = sorted(completed)
         baselines = machine.setdefault("baselines", {})
         thermal = machine.setdefault("thermal", {})
+        if sensor_paths:
+            thermal["sensor_path"] = next(iter(sensor_paths))
 
         if phase == "cold_idle":
             baselines["idle_battery_w"] = result["battery_power_median_w"] or 0.0

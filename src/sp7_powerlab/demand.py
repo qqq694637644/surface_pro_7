@@ -2,17 +2,41 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-REMOTE_PROCESS_HINTS = (
-    "ssh",
-    "mosh",
-    "remmina",
-    "xfreerdp",
-    "code-tunnel",
-    "code-server",
-    "vscode-server",
-)
+REMOTE_PROCESS_NAMES = {
+    "ssh": "ssh",
+    "mosh": "mosh",
+    "mosh-client": "mosh",
+    "remmina": "remmina",
+    "xfreerdp": "xfreerdp",
+    "wlfreerdp": "xfreerdp",
+    "code-tunnel": "code-tunnel",
+    "code-server": "code-server",
+    "vscode-server": "vscode-server",
+}
+
+
+def remote_process_tags(
+    name: str | None,
+    executable: str | None = None,
+    cmdline: list[str] | tuple[str, ...] | None = None,
+) -> set[str]:
+    tags: set[str] = set()
+    for raw in (name, executable):
+        if not raw:
+            continue
+        base = Path(str(raw)).name.lower()
+        tag = REMOTE_PROCESS_NAMES.get(base)
+        if tag:
+            tags.add(tag)
+    args = [str(value).lower() for value in (cmdline or [])]
+    if args:
+        command = Path(args[0]).name
+        if command == "code" and any(value == "tunnel" for value in args[1:]):
+            tags.add("code-tunnel")
+    return tags
 
 
 def _level(value: float, low: float, high: float) -> str:
@@ -78,10 +102,13 @@ class DemandObserver:
         else:
             network_intensity = "LOW"
 
-        process_names = " ".join(
-            str(row.get("name") or "").lower() for row in sample.get("processes") or []
+        explicit_remote = bool(sample.get("remote_process_present")) or any(
+            remote_process_tags(
+                str(row.get("name") or ""),
+                str(row.get("executable") or ""),
+            )
+            for row in sample.get("processes") or []
         )
-        explicit_remote = any(token in process_names for token in REMOTE_PROCESS_HINTS)
         remote_hint = 0.0
         if explicit_remote:
             remote_hint += 0.55

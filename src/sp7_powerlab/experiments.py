@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import time
 import uuid
+from importlib.resources import files
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 from .config import Config, load_machine
-from .envelopes import EnvelopeRegistry
+from .envelopes import EnvelopeRegistry, snapshot_matches_envelope
 from .evaluation import compare_candidate, summarize_block
 from .storage import Database
 from .waste import brightness_bucket, remote_bucket
@@ -32,27 +36,51 @@ class TrialManager:
 
     def _default_validation(self) -> dict[str, Any]:
         return {
-            "min_block_seconds": 300.0,
-            "settle_seconds": 60.0,
+            "min_block_seconds": float(self.config.get("experiments.min_block_seconds", 300.0)),
+            "settle_seconds": float(self.config.get("experiments.settle_seconds", 60.0)),
             "max_gap_seconds": float(self.config.get("collector.max_gap_seconds", 45.0)),
-            "max_brightness_delta": 10.0,
-            "min_power_saving_w": 0.10,
-            "max_cpu_psi_delta": 2.0,
-            "max_io_psi_delta": 2.0,
-            "max_thermal_pressure_delta": 0.10,
+            "max_brightness_delta": float(
+                self.config.get("experiments.max_brightness_delta", 10.0)
+            ),
+            "min_power_saving_w": float(self.config.get("experiments.min_power_saving_w", 0.10)),
+            "max_cpu_psi_delta": float(self.config.get("experiments.max_cpu_psi_delta", 2.0)),
+            "max_io_psi_delta": float(self.config.get("experiments.max_io_psi_delta", 2.0)),
+            "max_thermal_pressure_delta": float(
+                self.config.get("experiments.max_thermal_pressure_delta", 0.10)
+            ),
+            "max_media_drop": float(self.config.get("experiments.max_media_drop", 0.05)),
+            "max_sustained_compute_delta": float(
+                self.config.get("experiments.max_sustained_compute_delta", 0.10)
+            ),
         }
 
-    @staticmethod
-    def _snapshot_matches_envelope(
-        snapshot: dict[str, Any],
-        envelope: dict[str, Any],
-    ) -> bool:
-        if snapshot.get("max_perf_pct") != int(envelope["max_perf_pct"]):
-            return False
-        if snapshot.get("turbo") is not None and snapshot.get("turbo") != bool(envelope["turbo"]):
-            return False
-        epp_values = list((snapshot.get("epp") or {}).values())
-        return bool(epp_values) and all(value == envelope["epp"] for value in epp_values)
+    def _schema_errors(self, proposal: dict[str, Any]) -> list[str]:
+        try:
+            raw = (
+                files("sp7_powerlab.schemas")
+                .joinpath("envelope-trial-v2.schema.json")
+                .read_text(encoding="utf-8")
+            )
+            schema = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            return [f"trial schema unavailable: {exc}"]
+        validator = Draft202012Validator(schema)
+        return [
+            error.message
+            for error in sorted(
+                validator.iter_errors(proposal),
+                key=lambda item: list(item.path),
+            )
+        ]
+
+    def _validation_for_proposal(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        effective = self._default_validation()
+        if proposal.get("candidate_envelope"):
+            effective["min_block_seconds"] = max(
+                float(effective["min_block_seconds"]),
+                float(self.config.get("experiments.named_min_block_seconds", 600.0)),
+            )
+        return effective
 
     @staticmethod
     def _core_telemetry_valid(sample: dict[str, Any]) -> bool:
@@ -68,7 +96,9 @@ class TrialManager:
         )
 
     def validate_proposal(self, proposal: dict[str, Any]) -> list[str]:
-        errors: list[str] = []
+        errors = self._schema_errors(proposal)
+        if errors:
+            return errors
         if proposal.get("kind", "envelope") != "envelope":
             errors.append("only envelope trials are executable in v2.0")
         baseline = proposal.get("baseline_envelope")
@@ -137,25 +167,32 @@ class TrialManager:
             raise TrialError(
                 "current envelope must match baseline_envelope before starting a trial"
             )
+        baseline_env = self.registry.get(baseline)
+        assert baseline_env is not None
+        try:
+            actual_snapshot = self.actuator.snapshot()
+        except Exception as exc:
+            raise TrialError(f"cannot verify actual HWP baseline state: {exc}") from exc
+        if not snapshot_matches_envelope(actual_snapshot, baseline_env):
+            raise TrialError(
+                "actual HWP state does not match baseline_envelope before starting a trial"
+            )
         if proposal.get("candidate_envelope"):
             candidate = self.registry.candidate_from_named(str(proposal["candidate_envelope"]))
         else:
             candidate = self.registry.candidate_from_change(baseline, dict(proposal["changes"]))
-        validation = {**self._default_validation(), **(proposal.get("validation") or {})}
-        if proposal.get("candidate_envelope"):
-            validation["min_block_seconds"] = max(
-                600.0, float(validation.get("min_block_seconds", 300.0))
-            )
+        validation = self._validation_for_proposal(proposal)
         target = {
             "battery_epoch": current_sample.get("battery_epoch"),
             "brightness_bucket": brightness_bucket(current_sample.get("brightness_pct")),
+            "brightness_pct": current_sample.get("brightness_pct"),
             "demand_region": current_sample.get("demand_region"),
+            "user_active": bool(current_sample.get("user_active")),
             "media_playing": bool(current_sample.get("media_playing")),
             "remote_bucket": remote_bucket(current_sample.get("remote_hint")),
         }
-        target.update(proposal.get("target") or {})
         trial = {
-            "trial_id": proposal.get("id") or f"trial-{uuid.uuid4().hex[:12]}",
+            "trial_id": f"trial-{uuid.uuid4().hex[:12]}",
             "state": "WAITING_FOR_COMPARABLE_WINDOW",
             "kind": "envelope",
             "baseline_envelope": baseline,
@@ -170,7 +207,12 @@ class TrialManager:
         self.db.create_trial(trial)
         return self.db.get_trial(trial["trial_id"]) or trial
 
-    def _comparable(self, sample: dict[str, Any], target: dict[str, Any]) -> bool:
+    def _entry_comparable(
+        self,
+        sample: dict[str, Any],
+        target: dict[str, Any],
+        validation: dict[str, Any],
+    ) -> bool:
         if sample.get("battery_status") != "Discharging":
             return False
         if not self._core_telemetry_valid(sample):
@@ -195,11 +237,65 @@ class TrialManager:
             target.get("brightness_bucket", -1)
         ):
             return False
+        reference_brightness = target.get("brightness_pct")
+        current_brightness = sample.get("brightness_pct")
+        if (
+            isinstance(reference_brightness, (int, float))
+            and isinstance(current_brightness, (int, float))
+            and abs(float(current_brightness) - float(reference_brightness))
+            > float(validation.get("max_brightness_delta", 10.0))
+        ):
+            return False
         if bool(sample.get("media_playing")) != bool(target.get("media_playing")):
             return False
         if remote_bucket(sample.get("remote_hint")) != int(target.get("remote_bucket", 0)):
             return False
         return True
+
+    def _external_window_change(
+        self,
+        sample: dict[str, Any],
+        trial: dict[str, Any],
+    ) -> str | None:
+        target = trial.get("target") or {}
+        validation = trial.get("validation") or {}
+        arm = str(trial.get("current_arm") or "")
+        if sample.get("battery_status") != "Discharging":
+            return "power source changed"
+        if sample.get("resume_grace"):
+            return "suspend/resume interrupted experiment window"
+        if target.get("battery_epoch") is not None and sample.get("battery_epoch") != target.get(
+            "battery_epoch"
+        ):
+            return "battery epoch changed"
+        if brightness_bucket(sample.get("brightness_pct")) != int(
+            target.get("brightness_bucket", -1)
+        ):
+            return "brightness bucket changed"
+        reference_brightness = target.get("brightness_pct")
+        current_brightness = sample.get("brightness_pct")
+        if (
+            isinstance(reference_brightness, (int, float))
+            and isinstance(current_brightness, (int, float))
+            and abs(float(current_brightness) - float(reference_brightness))
+            > float(validation.get("max_brightness_delta", 10.0))
+        ):
+            return "brightness changed beyond experiment tolerance"
+        if bool(sample.get("user_active")) != bool(target.get("user_active")):
+            return "user active/idle state changed"
+        if remote_bucket(sample.get("remote_hint")) != int(target.get("remote_bucket", 0)):
+            return "remote/local workload changed"
+        if arm.startswith("A"):
+            if target.get("demand_region") and sample.get("demand_region") != target.get(
+                "demand_region"
+            ):
+                return "baseline workload region changed"
+            if bool(sample.get("media_playing")) != bool(target.get("media_playing")):
+                return "baseline media state changed"
+        elif arm.startswith("B"):
+            if not bool(target.get("media_playing")) and bool(sample.get("media_playing")):
+                return "new media workload started during candidate arm"
+        return None
 
     def _baseline_is_active(
         self,
@@ -208,7 +304,11 @@ class TrialManager:
     ) -> bool:
         return sample.get("current_envelope") == trial.get(
             "baseline_envelope"
-        ) and self._comparable(sample, trial.get("target") or {})
+        ) and self._entry_comparable(
+            sample,
+            trial.get("target") or {},
+            trial.get("validation") or {},
+        )
 
     def _capture_verified_baseline(self, trial: dict[str, Any]) -> bool:
         envelope = self.registry.get(str(trial["baseline_envelope"]))
@@ -224,7 +324,7 @@ class TrialManager:
                 reason=str(exc),
             )
             return False
-        if not self._snapshot_matches_envelope(snapshot, envelope):
+        if not snapshot_matches_envelope(snapshot, envelope):
             return False
         self.db.update_trial(trial["trial_id"], snapshot=snapshot)
         return True
@@ -330,7 +430,7 @@ class TrialManager:
             trial_id=trial["trial_id"],
             trial_arm=arm,
         )
-        return [row for row in rows if self._comparable(row, trial.get("target") or {})]
+        return rows
 
     def _close_block(self, trial: dict[str, Any], sample_ts: float) -> dict[str, Any] | None:
         validation = trial.get("validation") or {}
@@ -357,10 +457,18 @@ class TrialManager:
         self.db.add_trial_block(block)
         return block
 
-    def _evaluate(self, trial: dict[str, Any], *, final: bool) -> dict[str, Any]:
+    def _evaluate(self, trial: dict[str, Any], *, stage: str) -> dict[str, Any]:
         blocks = self.db.trial_blocks(trial["trial_id"])
-        baseline = [block for block in blocks if str(block["arm"]).startswith("A")]
-        candidate = [block for block in blocks if str(block["arm"]).startswith("B")]
+        if stage == "initial":
+            baseline_arms = {"A1", "A2"}
+            candidate_arms = {"B1"}
+        elif stage == "revalidation":
+            baseline_arms = {"A3"}
+            candidate_arms = {"B2"}
+        else:
+            raise TrialError(f"unknown evaluation stage: {stage}")
+        baseline = [block for block in blocks if str(block["arm"]) in baseline_arms]
+        candidate = [block for block in blocks if str(block["arm"]) in candidate_arms]
         validation = trial.get("validation") or {}
         result = compare_candidate(
             baseline,
@@ -369,6 +477,8 @@ class TrialManager:
             max_cpu_psi_delta=float(validation.get("max_cpu_psi_delta", 2.0)),
             max_io_psi_delta=float(validation.get("max_io_psi_delta", 2.0)),
             max_thermal_pressure_delta=float(validation.get("max_thermal_pressure_delta", 0.10)),
+            max_media_drop=float(validation.get("max_media_drop", 0.05)),
+            max_sustained_compute_delta=float(validation.get("max_sustained_compute_delta", 0.10)),
         )
         feedback = [
             item
@@ -384,9 +494,27 @@ class TrialManager:
                 "negative_feedback": negative,
             }
 
-        stage = "revalidation" if final else "initial"
         self.db.add_trial_result(trial["trial_id"], stage, result["verdict"], result)
         return result
+
+    def _pause_for_window(self, trial: dict[str, Any], reason: str) -> dict[str, Any]:
+        arm = str(trial.get("current_arm") or "")
+        if arm.startswith("B") and not self._restore_baseline(trial):
+            return self._fail_trial(trial, f"{reason}; failed to restore baseline")
+        if arm in {"A3", "B2"}:
+            next_state = "REVALIDATING"
+            self.db.delete_trial_blocks(trial["trial_id"], {"A3", "B2"})
+        else:
+            next_state = "WAITING_FOR_COMPARABLE_WINDOW"
+            self.db.delete_trial_blocks(trial["trial_id"], {"A1", "B1", "A2"})
+        self.db.update_trial(
+            trial["trial_id"],
+            state=next_state,
+            current_arm=None,
+            arm_start_ts=None,
+            last_error=f"paused: {reason}",
+        )
+        return self.db.get_trial(trial["trial_id"]) or trial
 
     def rollback(self, trial_id: str, reason: str) -> dict[str, Any]:
         trial = self.db.get_trial(trial_id)
@@ -454,6 +582,11 @@ class TrialManager:
                 return trial
             return self.rollback(trial["trial_id"], "battery fell below experiment threshold")
 
+        if not passive_wait:
+            external_change = self._external_window_change(sample, trial)
+            if external_change:
+                return self._pause_for_window(trial, external_change)
+
         if trial["state"] == "WAITING_FOR_COMPARABLE_WINDOW":
             if self._baseline_is_active(sample, trial):
                 if not self._capture_verified_baseline(trial):
@@ -473,9 +606,12 @@ class TrialManager:
 
         if trial["state"] == "REVALIDATING":
             if self._baseline_is_active(sample, trial):
-                if not self._apply_candidate(trial):
-                    return self.db.get_trial(trial["trial_id"])
-                self._begin_arm(trial, "B2", float(sample["ts"]), settle=True)
+                if not self._capture_verified_baseline(trial):
+                    return self._fail_trial(
+                        trial,
+                        "actual HWP state does not match verified baseline before revalidation",
+                    )
+                self._begin_arm(trial, "A3", float(sample["ts"]), settle=False)
                 return self.db.get_trial(trial["trial_id"])
             return trial
 
@@ -511,7 +647,7 @@ class TrialManager:
             return self.db.get_trial(trial["trial_id"])
 
         if arm == "A2":
-            result = self._evaluate(trial, final=False)
+            result = self._evaluate(trial, stage="initial")
             if result["verdict"] != "CANDIDATE_WINNER":
                 return self.reject(trial, result)
             self.db.update_trial(
@@ -519,22 +655,41 @@ class TrialManager:
                 state="REVALIDATING",
                 current_arm=None,
                 arm_start_ts=None,
-                result=result,
+                result={"initial_result": result},
             )
+            return self.db.get_trial(trial["trial_id"])
+
+        if arm == "A3":
+            if not self._apply_candidate(trial):
+                return self.db.get_trial(trial["trial_id"])
+            self._begin_arm(trial, "B2", float(sample["ts"]), settle=True)
             return self.db.get_trial(trial["trial_id"])
 
         if arm == "B2":
             if not self._restore_baseline(trial):
                 return self._fail_trial(trial, "failed to restore baseline after B2")
-            result = self._evaluate(trial, final=True)
+            result = self._evaluate(trial, stage="revalidation")
             if result["verdict"] != "CANDIDATE_WINNER":
-                return self.reject(trial, result)
+                return self.reject(
+                    trial,
+                    {
+                        "verdict": "REJECT",
+                        "reasons": result.get("reasons") or [],
+                        "initial_result": (trial.get("result") or {}).get("initial_result"),
+                        "revalidation_result": result,
+                    },
+                )
+            combined = {
+                "verdict": "CANDIDATE_WINNER",
+                "initial_result": (trial.get("result") or {}).get("initial_result"),
+                "revalidation_result": result,
+            }
             self.db.update_trial(
                 trial["trial_id"],
                 state="VERIFIED_WINNER",
                 current_arm=None,
                 arm_start_ts=None,
-                result=result,
+                result=combined,
             )
             return self.db.get_trial(trial["trial_id"])
 
@@ -559,18 +714,26 @@ class TrialManager:
         if not bool((machine.get("calibration") or {}).get("valid", False)):
             raise TrialError("machine calibration must be valid before promotion")
         calibration_version = int((machine.get("calibration") or {}).get("version") or 0)
+        previous_verified = self.registry.get(str(trial["baseline_envelope"]))
+        if not previous_verified or previous_verified.get("status") != "VERIFIED":
+            raise TrialError("baseline envelope is no longer VERIFIED at promotion time")
+        promotion_evidence = {
+            **(trial.get("result") or {}),
+            "previous_verified_envelope": previous_verified,
+        }
         promoted = self.registry.promote_candidate(
             trial["candidate"],
             battery_epoch=self.db.active_battery_epoch(),
             system_fingerprint=self.db.active_system_fingerprint(),
             calibration_version=calibration_version,
-            result=trial.get("result") or {},
+            result=promotion_evidence,
         )
         self.db.update_trial(
             trial_id,
             state="PROMOTED",
-            result={**(trial.get("result") or {}), "promoted": promoted},
+            result={**promotion_evidence, "promoted": promoted},
         )
+        self.db.set_meta("current_envelope", None)
         return promoted
 
     def feedback(
@@ -622,4 +785,52 @@ class TrialManager:
                     f"trial:{trial_id}",
                     f"user feedback after revalidation: {rating}",
                     {"notes": notes},
+                )
+            elif trial and trial.get("state") == "PROMOTED":
+                previous = trial.get("result") or {}
+                promoted = previous.get("promoted") or {}
+                promoted_name = promoted.get("name")
+                prior_verified = previous.get("previous_verified_envelope")
+                if promoted_name:
+                    try:
+                        self.registry.set_status(str(promoted_name), "BLOCKED")
+                    except KeyError:
+                        pass
+                current = self.db.get_meta("current_envelope")
+                if promoted_name and current == promoted_name:
+                    if not self._restore_baseline(trial):
+                        self._fail_trial(
+                            trial,
+                            "negative feedback after promotion; failed to restore prior baseline",
+                        )
+                        return
+                if isinstance(prior_verified, dict) and prior_verified.get("name") == promoted_name:
+                    machine = load_machine(self.config.root)
+                    restored = self.registry.restore_previous_verified(
+                        prior_verified,
+                        battery_epoch=self.db.active_battery_epoch(),
+                        system_fingerprint=self.db.active_system_fingerprint(),
+                        calibration_version=int(
+                            (machine.get("calibration") or {}).get("version") or 0
+                        ),
+                        reason=f"user feedback after promotion: {rating}",
+                    )
+                    if current == promoted_name:
+                        self.db.set_meta("current_envelope", restored["name"])
+                self.db.update_trial(
+                    trial_id,
+                    state="REJECTED",
+                    result={
+                        **previous,
+                        "verdict": "REJECT",
+                        "reasons": [
+                            *(previous.get("reasons") or []),
+                            "negative_user_feedback_after_promotion",
+                        ],
+                    },
+                )
+                self.db.add_rejection(
+                    f"trial:{trial_id}",
+                    f"user feedback after promotion: {rating}",
+                    {"notes": notes, "promoted": promoted},
                 )

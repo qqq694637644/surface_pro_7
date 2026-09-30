@@ -86,3 +86,53 @@ def test_conflicting_writer_blocks_writes(tmp_path, monkeypatch):
     report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)
     assert report.writable is False
     assert "auto-cpufreq.service" in report.errors[-1]
+
+
+def test_arbitrary_acpi_thermal_zone_is_not_cpu_control_sensor(tmp_path, monkeypatch):
+    sys, proc = build_fake_hardware(tmp_path)
+    zone = sys / "class/thermal/thermal_zone0"
+    (zone / "type").write_text("acpitz", encoding="utf-8")
+    monkeypatch.setattr(hardware, "systemd_available", lambda: True)
+    monkeypatch.setattr(
+        hardware,
+        "thermald_status",
+        lambda: {"available": True, "active": True, "version": "2"},
+    )
+    monkeypatch.setattr(hardware, "ownership_conflicts", lambda: [])
+    report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)
+    assert report.capabilities["thermal"] is False
+    assert report.thermal_sensor is None
+    assert report.writable is False
+
+
+def test_coretemp_package_sensor_beats_arbitrary_thermal_zone(tmp_path):
+    sys, _proc = build_fake_hardware(tmp_path)
+    zone = sys / "class/thermal/thermal_zone0"
+    (zone / "type").write_text("surface_thermal", encoding="utf-8")
+
+    hwmon = sys / "class/hwmon/hwmon0"
+    hwmon.mkdir(parents=True)
+    (hwmon / "name").write_text("coretemp", encoding="utf-8")
+    (hwmon / "temp1_label").write_text("Core 0", encoding="utf-8")
+    (hwmon / "temp1_input").write_text("43000", encoding="utf-8")
+    (hwmon / "temp2_label").write_text("Package id 0", encoding="utf-8")
+    package = hwmon / "temp2_input"
+    package.write_text("47000", encoding="utf-8")
+
+    assert hardware.thermal_sensor_path(sys) == package
+
+
+def test_explicit_pinned_sensor_is_last_safe_fallback(tmp_path):
+    sys, _proc = build_fake_hardware(tmp_path)
+    zone = sys / "class/thermal/thermal_zone0"
+    (zone / "type").write_text("surface_thermal", encoding="utf-8")
+    pinned = zone / "temp"
+    assert hardware.thermal_sensor_path(sys) is None
+    assert (
+        hardware.thermal_sensor_path(
+            sys,
+            "/sys/class/thermal/thermal_zone0/temp",
+        )
+        == pinned
+    )
+    assert hardware.thermal_sensor_path(sys, str(tmp_path / "outside")) is None

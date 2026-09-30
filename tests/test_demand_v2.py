@@ -1,4 +1,4 @@
-from sp7_powerlab.demand import DemandObserver
+from sp7_powerlab.demand import DemandObserver, remote_process_tags
 
 
 def sample(**changes):
@@ -48,6 +48,34 @@ def test_remote_hint_uses_process_and_network():
     )
     assert result["remote_hint"] >= 0.5
     assert result["network_intensity"] == "INTERACTIVE"
+
+
+def test_remote_hint_does_not_depend_on_top_cpu_process_list():
+    result = DemandObserver(cpu_count=4).observe(
+        sample(
+            network_rx_mbps=2.0,
+            processes=[],
+            remote_process_present=True,
+        )
+    )
+    assert result["remote_hint"] >= 0.5
+    assert "REMOTE" in result["region"]
+
+
+def test_ssh_agent_is_not_treated_as_remote_session():
+    assert remote_process_tags("ssh-agent", "/usr/bin/ssh-agent") == set()
+    result = DemandObserver(cpu_count=4).observe(
+        sample(
+            network_rx_mbps=0.1,
+            processes=[{"name": "ssh-agent", "executable": "/usr/bin/ssh-agent"}],
+        )
+    )
+    assert result["remote_hint"] < 0.5
+    assert "LOCAL" in result["region"]
+
+
+def test_exact_ssh_process_is_remote_even_when_low_cpu():
+    assert remote_process_tags("ssh", "/usr/bin/ssh") == {"ssh"}
 
 
 def test_media_is_parallel_requirement():

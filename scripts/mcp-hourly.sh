@@ -5,5 +5,5 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/runtime/hourly-pack-v2.json}"
 
 mkdir -p "$(dirname "$OUT")"
-sp7-powerlab hourly --output "$OUT" >/dev/null
+sp7-powerlab-agent hourly >"$OUT"
 cat "$OUT"

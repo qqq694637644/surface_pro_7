@@ -163,7 +163,12 @@ def test_human_approved_field_is_not_trusted(project_root: Path):
         db.close()
 
 
-def test_cli_side_approval_still_requires_level_two(project_root: Path):
+def test_level_two_llm_path_can_only_save_for_human_review(project_root: Path):
+    config_path = project_root / "config/powerlab.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("level = 1", "level = 2"),
+        encoding="utf-8",
+    )
     config = load_config(project_root)
     db = Database(project_root / "runtime/db.sqlite3")
     registry = EnvelopeRegistry(project_root, db)
@@ -186,10 +191,10 @@ def test_cli_side_approval_still_requires_level_two(project_root: Path):
             db=db,
             registry=registry,
             trials=trials,
-            approved=True,
         )
         assert result["executed"] is False
-        assert result["status"] == "automation_level_too_low"
-        assert result["required_level"] == 2
+        assert result["status"] == "awaiting_human_approval"
+        assert result["required_level_for_autonomous_trial"] == 3
+        assert Path(result["proposal_file"]).exists()
     finally:
         db.close()

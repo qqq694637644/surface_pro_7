@@ -18,7 +18,8 @@ ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/sys/devices/system/cpu /run/sp7-powerlab
 RestrictAddressFamilies=AF_UNIX
-CapabilityBoundingSet=CAP_SYS_ADMIN
+CapabilityBoundingSet=
+AmbientCapabilities=
 LockPersonality=true
 MemoryDenyWriteExecute=true
 

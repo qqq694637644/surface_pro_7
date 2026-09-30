@@ -16,7 +16,7 @@ from .demand import DemandObserver
 from .envelopes import EnvelopeRegistry
 from .hardware import inspect_hardware
 from .helper import RootHelperServer
-from .llm import apply_decision, build_knowledge_pack
+from .llm import build_knowledge_pack
 from .service import PowerLabService, build_actuator, prepare_stack, service_status
 from .storage import Database, LegacyDatabaseError
 from .telemetry import TelemetryCollector
@@ -60,6 +60,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     report = inspect_hardware(
         expected_product=str(identity.get("expected_product", "Surface Pro 7")),
         expected_cpu_substring=str(identity.get("expected_cpu_substring", "i5-1035G4")),
+        configured_thermal_sensor=str((machine.get("thermal") or {}).get("sensor_path") or "")
+        or None,
     )
     database: dict[str, Any]
     try:
@@ -173,7 +175,12 @@ def cmd_observe_now(args: argparse.Namespace) -> int:
     finally:
         db.close()
 
-    collector = TelemetryCollector(config)
+    machine = load_machine(ROOT)
+    collector = TelemetryCollector(
+        config,
+        thermal_sensor_override=str((machine.get("thermal") or {}).get("sensor_path") or "")
+        or None,
+    )
     sample = collector.sample()
     demand = DemandObserver().observe(sample)
     thermal = ThermalObserver(load_machine(ROOT), load_thermal_config(ROOT)).observe(sample)
@@ -447,25 +454,6 @@ def cmd_hourly(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_llm_apply(args: argparse.Namespace) -> int:
-    stack = _trial_stack(args)
-    try:
-        decision = json.loads(Path(args.decision).read_text(encoding="utf-8"))
-        emit(
-            apply_decision(
-                decision,
-                config=stack["config"],
-                db=stack["db"],
-                registry=stack["registry"],
-                trials=stack["trials"],
-                approved=bool(args.approve),
-            )
-        )
-    finally:
-        stack["db"].close()
-    return 0
-
-
 def cmd_knowledge_export(args: argparse.Namespace) -> int:
     config, db, registry = _registry(args)
     try:
@@ -611,15 +599,6 @@ def parser() -> argparse.ArgumentParser:
     hourly = sub.add_parser("hourly")
     hourly.add_argument("--output")
     hourly.set_defaults(func=cmd_hourly)
-
-    llm = sub.add_parser("llm-apply")
-    llm.add_argument("decision")
-    llm.add_argument(
-        "--approve",
-        action="store_true",
-        help="human approval to execute an eligible Level 2+ trial/promotion",
-    )
-    llm.set_defaults(func=cmd_llm_apply)
 
     knowledge = sub.add_parser("knowledge-export")
     knowledge.set_defaults(func=cmd_knowledge_export)

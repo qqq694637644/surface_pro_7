@@ -838,6 +838,16 @@ class Database:
             )
         ]
 
+    def delete_trial_blocks(self, trial_id: str, arms: set[str]) -> None:
+        if not arms:
+            return
+        placeholders = ",".join("?" for _ in arms)
+        with self.conn:
+            self.conn.execute(
+                f"DELETE FROM trial_blocks WHERE trial_id=? AND arm IN ({placeholders})",
+                (trial_id, *sorted(arms)),
+            )
+
     def add_trial_result(
         self, trial_id: str, stage: str, verdict: str, result: dict[str, Any]
     ) -> None:

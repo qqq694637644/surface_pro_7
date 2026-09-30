@@ -21,6 +21,18 @@ VALID_STATUS = {
 }
 
 
+def snapshot_matches_envelope(
+    snapshot: dict[str, Any],
+    envelope: dict[str, Any],
+) -> bool:
+    if snapshot.get("max_perf_pct") != int(envelope["max_perf_pct"]):
+        return False
+    if snapshot.get("turbo") is not None and snapshot.get("turbo") != bool(envelope["turbo"]):
+        return False
+    epp_values = list((snapshot.get("epp") or {}).values())
+    return bool(epp_values) and all(value == envelope["epp"] for value in epp_values)
+
+
 def _hash(envelope: dict[str, Any]) -> str:
     payload = {
         "epp": envelope["epp"],
@@ -69,7 +81,7 @@ class EnvelopeRegistry:
                 stored_revision = int(stored.get("revision") or 1)
                 config_revision = int(env.get("revision") or 1)
                 if (
-                    stored.get("source") in {"trial", "adopted"}
+                    stored.get("source") in {"trial", "adopted", "rollback"}
                     and stored_revision >= config_revision
                     and stored.get("content_hash") == env["content_hash"]
                 ):
@@ -129,6 +141,21 @@ class EnvelopeRegistry:
     def verified(self, name: str) -> bool:
         env = self.get(name)
         return bool(env and env.get("status") == "VERIFIED")
+
+    def match_verified_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        preferred: str | None = None,
+    ) -> str | None:
+        matches = [
+            env["name"]
+            for env in self.list()
+            if env.get("status") == "VERIFIED" and snapshot_matches_envelope(snapshot, env)
+        ]
+        if preferred in matches:
+            return preferred
+        return matches[0] if len(matches) == 1 else None
 
     def set_status(self, name: str, status: str) -> dict[str, Any]:
         env = self.get(name)
@@ -285,6 +312,46 @@ class EnvelopeRegistry:
         )
         self._persist_parameters()
         return promoted
+
+    def restore_previous_verified(
+        self,
+        previous: dict[str, Any],
+        *,
+        battery_epoch: int | None,
+        system_fingerprint: str | None,
+        calibration_version: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        current = self.get(str(previous["name"]))
+        restored = {
+            **previous,
+            "revision": max(
+                int(previous.get("revision") or 1) + 1,
+                int((current or {}).get("revision") or 0) + 1,
+            ),
+            "status": "VERIFIED",
+            "source": "rollback",
+            "updated_ts": time.time(),
+        }
+        restored["content_hash"] = _hash(restored)
+        validate_envelope(restored)
+        self.db.upsert_envelope(restored)
+        self.db.add_envelope_validation(
+            {
+                "envelope_name": restored["name"],
+                "revision": restored["revision"],
+                "battery_epoch": battery_epoch,
+                "system_fingerprint": system_fingerprint,
+                "calibration_version": calibration_version,
+                "result": {
+                    "rollback": True,
+                    "reason": reason,
+                    "restored_content_hash": restored["content_hash"],
+                },
+            }
+        )
+        self._persist_parameters()
+        return restored
 
     def mark_verified_needs_revalidation(self, reason: str) -> list[str]:
         return self.mark_needs_revalidation(None, reason)

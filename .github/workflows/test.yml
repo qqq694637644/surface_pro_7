@@ -72,11 +72,24 @@ jobs:
           enabled = false
           EOF
           sp7-powerlab --help
+          sp7-powerlab-agent --help
           sp7-powerlab --config /tmp/sp7-powerlab-ci.toml doctor
           sp7-powerlab --config /tmp/sp7-powerlab-ci.toml envelope list
 
       - name: Build wheel
-        run: python -m pip wheel . --no-deps -w /tmp/powerlab-wheel
+        run: |
+          python -m pip wheel . --no-deps -w /tmp/powerlab-wheel
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          wheel = glob.glob("/tmp/powerlab-wheel/sp7_powerlab-*.whl")
+          assert len(wheel) == 1, wheel
+          with zipfile.ZipFile(wheel[0]) as archive:
+              names = set(archive.namelist())
+          assert "sp7_powerlab/schemas/envelope-trial-v2.schema.json" in names
+          print("packaged schema present in wheel")
+          PY
 
       - name: Validate shell syntax
         run: bash -n scripts/*.sh

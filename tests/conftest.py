@@ -25,6 +25,18 @@ normal_interactive_min_seconds = 0
 media_min_seconds = 0
 bounded_burst_min_seconds = 0
 
+[experiments]
+min_block_seconds = 20
+named_min_block_seconds = 40
+settle_seconds = 0
+max_brightness_delta = 10
+min_power_saving_w = 0.10
+max_cpu_psi_delta = 2.0
+max_io_psi_delta = 2.0
+max_thermal_pressure_delta = 0.10
+max_media_drop = 0.05
+max_sustained_compute_delta = 0.10
+
 [automation]
 level = 1
 auto_promote = false

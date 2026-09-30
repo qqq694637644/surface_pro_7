@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from sp7_powerlab.actuators import hwp as hwp_module
 from sp7_powerlab.actuators.base import ActuatorError
 from sp7_powerlab.actuators.hwp import HWPActuator
 
@@ -32,7 +33,7 @@ def test_hwp_restore_rejects_forged_path(tmp_path):
     actuator = HWPActuator(tmp_path)
     snap = actuator.snapshot()
     snap["epp"][str(tmp_path / "evil")] = "power"
-    with pytest.raises(ActuatorError, match="unauthorized"):
+    with pytest.raises(ActuatorError, match="policy set"):
         actuator.restore(snap)
     assert (policy / "energy_performance_preference").read_text() == "balance_power"
 
@@ -41,3 +42,36 @@ def test_hwp_restore_rejects_forged_path(tmp_path):
 def test_hwp_bounds(max_perf):
     with pytest.raises(ActuatorError):
         HWPActuator.validate_values("power", max_perf, True)
+
+
+def test_hwp_partial_apply_failure_restores_exact_previous_state(tmp_path, monkeypatch):
+    pstate, policy0 = make_sysfs(tmp_path)
+    policy1 = tmp_path / "devices/system/cpu/cpufreq/policy1"
+    policy1.mkdir(parents=True)
+    (policy1 / "energy_performance_preference").write_text(
+        "balance_power",
+        encoding="utf-8",
+    )
+    original_write = hwp_module._write
+    failed = False
+
+    def fail_second_policy_once(path, value):
+        nonlocal failed
+        if not failed and path == policy1 / "energy_performance_preference" and value == "power":
+            failed = True
+            raise ActuatorError("injected EPP write failure")
+        return original_write(path, value)
+
+    monkeypatch.setattr(hwp_module, "_write", fail_second_policy_once)
+    actuator = HWPActuator(tmp_path)
+    with pytest.raises(ActuatorError, match="rolled back"):
+        actuator.apply_values(epp="power", max_perf_pct=40, turbo=False)
+
+    assert (pstate / "max_perf_pct").read_text(encoding="utf-8") == "60"
+    assert (pstate / "no_turbo").read_text(encoding="utf-8") == "0"
+    assert (policy0 / "energy_performance_preference").read_text(
+        encoding="utf-8"
+    ) == "balance_power"
+    assert (policy1 / "energy_performance_preference").read_text(
+        encoding="utf-8"
+    ) == "balance_power"

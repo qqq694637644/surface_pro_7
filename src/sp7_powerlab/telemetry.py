@@ -19,6 +19,7 @@ from typing import Any
 import psutil
 
 from .config import Config
+from .demand import remote_process_tags
 from .hardware import (
     PROC,
     SYSFS,
@@ -167,8 +168,11 @@ def _cpu_state(sys_root: Path = SYSFS) -> dict[str, Any]:
     }
 
 
-def _temperature_c(sys_root: Path = SYSFS) -> float | None:
-    path = thermal_sensor_path(sys_root)
+def _temperature_c(
+    sys_root: Path = SYSFS,
+    sensor_path: Path | None = None,
+) -> float | None:
+    path = sensor_path or thermal_sensor_path(sys_root)
     if path is None:
         return None
     value = _number(path)
@@ -443,11 +447,22 @@ class ProcessSampler:
     def __init__(self, top_n: int = 10):
         self.top_n = top_n
         self._primed = False
+        self.remote_processes: list[str] = []
 
     def sample(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
+        remote_processes: set[str] = set()
         for proc in psutil.process_iter(
-            ["pid", "ppid", "name", "exe", "create_time", "memory_info", "io_counters"]
+            [
+                "pid",
+                "ppid",
+                "name",
+                "exe",
+                "cmdline",
+                "create_time",
+                "memory_info",
+                "io_counters",
+            ]
         ):
             try:
                 cpu = proc.cpu_percent(None)
@@ -467,10 +482,18 @@ class ProcessSampler:
                         "write_bytes": getattr(io, "write_bytes", None),
                     }
                 )
+                remote_processes.update(
+                    remote_process_tags(
+                        info.get("name"),
+                        info.get("exe"),
+                        info.get("cmdline"),
+                    )
+                )
             except (psutil.Error, OSError):
                 continue
         rows.sort(key=lambda item: item.get("cpu_percent") or 0.0, reverse=True)
         self._primed = True
+        self.remote_processes = sorted(remote_processes)
         return rows[: self.top_n]
 
 
@@ -481,6 +504,7 @@ class TelemetryCollector:
         *,
         sys_root: Path = SYSFS,
         proc_root: Path = PROC,
+        thermal_sensor_override: str | None = None,
         clock=time.time,
     ):
         self.config = config
@@ -488,6 +512,7 @@ class TelemetryCollector:
         self.proc_root = proc_root
         self.clock = clock
         self.rapl_path = rapl_energy_path(sys_root)
+        self.thermal_path = thermal_sensor_path(sys_root, thermal_sensor_override)
         self.rapl_max_path = (
             self.rapl_path.parent / "max_energy_range_uj" if self.rapl_path else None
         )
@@ -534,7 +559,7 @@ class TelemetryCollector:
         return power, {"10s": rolling(10), "60s": rolling(60), "300s": rolling(300)}
 
     def _temp(self, ts: float) -> tuple[float | None, float | None]:
-        temp = _temperature_c(self.sys_root)
+        temp = _temperature_c(self.sys_root, self.thermal_path)
         if temp is not None:
             self._temps.append((ts, temp))
         cutoff = ts - 300
@@ -676,6 +701,7 @@ class TelemetryCollector:
             "load1": _load1(self.proc_root),
             **cpu,
             "package_temp_c": temp,
+            "thermal_sensor_path": str(self.thermal_path) if self.thermal_path else None,
             "temp_slope_c_per_min": temp_slope,
             "rapl_power_instant_w": instant_rapl,
             "rapl_power_10s_w": rolling["10s"],
@@ -698,4 +724,6 @@ class TelemetryCollector:
             "activity": activity,
             "processes": self._last_process_rows,
             "processes_fresh": processes_fresh,
+            "remote_process_present": bool(self.process_sampler.remote_processes),
+            "remote_processes": self.process_sampler.remote_processes,
         }
