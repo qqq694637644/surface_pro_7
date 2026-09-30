@@ -1,264 +1,84 @@
-# 运维与故障恢复
+# Operations
 
-## 状态
+## 日常状态
 
-```bash
-sp7-powerlab service-status
-sp7-powerlab current
-sp7-powerlab actuator-inspect
-```
+~~~bash
+sp7-powerlab service status
+sp7-powerlab observe now
+sp7-powerlab observe power --hours 24
+sp7-powerlab incidents --hours 24
+~~~
 
-## 观察真实使用
+## Waste incident
 
-```bash
-sp7-powerlab observe --hours 1
-sp7-powerlab observe --hours 24
-sp7-powerlab contexts --hours 24
-sp7-powerlab contexts --hours 168 --scene coding_interactive
-```
+PowerLab 优先查“低 demand + 明显高于个人历史 baseline 的 BAT W”。
 
-## Profile
+incident 会附带 top processes、RAPL、brightness、network、GPU hint 和 system fingerprint。
 
-```bash
-sp7-powerlab profile list
-sp7-powerlab profile inspect ppd-balanced
-sp7-powerlab profile apply ppd-balanced --reason "manual validation"
-```
+正确顺序是先找浪费原因，不是先降低 max_perf_pct。
 
-人工验证后：
+## Media decode
 
-```bash
-sp7-powerlab profile status ppd-balanced verified   --scene coding_interactive   --note "validated on SP7"
-```
+媒体播放同时出现高 CPU、高 RAPL、GPU decode activity 不明显时，会记录 suspected media software decode waste incident。
 
-标记：
+这是诊断 hint，不是自动控制信号。
 
-```text
-experimental
-verified
-needs_revalidation
-deprecated
-blocked
-```
+## Thermal incident
 
-Kernel/工具版本漂移时，非 no-op verified profile 会自动转为 `needs_revalidation`。
+THERMAL_PRESSURE / THROTTLING 会让 trial 自动 rollback，controller 优先 THERMAL_SAFE，thermald 继续作为独立安全层。
+
+## Suspend/resume
+
+超过 collector gap 后 RAPL/temp rolling window 重建，进入 resume grace，grace 内不自动控制，也不把 suspend 计入有效实验时长。
+
+## Service restart
+
+主 service 启动时不会继续一个跨重启的旧实验。任何未完成 trial 都会先尝试恢复 exact baseline snapshot 并标记为 rolled back；如果 helper/HWP 已不可用导致恢复失败，则 trial 进入 FAILED，controller 保持不可写状态直到硬件/ownership 条件重新通过。
+
+运行期间每 5 分钟重新检查硬件契约、thermald/ownership 冲突和 helper 可用性；calibration 或 thermal 配置文件变化也会同步到 observer/controller，并使受影响的 VERIFIED envelope 进入 revalidation。
 
 ## Manual override
 
-```bash
-sp7-powerlab override set safe-baseline
-sp7-powerlab override status
-sp7-powerlab override clear
-```
+只接受 verified envelope：
 
-设置 override 时，如果有 active trial，会先 rollback。
+~~~bash
+sp7-powerlab envelope override INTERACTIVE_EFFICIENT
+sp7-powerlab envelope clear-override
+~~~
 
-## Trial
+## Feedback
 
-查看：
+~~~bash
+sp7-powerlab feedback good --envelope INTERACTIVE_EFFICIENT
+sp7-powerlab feedback sluggish --trial-id trial-xxxx --notes "..."
+~~~
 
-```bash
-sp7-powerlab trial status
-```
+负面 trial feedback 会立即回滚。
 
-人工启动：
+如果负面反馈发生在 revalidation 之后、promotion 之前，该 VERIFIED_WINNER
+也会被改成 REJECTED，不能继续 promotion。
 
-```bash
-sp7-powerlab trial start proposals/my-proposal.json
-```
+## Trial promotion
 
-如果你明确知道场景条件：
+~~~bash
+sp7-powerlab trial status --trial-id trial-xxxx
+sp7-powerlab trial promote trial-xxxx
+~~~
 
-```bash
-sp7-powerlab trial start proposals/my-proposal.json --ignore-context
-```
+只有 VERIFIED_WINNER 能 promotion；Level 0/1 不允许。
 
-评价：
+## Runtime reset
 
-```bash
-sp7-powerlab trial evaluate
-```
+只在 v1→v2 或明确丢弃本地 DB 时：
 
-回滚：
+~~~bash
+sp7-powerlab reset-runtime --yes
+~~~
 
-```bash
-sp7-powerlab trial rollback --reason "manual stop"
-```
+## Git knowledge
 
-晋升：
-
-```bash
-sp7-powerlab trial promote t-...
-```
-
-只有经过 revalidation 的 `CANDIDATE_WINNER` 能晋升。
-
-外部 profile A/B 也走同一套 trial。proposal 中使用：
-
-```text
-change.parameter = profile.id
-change.from      = baseline profile id
-change.to        = candidate profile id
-```
-
-Power Options/PPD profile 不要通过 direct sysfs trial 绕过单一写入者规则。
-
-## 固定工作量
-
-collector 必须正在运行：
-
-```bash
-sp7-powerlab task-run   --scene compile   --label surface-build   -- make -j4
-```
-
-重复至少配置要求的次数。
-
-每个 run 保存：
-
-- duration
-- battery energy
-- average power
-- exit code
-- profile
-- trial
-- quality
-
-## 人工体验
-
-```bash
-sp7-powerlab feedback accepted   --trial-id t-...   --responsiveness 5   --stability good   --suspend-wake good
-
-sp7-powerlab feedback rejected   --trial-id t-...   --responsiveness 2   --notes "滚动卡顿"
-```
-
-## collector crash
-
-systemd：
-
-```bash
-systemctl --user restart sp7-powerlab-collector
-journalctl --user -u sp7-powerlab-collector -n 200
-```
-
-如果 trial 已经应用并留下 lock，collector 启动会尝试恢复 snapshot。
-
-## profile state
-
-sysfs verified profile 应用时，PowerLab 保存：
-
-```text
-runtime/profile-state.json
-```
-
-场景切走或 manual override 时，先恢复应用前的参数，再应用新 profile。
-
-## thermal emergency
-
-`config/powerlab.toml`：
-
-```toml
-thermal_emergency_c = 90
-```
-
-active trial 越过阈值时会自动 rollback。
-
-## Root helper 升级
-
-root helper 是 root-owned 的独立安装，不会自动跟随当前 Git checkout。
-
-更新代码并审核完成后，显式重新安装：
-
-```bash
-bash scripts/install-root-helper.sh
-```
-
-检查：
-
-```bash
-systemctl status sp7-powerlab-root-helper
-sp7-powerlab actuator-inspect
-```
-
-## ActivityWatch 不可用
-
-collector 不退出。
-
-检查：
-
-```bash
-curl http://127.0.0.1:5600/api/0/buckets/
-sp7-powerlab collect-once
-```
-
-如果 `activity.source=activitywatch-unavailable`，修 ActivityWatch/awatcher；不要用这种数据做应用级结论。
-
-## 数据库
-
-默认：
-
-```text
-runtime/powerlab.sqlite3
-```
-
-WAL 模式。
-
-备份前可先停止 collector：
-
-```bash
-systemctl --user stop sp7-powerlab-collector
-cp runtime/powerlab.sqlite3 /safe/place/
-systemctl --user start sp7-powerlab-collector
-```
-
-## 重置实验状态
-
-优先：
-
-```bash
-sp7-powerlab trial rollback
-sp7-powerlab override clear
-```
-
-不要直接删除 `trial.lock`，除非确认没有任何 trial 参数还留在系统上。
-
-## 数据保留
-
-`raw_retention_days` 控制高频：
-
-- samples
-- process samples
-- app events
-- system events
-
-分钟 rollup、sessions、trial、反馈、知识记录继续保留。
-
-## Git 长期知识
-
-每次 hourly 会导出：
-
-```text
-history/continuous/knowledge.json
-history/continuous/trials/*.json
-history/continuous/daily/YYYY-MM-DD.json
-```
-
-按需提交：
-
-```bash
+~~~bash
 bash scripts/commit-knowledge.sh
-bash scripts/commit-knowledge.sh --push
-```
+~~~
 
-默认不自动 commit/push。
-
-## 更新仓库后
-
-升级代码/Kernel/Power Options 等之后：
-
-```bash
-pip install -e .
-systemctl --user restart sp7-powerlab-collector
-sp7-powerlab hourly
-```
-
-版本 fingerprint 变化会触发旧 verified 策略重新验证。
+默认不会自动 push。

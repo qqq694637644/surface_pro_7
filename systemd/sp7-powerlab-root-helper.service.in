@@ -1,12 +1,12 @@
 [Unit]
-Description=Surface Pro 7 PowerLab privileged parameter helper
+Description=Surface Pro 7 PowerLab v2 restricted HWP helper
 After=local-fs.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/
-ExecStart=@POWERLAB_BIN@ root-helper --socket @SOCKET@ --allow-user @USER@
+ExecStart=@POWERLAB_BIN@ root-helper serve --socket @SOCKET@ --allow-uid @UID@
 Restart=on-failure
 RestartSec=3
 RuntimeDirectory=sp7-powerlab
@@ -15,6 +15,13 @@ UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/sys/devices/system/cpu /run/sp7-powerlab
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target

@@ -1,55 +1,60 @@
 [collector]
-system_interval_seconds = 10
-process_interval_seconds = 20
+sample_seconds = 10
+process_seconds = 30
 rollup_seconds = 60
 max_gap_seconds = 45
-top_processes = 12
+top_processes = 10
 
-[llm]
-analysis_interval_minutes = 60
-history_days = 30
-recent_hours = 24
-max_trials_in_pack = 40
+[controller]
+minimum_dwell_seconds = 60
+resume_grace_seconds = 45
+reconcile_seconds = 60
+low_battery_percent = 15
+waste_window_minutes = 5
+waste_min_baselines = 8
+waste_relative_threshold = 0.20
+waste_absolute_threshold_w = 0.8
 
-[experiment]
-settle_seconds = 120
-interactive_min_sessions = 3
-interactive_min_valid_minutes = 60
-job_min_repetitions = 3
-max_one_primary_change = true
-revalidation_sessions = 2
-revalidation_min_valid_minutes = 30
+[experiments]
+min_block_seconds = 300
+named_min_block_seconds = 600
+settle_seconds = 60
+max_brightness_delta = 10
+min_power_saving_w = 0.10
+max_cpu_psi_delta = 2.0
+max_io_psi_delta = 2.0
+max_thermal_pressure_delta = 0.10
+max_media_drop = 0.05
+max_sustained_compute_delta = 0.10
+
+[calibration]
+cold_idle_min_seconds = 900
+normal_interactive_min_seconds = 1800
+media_min_seconds = 600
+bounded_burst_min_seconds = 30
 
 [automation]
-auto_switch_verified_profiles = true
-auto_run_low_risk_trials = false
-auto_promote_profiles = false
-recover_trial_on_collector_start = true
+# 0=read only, 1=verified control, 2=assisted trials,
+# 3=low-risk autonomous trials, 4=eligible auto-promotion.
+level = 0
+auto_promote = false
 
 [storage]
 database = "runtime/powerlab.sqlite3"
 raw_retention_days = 30
-keep_rollups_forever = true
+
+[llm]
+analysis_interval_minutes = 60
+history_hours = 24
+max_incidents = 20
+max_trials = 20
 
 [activity]
+# Attribution only. The controller does not depend on ActivityWatch.
 enabled = true
 server_url = "http://127.0.0.1:5600"
 timeout_seconds = 1.0
 store_window_title = true
-store_executable = true
-store_process_tree = true
-
-[policy]
-actuator = "auto"
-safe_profile = "safe-baseline"
-thermal_emergency_c = 90
-low_battery_percent = 15
-
-[power_options]
-binary = "power-daemon-mgr"
-
-[power_profiles_daemon]
-binary = "powerprofilesctl"
 
 [helper]
 enabled = true

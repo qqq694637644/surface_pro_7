@@ -1,0 +1,29 @@
+[envelopes.ECO_IDLE]
+status = "CANDIDATE"
+epp = "power"
+max_perf_pct = 30
+turbo = false
+
+[envelopes.INTERACTIVE_EFFICIENT]
+status = "CANDIDATE"
+epp = "balance_power"
+max_perf_pct = 60
+turbo = true
+
+[envelopes.REMOTE_EFFICIENT]
+status = "CANDIDATE"
+epp = "balance_power"
+max_perf_pct = 50
+turbo = true
+
+[envelopes.MEDIA_EFFICIENT]
+status = "CANDIDATE"
+epp = "power"
+max_perf_pct = 45
+turbo = true
+
+[envelopes.THERMAL_SAFE]
+status = "CANDIDATE"
+epp = "power"
+max_perf_pct = 30
+turbo = false

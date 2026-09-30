@@ -9,17 +9,16 @@ if [[ "${1:-}" == "--push" ]]; then
   PUSH=true
 fi
 
-sp7-powerlab knowledge-export
+sp7-powerlab knowledge-export >/dev/null
 
-git add -- history/continuous proposals
+git add -- config/machine.toml config/envelopes.toml history/continuous proposals
 if git diff --cached --quiet; then
-  echo "No PowerLab knowledge changes to commit."
+  echo "No PowerLab v2 knowledge changes to commit."
   exit 0
 fi
 
-STAMP="$(date -Iseconds)"
-git commit -m "Update SP7 PowerLab knowledge $STAMP"
+git commit -m "Update SP7 PowerLab v2 knowledge $(date -Iseconds)"
 
 if [[ "$PUSH" == true ]]; then
-  git push origin HEAD:refs/heads/main
+  git push
 fi

@@ -1,0 +1,26 @@
+[identity]
+expected_product = "Surface Pro 7"
+expected_cpu_substring = "i5-1035G4"
+
+[calibration]
+valid = false
+version = 0
+completed_phases = []
+
+[battery]
+active_epoch = 0
+
+[baselines]
+idle_battery_w = 0.0
+interactive_battery_w = 0.0
+media_battery_w = 0.0
+idle_temp_c = 0.0
+interactive_temp_p90_c = 0.0
+normal_rapl_p90_w = 0.0
+
+[thermal]
+soft_temp_c = 0.0
+pressure_temp_c = 0.0
+slope_reference_c_per_min = 0.0
+rapl_reference_w = 0.0
+cooldown_reference_c_per_min = 0.0

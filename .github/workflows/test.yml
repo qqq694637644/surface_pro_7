@@ -23,7 +23,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e . pytest
+          python -m pip install -e . pytest ruff
 
       - name: Compile
         run: python -m compileall -q src
@@ -31,25 +31,65 @@ jobs:
       - name: Test
         run: pytest -q
 
+      - name: Ruff
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+
       - name: Parse config and schemas
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
-          from sp7_powerlab.config import load_config
-          from sp7_powerlab.profiles import ProfileRegistry
+          from sp7_powerlab.config import (
+              load_config,
+              load_envelope_config,
+              load_machine,
+              load_thermal_config,
+          )
 
           root = Path.cwd()
           load_config(root)
-          ProfileRegistry(root).load()
+          load_machine(root)
+          load_envelope_config(root)
+          load_thermal_config(root)
           for path in (root / "schemas").glob("*.json"):
               json.loads(path.read_text(encoding="utf-8"))
           print("config/schema parse ok")
           PY
 
+      - name: CLI smoke
+        run: |
+          cat >/tmp/sp7-powerlab-ci.toml <<'EOF'
+          [storage]
+          database = "/tmp/sp7-powerlab-ci.sqlite3"
+
+          [activity]
+          enabled = false
+
+          [helper]
+          enabled = false
+          EOF
+          sp7-powerlab --help
+          sp7-powerlab-agent --help
+          sp7-powerlab --config /tmp/sp7-powerlab-ci.toml doctor
+          sp7-powerlab --config /tmp/sp7-powerlab-ci.toml envelope list
+
       - name: Build wheel
-        run: python -m pip wheel . --no-deps -w /tmp/powerlab-wheel
+        run: |
+          python -m pip wheel . --no-deps -w /tmp/powerlab-wheel
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          wheel = glob.glob("/tmp/powerlab-wheel/sp7_powerlab-*.whl")
+          assert len(wheel) == 1, wheel
+          with zipfile.ZipFile(wheel[0]) as archive:
+              names = set(archive.namelist())
+          assert "sp7_powerlab/schemas/envelope-trial-v2.schema.json" in names
+          print("packaged schema present in wheel")
+          PY
 
       - name: Validate shell syntax
         run: bash -n scripts/*.sh

@@ -1,0 +1,19 @@
+[model]
+temperature_weight = 0.40
+slope_weight = 0.20
+sustained_power_weight = 0.25
+throttle_weight = 0.15
+
+[state]
+warming_enter = 0.35
+warming_exit = 0.25
+heat_soaked_enter = 0.55
+heat_soaked_exit = 0.40
+pressure_enter = 0.75
+pressure_exit = 0.60
+throttling_enter = 0.95
+
+[bootstrap]
+# Safety stop used only before calibration exists.
+abort_temp_c = 80.0
+max_burst_seconds = 90

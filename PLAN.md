@@ -1,1831 +1,1943 @@
-# Surface Pro 7 PowerLab v2 — 热预算与性能需求驱动的破坏式重构计划
+# Surface Pro 7 PowerLab v2 — 续航优先的长期自优化设计计划
 
-> 状态：v2 设计审查稿
+> 状态：v2 破坏式重构设计稿
 >
-> 目标硬件：**Microsoft Surface Pro 7 / Intel Core i5-1035G4**
+> 目标硬件：Microsoft Surface Pro 7，Intel Core i5-1035G4
 >
-> 设备角色：**低功耗个人交互终端**。浏览、文档、代码编辑、终端、远程开发、媒体为主要用途；持续高负载计算默认放在远程服务器，本机持续高 CPU/GPU 负载视为异常或短时 burst。
+> 设备定位：个人低功耗交互终端。主要用于浏览、文档、代码编辑、终端、远程开发、媒体播放和轻量本地任务；持续高负载计算默认放到远程服务器。
 >
-> 重构原则：**破坏式更新，不保留 v1 兼容层，不做旧数据库迁移，不保留旧 CLI alias，不同时维护 scene-based 与 demand-based 两套路由。**
+> 最高目标：在用户体验不出现可感知退化、系统保持稳定且不进入不可持续热状态的前提下，尽可能降低真实日常使用中的整机电池放电功率，从而延长实际续航。
 >
-> 核心目标：在保证前台交互和媒体连续性的前提下，减少整机电池功耗，主动避免 Surface Pro 7 无风扇机身的长期 heat soak 和 emergency throttle。
+> 重构原则：破坏式更新。v2 不保留 v1 的场景分类主架构、不迁移 v1 SQLite、不保留旧 CLI alias、不维护兼容适配层、不同时维护两套控制逻辑。
 
 ---
 
-## 1. 为什么 v1 需要整体推倒重做
+## 1. 项目到底要解决什么
 
-v1 的核心抽象是：
+PowerLab 不是性能管理器，也不是热管理器，更不是“识别用户正在做什么”的 AI。
 
-```text
-foreground app / processes
-        ↓
-scene = reading / coding / web / compile / mixed ...
-        ↓
-scene -> verified profile
-```
+它只有一个主目标：
 
-这个抽象存在三个根本问题。
+**让这台 Surface Pro 7 在真实个人使用中尽量少从电池取电，同时保持用户愿意接受的体验。**
 
-### 1.1 “用户到底在做什么”并不是电源控制真正需要的问题
+工程上写成：
 
-真实使用经常同时存在：
+- 主优化目标：最小化整机 BAT 放电功率和单位有效使用时间的能量消耗。
+- 硬约束一：交互体验不能出现可感知退化。
+- 硬约束二：媒体播放、网络和系统稳定性不能因为节能策略失效。
+- 硬约束三：不能把机器推进不可持续的 heat soak、thermal throttling 或 emergency frequency collapse。
+- 硬约束四：安全层 thermald、firmware 和 CPU thermal protection 永远高于 PowerLab。
 
-- 编辑器；
-- 浏览器；
-- 远程 SSH / Remote IDE；
-- 音乐；
-- 同步；
-- language server；
-- 后台短任务。
+因此：
 
-强制回答“这是 coding 还是 web 还是 mixed”并不能直接告诉 CPU 应该需要多少性能。
+**续航是 objective；体验、稳定和热状态是 constraints。**
 
-电源控制真正需要知道的是：
-
-```text
-用户当前是否活跃？
-前台是否对延迟敏感？
-本地计算强度有多高？
-有没有持续媒体？
-网络吞吐是否重要？
-本机是否正在积热？
-当前是否已经发生 thermal pressure？
-```
-
-因此 v2 不再把“语义场景名称”作为实时控制主键。
-
-### 1.2 Surface Pro 7 i5 的热行为必须成为一等公民
-
-Surface Pro 7 i5 为无风扇设计。Linux 社区已经长期报告：
-
-```text
-持续高负载
-→ 机身 heat soak
-→ 温度继续上升
-→ 频率突然跌到极低水平
-→ 冷却后恢复
-→ 再次升温
-```
-
-这意味着仅用“当前 CPU load / 当前温度”做策略不够。
-
-v2 必须显式建模：
-
-- 当前温度；
-- 温度变化速度 dT/dt；
-- 10s / 60s / 300s RAPL package power；
-- 整机电池功耗；
-- CPU 频率是否异常塌陷；
-- thermal throttle 计数（硬件暴露时）；
-- 持续高功耗时间；
-- thermal headroom。
-
-### 1.3 本机不是高性能工作站
-
-用户已明确：
-
-> 长时间高负载任务会放到远程服务器。
-
-因此 v2 不再围绕本地 compile/render/transcode 做大量特殊优化。
-
-对于这台设备：
-
-```text
-持续本地高负载
-```
-
-优先解释为：
-
-```text
-LOCAL_COMPUTE_PRESSURE / 可能异常 / 需要热保护
-```
-
-而不是“进入性能模式”。
+PowerLab 不追求最低温度，也不追求最低 CPU 频率。
 
 ---
 
-## 2. v2 的总原则
+## 2. 设计哲学
 
-### 2.1 实时频率由 Linux 和 Intel HWP 决定
+### 2.1 先消除浪费，再考虑牺牲性能
 
-PowerLab 不实现自己的毫秒级 DVFS。
+节能动作分三层。
 
-职责：
+第一层：零成本或接近零成本的浪费消除。
 
-```text
-Linux scheduler
-+ intel_pstate
-+ Intel HWP
-```
+包括：
 
-负责实际 P-state / 频率选择。
+- 异常后台进程；
+- 浏览器 runaway tab；
+- 硬件视频解码失效；
+- GPU 无法进入 idle；
+- 不必要的设备唤醒；
+- 明显异常的 Wi-Fi / Bluetooth / USB 活动；
+- kernel / driver 回归；
+- idle residency 异常；
+- 某次软件升级导致的额外功耗。
 
-PowerLab 只提供较慢的“性能意图”：
+这类问题优先级最高，因为通常可以做到：
+
+**更省电，同时不降低体验。**
+
+第二层：性能/能效意图优化。
+
+包括：
 
 - EPP；
-- max_perf_pct；
-- turbo 是否允许；
-- 已验证的设备节能设置。
+- intel_pstate max_perf_pct；
+- Turbo 策略；
+- HWP 可用的慢速性能意图；
+- 已验证的设备节能选项。
 
-### 2.2 热安全由 thermald 负责
+目标是：
 
-thermald 作为独立安全层长期运行。
+**只减少用户感觉不到的性能余量。**
 
-PowerLab：
+第三层：明确的体验换续航。
 
-- 不关闭 thermald；
-- 不绕过 thermald；
-- 不自动提高 thermald 的热限制；
-- 不让 LLM 直接改 thermald trip point；
-- 把 thermald / firmware 的限制视为高于 PowerLab 的安全覆盖。
+例如非常激进的频率限制、显示策略、设备关闭等。
 
-### 2.3 PowerLab 只做秒级/分钟级策略
+这类策略默认不自动启用，必须经过用户明确接受。
 
-PowerLab 本地 daemon 负责：
+### 2.2 不自己做毫秒级 DVFS
 
-```text
-需求状态
-+
-热状态
-+
-电池状态
-+
-人工 override
-        ↓
-选择一个已验证 operating envelope
-```
+PowerLab 不实现：
 
-默认控制周期约 5–10 秒。
+- 每几十毫秒决定频率；
+- 自己计算 1.2 GHz / 1.8 GHz / 2.5 GHz；
+- 用 LLM 或 Python 循环替代 CPU governor。
 
-### 2.4 LLM 只做慢速研究
+瞬时频率选择交给：
 
-LLM 大约每小时运行一次。
+- Linux scheduler；
+- intel_pstate；
+- Intel HWP。
 
-允许：
+PowerLab 只提供较慢的“性能意图”。
 
-- 分析回归；
-- 查找异常进程；
-- 判断哪个 envelope 值得实验；
-- 生成受控 trial；
-- 分析长期热行为；
-- 建议人工修改 thermal calibration。
+### 2.3 不把 LLM 放进实时控制回路
 
-禁止：
+LLM 大约每小时或按需运行。
 
+它负责：
+
+- 解释历史；
+- 找异常；
+- 研究社区和软件回归；
+- 提出新的可验证假设；
+- 生成受控 trial。
+
+它不负责：
+
+- 秒级控制；
 - 实时调频；
-- 实时分类工作内容；
-- 直接 root shell；
-- 自动提高安全温度；
-- 自己宣布实验成功。
+- thermal safety；
+- 决定实验是否成功；
+- 任意 root 操作。
 
-### 2.5 v2.0 不使用机器学习参与控制
+### 2.4 v2.0 不依赖机器学习控制
 
-v2.0 明确采用：
+v2.0 的实时路径只使用：
 
-```text
-deterministic signals
-+ state machine
-+ hysteresis
-+ A/B experiment
-```
+- 可测物理量；
+- 确定性状态机；
+- hysteresis；
+- rolling window；
+- A/B 实验；
+- 用户反馈。
 
-不使用：
-
-- 深度学习实时分类；
-- contextual bandit 自动探索；
-- 在线神经网络；
-- LLM 实时控制。
-
-以后如果数据证明规则不足，ML 只能先进入 **shadow mode**：
-
-```text
-预测
-但不控制
-```
-
-经过离线验证后再单独审查是否允许参与决策。
+以后即使研究 ML，也先进入 shadow mode，只预测、不控制。
 
 ---
 
-## 3. 新总体架构
+## 3. 为什么不再以“工作场景分类”为核心
 
-```text
-                          Surface Pro 7
-                                │
-         ┌──────────────────────┴──────────────────────┐
-         │                                             │
-         ▼                                             ▼
-   Demand Sensors                                Thermal Sensors
-         │                                             │
-   user active                                   package temp
-   local CPU pressure                            dT/dt
-   media playing                                 RAPL package power
-   remote-session hint                           battery power
-   network activity                              sustained power windows
-   PSI / load                                    throttle indicators
-         │                                             │
-         ▼                                             ▼
-   Demand Observer                               Thermal Observer
-         │                                             │
-         └──────────────────────┬──────────────────────┘
-                                ▼
-                         Local Controller
-                                │
-                     verified operating envelope
-                                │
-                  ┌─────────────┴─────────────┐
-                  ▼                           ▼
-            intel_pstate/HWP               thermald
-            performance intent           thermal safety
-                  │                           │
-                  └─────────────┬─────────────┘
-                                ▼
-                              CPU
-                                │
-                                ▼
-                   battery / temperature result
-                                │
-                                ▼
-                         SQLite history
-                                │
-                           ~1 hour
-                                ▼
-                              LLM
-                                │
-                         controlled trials
-                                │
-                        promote / reject
-```
+v1 试图把用户状态归类为 reading、coding、web、compile、mixed 等。
+
+这有两个问题。
+
+第一，真实个人使用天然是并发的。
+
+用户可能同时：
+
+- 编辑代码；
+- 查浏览器文档；
+- SSH 到服务器；
+- 播放音乐；
+- 后台同步；
+- language server 工作。
+
+第二，电源控制真正需要的是“机器需要什么”，而不是“这个行为叫什么”。
+
+v2 只关心：
+
+- 用户是否活跃；
+- 前台是否需要低延迟；
+- 本地计算压力；
+- 是否需要连续媒体；
+- 网络是否重要；
+- 是否存在 I/O / CPU pressure；
+- 当前热状态；
+- 当前整机功耗。
+
+因此 ActivityWatch、前台应用和窗口标题在 v2 中主要用于归因和解释，而不是实时策略主键。
 
 ---
 
-## 4. 删除 v1 的核心抽象
+## 4. 目标设备假设
 
-以下设计在 v2 中直接删除。
+v2 专门针对这一台机器设计，不做通用 Linux 笔记本框架。
 
-### 4.1 删除 scene 作为实时主键
+硬件契约：
 
-删除：
+- DMI 必须是 Surface Pro 7；
+- CPU 必须是 Intel Core i5-1035G4；
+- intel_pstate 必须可用；
+- HWP 必须确认可用或明确记录实际工作模式；
+- BAT sysfs 必须可读取；
+- 至少一个可信 CPU/package thermal sensor 必须可读取；
+- Intel RAPL package energy 必须可读取，或系统进入只读诊断模式；
+- systemd 可用；
+- thermald 状态可查询。
 
-```text
-idle
-reading
-web_interactive
-coding_interactive
-office_interactive
-remote_interactive
-compile
-background_compute
-media_playback
-video_call
-file_transfer
-mixed
-unknown
-```
+不满足硬件契约时：
 
-实时控制不再依赖这些字符串。
-
-可以保留少量“诊断标签”，但仅用于：
-
-- UI；
-- 报告；
-- LLM 阅读；
-- 用户理解。
-
-它们不能直接决定 profile。
-
-### 4.2 删除 ContextEngine v1
-
-删除当前：
-
-```text
-src/sp7_powerlab/context.py
-config/contexts.toml
-schemas/context-v1.schema.json
-```
-
-不保留兼容 adapter。
-
-### 4.3 删除 scene -> profile policy
-
-删除：
-
-```text
-config/policy.toml
-context_policies
-UPDATE_CONTEXT_RULE
-scene-specific profile promotion
-```
-
-不再存在：
-
-```text
-coding_interactive -> profile A
-reading -> profile B
-```
-
-### 4.4 删除本地 heavy-job 优化主线
-
-删除本地固定任务作为核心架构：
-
-- compile 专用场景；
-- job_min_repetitions；
-- task-run 作为主要优化流程；
-- compile/transcode 的自动 profile 学习；
-- energy-per-local-heavy-task 的特殊状态机。
-
-如果以后确实需要，可以重新作为插件设计；v2 核心不保留。
-
-### 4.5 ActivityWatch 降级为可选诊断输入
-
-ActivityWatch / awatcher 不再是实时控制必需依赖。
-
-保留价值：
-
-- 哪个程序导致异常；
-- 用户活动统计；
-- LLM 解释历史；
-- 前台 app attribution。
-
-实时控制必须在 ActivityWatch 不运行时仍能完成核心功能。
-
-这是 v2 的设计要求，不是 v1 兼容 fallback。
-
----
-
-## 5. 新硬件契约：只支持这一台 SP7
-
-v2 不做通用 Linux laptop 框架。
-
-启动写入功能前必须验证：
-
-```text
-DMI product == Surface Pro 7
-CPU == Intel Core i5-1035G4
-intel_pstate available
-HWP available / active
-battery sysfs available
-thermal sensor available
-RAPL package domain available
-systemd available
-```
-
-如果硬件契约不满足：
-
-```text
-collector 可以输出诊断
-controller 不允许写任何电源参数
-```
+- 允许 doctor 和只读采集；
+- 禁止自动写入；
+- 禁止自动 trial；
+- 禁止 envelope promotion。
 
 不增加 AMD、其他 Surface、其他 Intel CPU 的兼容分支。
 
 ---
 
-## 6. 两个实时状态：Demand State + Thermal State
+## 5. 设备使用模型
 
-v2 不再用一个 scene 描述整台机器。
+用户已明确：
 
-实时状态拆成两个正交部分。
+**持续重负载任务放在远程服务器。**
+
+所以正常本机负载应该是：
+
+- 长时间低本地计算；
+- 大量 idle / shallow-interactive；
+- 偶尔短 burst；
+- 远程工作；
+- 媒体；
+- 短时文件传输；
+- 少量后台服务。
+
+本机持续高 CPU / RAPL package power 不默认解释为“需要性能”。
+
+它优先进入：
+
+**LOCAL_COMPUTE_PRESSURE**
+
+系统会：
+
+1. 记录 top processes 和 process tree；
+2. 记录持续时间和热变化；
+3. 不自动切高性能策略；
+4. 如果 thermal pressure 上升，提前收紧；
+5. 在下一次 LLM 分析中解释异常来源。
 
 ---
 
-## 7. Demand State：机器当前需要什么
+## 6. 总体架构
 
-新的需求向量：
+整体分六层。
 
-```json
-{
-  "user_active": true,
-  "foreground_latency_need": 0.82,
-  "local_compute_pressure": 0.18,
-  "media_continuity": 1.0,
-  "remote_interactive": 0.75,
-  "network_intensity": 0.31,
-  "io_pressure": 0.05
-}
-```
+第一层：Hardware / Telemetry
 
-这些值不代表“用户在做什么职业活动”。
+持续观察：
 
-只代表：
+- 电池；
+- CPU；
+- RAPL；
+- 温度；
+- PSI；
+- 网络；
+- 媒体；
+- 用户活动；
+- 进程归因；
+- brightness；
+- 系统版本。
 
-> 当前机器需要什么。
+第二层：Observers
 
-### 7.1 user_active
+两个独立观察器：
 
-优先来源：
+- Demand Observer：当前需要多少性能；
+- Thermal Observer：当前还有多少可持续热余量。
 
-- systemd-logind IdleHint；
-- 桌面 idle API；
-- 可选 ActivityWatch AFK。
+第三层：Battery-Life Controller
 
-输出：
+根据：
 
-```text
-ACTIVE
-IDLE
-```
+- Demand；
+- Thermal；
+- Battery；
+- 用户 override；
+- Trial lock；
 
-### 7.2 foreground_latency_need
+选择一个已经验证的 operating envelope。
 
-初始确定性规则：
+第四层：Actuators / Safety
 
-- 用户正在连续输入/切窗；
+- PowerLab HWP actuator：表达性能意图；
+- thermald：热安全；
+- Intel HWP：实际瞬时频率；
+- Surface firmware / CPU：最后硬保护。
+
+第五层：Storage / Experiment
+
+SQLite 保存：
+
+- 原始采样；
+- rollup；
+- controller action；
+- thermal incident；
+- trial；
+- feedback；
+- 系统漂移。
+
+第六层：LLM
+
+每小时读取压缩后的 knowledge pack：
+
+- 分析浪费；
+- 分析热事件；
+- 提实验；
+- 不参与实时控制。
+
+---
+
+## 7. 时间尺度与控制职责
+
+必须明确每一层工作的速度。
+
+### 微秒/毫秒级
+
+Owner：
+
+- CPU；
+- Intel HWP；
+- Linux scheduler；
+- intel_pstate。
+
+职责：
+
+- P-state；
+- burst；
+- 任务调度；
+- 瞬时频率。
+
+PowerLab 不参与。
+
+### 5–10 秒级
+
+Owner：
+
+- PowerLab local controller。
+
+职责：
+
+- 更新 demand；
+- 更新 thermal state；
+- 检查异常；
+- 选择 verified envelope；
+- thermal preemption；
+- hysteresis。
+
+### 1–5 分钟级
+
+Owner：
+
+- PowerLab rolling analysis。
+
+职责：
+
+- 持续功耗；
+- heat soak；
+- battery drain；
+- 异常后台负载；
+- 浪费事件。
+
+### 小时级
+
+Owner：
+
+- LLM / MCP。
+
+职责：
+
+- 长期趋势；
+- regression；
+- 实验建议；
+- 异常解释。
+
+### 天/周级
+
+Owner：
+
+- Experiment engine + user review。
+
+职责：
+
+- 验证 envelope；
+- battery-life 对比；
+- drift；
+- calibration 更新。
+
+---
+
+## 8. 真正的优化指标
+
+### 8.1 整机电池功耗是主指标
+
+主数据源：
+
+- BAT power_now；
+- energy_now / energy_full；
+- 必要时用 current_now × voltage_now fallback。
+
+CPU RAPL 不是续航 reward。
+
+RAPL 用来解释：
+
+- CPU 在整机功耗中占多少；
+- heat soak 是否来自 CPU；
+- 性能意图变化是否真的影响 package power。
+
+### 8.2 不追求固定 5W / 6W 目标
+
+不同：
+
+- 亮度；
+- Wi-Fi；
+- 媒体；
+- 电池健康；
+- 软件版本；
+- 环境温度；
+
+都会改变整机 W。
+
+因此不设一个拍脑袋的“优秀功耗”。
+
+我们只做相对比较：
+
+- stock baseline；
+- current verified envelope；
+- candidate；
+- 历史相似窗口。
+
+### 8.3 续航评价
+
+长期报告至少给出：
+
+- 有效放电时间；
+- 平均 BAT W；
+- 中位数 BAT W；
+- P90 / P95；
+- 单位活动时间 Wh；
+- 基于当前 usable energy 的 projected runtime；
+- battery drain slope。
+
+Projected runtime 只是展示指标，不直接作为实验 reward。
+
+---
+
+## 9. 亮度的特殊处理
+
+屏幕是整机功耗的重要组成部分，但自动降亮度极易损伤体验。
+
+v2 默认：
+
+**不自动改变用户亮度。**
+
+所有实验必须：
+
+- 记录 brightness；
+- 按 brightness bucket 匹配；
+- 候选和 baseline 亮度差异过大时判不可比。
+
+以后可以增加可选 Display Saver，但必须由用户显式启用，并配置：
+
+- 最小亮度；
+- 允许自动调整的范围；
+- 是否在媒体/远程状态关闭。
+
+Display Saver 不属于 v2 初始自动控制面。
+
+---
+
+## 10. Telemetry v2
+
+建议基础采样周期 5–10 秒；重型诊断采用更低频率。
+
+每条 sample 至少包含：
+
+### Battery
+
+- status；
+- percent；
+- power_w；
+- energy_wh；
+- voltage；
+- current；
+- energy_full；
+- energy_full_design；
+- cycle_count（可用时）；
+- battery epoch。
+
+### CPU / HWP
+
+- cpu utilization；
+- load；
+- average frequency；
+- policy max/min；
+- EPP；
+- max_perf_pct；
+- Turbo / no_turbo；
+- HWP dynamic boost（可用时）。
+
+### Pressure
+
 - CPU PSI；
 - I/O PSI；
-- runnable load；
-- 短 burst 活跃度。
+- memory PSI。
 
-不需要知道前台是 Firefox 还是 VS Code 才能成立。
+### Thermal
 
-### 7.3 local_compute_pressure
+- package/core temperature；
+- 温度斜率；
+- throttle counters；
+- frequency collapse evidence；
+- thermald status。
 
-使用滚动窗口：
+### RAPL
 
-```text
-CPU usage EWMA
-load
-CPU PSI
-RAPL package power
-top process CPU
-```
+- package energy；
+- derived power 10s；
+- derived power 60s；
+- derived power 300s。
 
-建议时间窗口：
+### Display / Devices
 
-- 10 秒；
-- 60 秒；
-- 300 秒。
+- brightness；
+- backlight level；
+- Wi-Fi traffic；
+- Bluetooth state；
+- 可用时的 GPU frequency / RC6；
+- 设备 wakeup 诊断只低频采样。
+
+### User / Media
+
+- user active / idle；
+- MPRIS playing；
+- 可选 ActivityWatch attribution。
+
+### Process Attribution
+
+仅保存少量 top processes：
+
+- PID；
+- start time；
+- executable；
+- CPU；
+- RSS；
+- I/O；
+- parent PID。
+
+不对全进程树做高频永久采样。
+
+---
+
+## 11. Battery Epoch
+
+用户计划更换电池，因此 v2 必须避免把旧坏电池和新电池数据混在一起。
+
+定义 battery_epoch。
+
+当检测到以下明显变化时启动新 epoch：
+
+- battery identity 变化；
+- energy_full 大幅跃迁；
+- energy_full_design / serial / model 变化；
+- 用户手工声明已换电池。
+
+不同 battery epoch：
+
+- 续航数据不直接横向比较；
+- envelope 可以复用，但需要 revalidation；
+- projected runtime 使用当前 epoch 数据。
+
+---
+
+## 12. Demand Observer
+
+Demand Observer 不输出“用户正在做 coding”。
+
+它输出当前性能需求向量。
+
+建议字段：
+
+- user_active；
+- latency_need；
+- local_compute_pressure；
+- media_continuity；
+- remote_hint；
+- network_intensity；
+- io_pressure。
+
+### user_active
+
+来源优先级：
+
+1. systemd-logind IdleHint；
+2. 桌面 idle API；
+3. 可选 ActivityWatch AFK。
 
 输出：
 
-```text
-LOW
-MEDIUM
-SUSTAINED
-```
+- ACTIVE；
+- IDLE。
 
-由于目标设备不承担持续重计算：
+### latency_need
 
-```text
-SUSTAINED local compute
-```
+根据：
 
-默认触发异常记录和更保守的 thermal policy，而不是 performance mode。
+- 最近输入/活动；
+- 短 burst；
+- CPU PSI；
+- I/O PSI；
+- runnable pressure；
+- 最近 envelope 下的反馈。
 
-### 7.4 media_continuity
+输出：
 
-来源：
+- LOW；
+- MEDIUM；
+- HIGH。
+
+不要求知道前台软件名。
+
+### local_compute_pressure
+
+基于：
+
+- CPU EWMA；
+- load；
+- CPU PSI；
+- RAPL 10/60/300s；
+- top-process CPU。
+
+输出：
+
+- LOW；
+- MODERATE；
+- SUSTAINED。
+
+SUSTAINED 不自动触发 performance envelope。
+
+### media_continuity
+
+根据：
 
 - MPRIS；
 - playerctl；
-- 可选浏览器媒体 telemetry。
+- 以后可选 dropped-frame telemetry。
 
-媒体播放是少数仍值得显式识别的需求，因为：
+### remote_hint
 
-```text
-不能为了省电导致播放中断
-```
+只做辅助。
 
-### 7.5 remote_interactive
-
-只作为 hint。
-
-来源可包括：
+可能来源：
 
 - SSH / mosh；
-- Remote Desktop；
-- VS Code remote helper；
+- VS Code remote；
 - Remmina / xfreerdp；
-- 网络流量 + 低本地 compute。
+- 持续交互网络 + 低本地 compute。
 
-它不必 100% 准确。
+它不需要做到语义上 100% 准确。
 
-远程工作的主要需求仍由：
-
-```text
-foreground latency + network continuity + low local compute
-```
-
-决定。
-
-### 7.6 network_intensity
-
-通过网卡计数器的差分计算。
-
-只区分：
-
-```text
-LOW
-INTERACTIVE
-TRANSFER
-```
-
-不尝试猜具体应用协议。
-
----
-
-## 8. Thermal State：Surface 的热预算
-
-这是 v2 最重要的新模块。
-
-### 8.1 输入
-
-必须连续记录：
-
-```text
-package/core temperature
-temperature slope dT/dt
-RAPL package energy
-RAPL rolling power:
-    10s
-    60s
-    300s
-whole-device battery power
-CPU average frequency
-intel_pstate max_perf_pct
-EPP
-turbo state
-CPU utilization
-thermal throttle count（可用时）
-frequency collapse event
-suspend/resume
-ambient proxy（没有真实环境温度传感器时留空）
-```
-
-### 8.2 热状态
-
-初始状态机：
-
-```text
-COOL
-WARMING
-HEAT_SOAKED
-THERMAL_PRESSURE
-THROTTLING
-```
-
-#### COOL
-
-特征：
-
-- 温度低；
-- dT/dt 低；
-- 60s/300s package power 低；
-- 无 throttle。
-
-允许正常短 burst。
-
-#### WARMING
-
-特征：
-
-- 温度持续上升；
-- package power 连续高于轻负载基线；
-- 尚未进入高温。
-
-开始收紧 sustained performance。
-
-#### HEAT_SOAKED
-
-特征：
-
-- 机身已经积累明显热量；
-- 温度不一定非常高，但即使负载下降也降温缓慢；
-- 300s package energy 高。
-
-此状态下不允许重新激进 boost。
-
-#### THERMAL_PRESSURE
-
-特征：
-
-- 接近经真机校准的软温控阈值；
-- dT/dt 仍为正；
-- thermald 已开始限制；
-- 或频率开始明显受热约束。
-
-PowerLab 强制 thermal-safe envelope。
-
-#### THROTTLING
-
-特征：
-
-- thermal throttle counter 增长；
-- 频率异常塌陷；
-- firmware / thermald 明显 clamp；
-- 或达到危险阈值。
-
-PowerLab：
-
-- 立即停止 trial；
-- 切 thermal-safe；
-- 记录完整 incident；
-- 在温度和 heat score 恢复前不退出。
-
-### 8.3 不能硬编码 Reddit 的温度
-
-社区给出的 65°C / 70°C 等经验只作为研究参考。
-
-最终参数必须在本机校准后写入：
-
-```text
-config/machine.toml
-```
-
-系统在没有 machine calibration 时：
-
-```text
-允许只读采集
-禁止自动 trial
-禁止自动 envelope promotion
-```
-
----
-
-## 9. Thermal Pressure Score
-
-除离散状态外，维护连续分值：
-
-```text
-thermal_pressure = 0.0 ... 1.0
-```
-
-第一版不用机器学习。
-
-由以下归一化量确定：
-
-```text
-temperature level
-temperature slope
-60s package power
-300s package energy
-cool-down rate
-throttle evidence
-```
-
-例如概念上：
-
-```text
-pressure =
-    temp_component
-  + slope_component
-  + sustained_power_component
-  + throttle_component
-```
-
-实际权重通过真机 replay 和校准确定。
-
-用途：
-
-- 避免状态阈值来回抖动；
-- 作为 experiment 的约束；
-- 识别“温度还没高，但热量正在快速累积”的情况。
-
----
-
-## 10. Operating Envelope 取代 Scene Profile
-
-v2 不再有几十个按 app/scene 命名的 profile。
-
-只维护少量**性能/热包络**。
-
-初始候选：
-
-```text
-ECO_IDLE
-INTERACTIVE_EFFICIENT
-REMOTE_EFFICIENT
-MEDIA_EFFICIENT
-THERMAL_SAFE
-```
-
-### 10.1 ECO_IDLE
-
-目标：
-
-- 人不操作时最低功耗；
-- 尽量进入深 C-state；
-- 不追求瞬时响应。
-
-### 10.2 INTERACTIVE_EFFICIENT
-
-默认主 envelope。
-
-目标：
-
-- 点击/输入/滚动有 burst 性能；
-- burst 结束迅速回落；
-- 不允许长时间高 package power。
-
-适合：
-
-- 网页；
-- 文档；
--代码编辑；
-- 终端；
-- 普通桌面操作。
-
-不需要识别这些具体 app。
-
-### 10.3 REMOTE_EFFICIENT
-
-目标：
-
-- 本地 CPU 保持较低；
-- 前台延迟优先；
-- 网络连续；
-- 不因本地后台任务抢走热预算。
-
-### 10.4 MEDIA_EFFICIENT
-
-目标：
-
-- 媒体连续；
-- 硬件解码正常；
-- CPU 尽可能 idle；
-- 避免无意义 turbo。
-
-### 10.5 THERMAL_SAFE
-
-最高优先级软策略。
-
-目标：
-
-- 降低持续 package power；
-- 禁止 aggressive boost；
-- 等待 thermal pressure 回落。
-
-它不是“省电 profile”，而是：
-
-> heat soak 恢复 envelope。
-
----
-
-## 11. SP7 专用执行器，不再依赖通用 Power Options 主控制
-
-v2 删除“自动探测 Power Options / PPD / sysfs 三选一”的通用执行器模型。
-
-原因：
-
-- 目标硬件固定；
-- 需要明确控制 ownership；
-- 通用 daemon 很容易与 thermald / HWP 形成不可见竞态；
-- 用户明确接受破坏式、单机专用设计。
-
-新的动态 CPU actuator 直接针对：
-
-```text
-intel_pstate + HWP
-```
-
-初始允许的控制面只包括经过审查的少量参数：
-
-```text
-energy_performance_preference
-intel_pstate/max_perf_pct
-turbo / no_turbo（是否启用需要真机确认与 ownership 审查）
-hwp_dynamic_boost（若本机暴露且验证）
-```
-
-不直接做：
-
-- 任意 sysfs 写入；
-- 通用 PCI 树扫描写入；
-- 任意 USB autosuspend；
-- 任意 ASPM；
-- 任意 kernel cmdline；
-- 任意 RAPL PL1/PL2 自动写入。
-
-RAPL 限制优先交给 thermald。
-
----
-
-## 12. 控制 ownership
-
-必须显式定义谁拥有哪个旋钮。
-
-| 层 | Owner | 职责 |
-|---|---|---|
-| 实际 P-state | Intel HWP | 微秒/毫秒级硬件频率选择 |
-| scheduler utilization | Linux kernel | 任务调度与利用率 |
-| performance intent | PowerLab | EPP / max_perf_pct 等慢速意图 |
-| thermal safety | thermald | trip / RAPL / cooling action |
-| firmware emergency | Surface firmware / CPU | 最后安全保护 |
-| long-term experiment | PowerLab + LLM | envelope 参数研究 |
-
-优先级：
-
-```text
-firmware emergency
-    >
-thermald safety
-    >
-PowerLab envelope request
-    >
-HWP normal selection
-```
-
-如果 thermald 覆盖了 PowerLab 请求：
-
-```text
-这是安全 override
-不是“写入冲突”
-```
-
-PowerLab 必须识别并记录：
-
-```text
-thermal_override_active = true
-```
-
----
-
-## 13. 本地控制状态机
-
-每 5–10 秒运行一次。
-
-概念逻辑：
-
-```text
-if THROTTLING:
-    THERMAL_SAFE
-
-elif THERMAL_PRESSURE:
-    THERMAL_SAFE
-
-elif HEAT_SOAKED:
-    conservative envelope
-    no new burst promotion
-
-elif user_idle:
-    ECO_IDLE
-
-elif media_continuity high:
-    MEDIA_EFFICIENT
-
-elif remote_interactive high and local_compute low:
-    REMOTE_EFFICIENT
-
-else:
-    INTERACTIVE_EFFICIENT
-```
-
-再叠加：
-
-- minimum dwell time；
-- hysteresis；
-- manual override；
-- battery low guard；
-- trial lock。
-
-禁止：
-
-```text
-每个 5 秒采样都切一次 envelope
-```
-
----
-
-## 14. sustained local compute 是异常状态
-
-由于用户把重负载放到远程服务器，本机出现：
-
-```text
-high CPU
-+
-high RAPL package power
-+
-持续超过一定窗口
-```
-
-时，v2 进入：
-
-```text
-LOCAL_COMPUTE_PRESSURE
-```
-
-行为：
-
-1. 记录 top processes；
-2. 记录 process tree；
-3. 不切 performance envelope；
-4. 如果 thermal pressure 上升，提前进入 THERMAL_SAFE；
-5. 下一次 LLM 分析时解释：
-   - 浏览器 runaway tab；
-   - language server；
-   - update/indexer；
-   - 本地意外编译；
-   - 其他持续 CPU 消耗。
-
-这比优化本地大型编译更符合该设备定位。
-
----
-
-## 15. 数据库 v2：全新 schema，不迁移 v1
-
-版本直接升级：
-
-```text
-2.0.0
-```
-
-v2 **不读取 v1 SQLite schema**。
-
-安装/首次运行时如果检测到旧：
-
-```text
-runtime/powerlab.sqlite3
-```
-
-行为：
-
-```text
-FAIL FAST
-提示用户删除 runtime/
-```
-
-不自动 migration。
-
-原因：
-
-- v1 scene/context 表的语义已经失效；
-- 自动迁移会制造假兼容；
-- 用户尚未在正式 SP7 上产生必须保存的长期 v1 数据。
-
-### 15.1 新表
-
-建议：
-
-```text
-samples
-thermal_windows
-demand_windows
-controller_state
-control_actions
-thermal_incidents
-envelopes
-envelope_validations
-trials
-trial_results
-user_feedback
-process_attribution
-system_fingerprints
-battery_health
-llm_runs
-llm_decisions
-rejections
-```
-
-删除：
-
-```text
-contexts
-context_policies
-scene-based sessions
-task_runs
-scene profile applications
-```
-
-### 15.2 raw sample
-
-核心字段：
-
-```text
-ts
-battery_status
-battery_pct
-battery_power_w
-battery_energy_wh
-
-package_temp_c
-temp_slope_c_per_min
-
-rapl_package_energy_uj
-rapl_power_10s_w
-rapl_power_60s_w
-rapl_power_300s_w
-
-cpu_usage
-cpu_psi
-io_psi
-load
-avg_freq
-max_freq
-epp
-max_perf_pct
-turbo
-
-user_active
-media_playing
-network_rx_rate
-network_tx_rate
-
-thermal_pressure
-thermal_state
-demand_state
-current_envelope
-thermal_override_active
-```
-
----
-
-## 16. Activity / app 信息只用于 attribution
-
-仍可收集：
-
-- foreground app；
-- executable；
-- top processes；
-- process tree；
-- window title；
-- ActivityWatch timeline。
-
-但是这些字段不再参与：
-
-```text
-app name -> profile
-```
-
-它们主要回答：
-
-> 为什么今天这一段功耗异常？
-
-例如：
-
-```text
-13:22–13:40
-local_compute_pressure=SUSTAINED
-top process=firefox content process
-battery=10.2W
-thermal state=WARMING
-```
-
-这比“scene=web_interactive”有用得多。
-
----
-
-## 17. thermald 设计
-
-v2 将 thermald 作为正式依赖，不再只是“可选建议”。
-
-### 17.1 Stage 0 先验证 stock thermald
-
-真机先检查：
-
-```bash
-systemctl status thermald
-thermald --version
-journalctl -u thermald
-```
-
-验证：
-
-- Surface thermal zones；
-- RAPL powercap；
-- intel_pstate；
-- thermald adaptive engine 是否正常工作。
-
-### 17.2 自定义 thermal 配置必须人工审核
-
-如果 stock thermald 无法避免 SP7 的 emergency throttle：
-
-可以设计 SP7 专用 thermald 配置。
-
-但：
-
-```text
-LLM 不能自动修改 thermal-conf.xml
-```
-
-thermal limit 属于 Class D 安全配置：
-
-- 人工审核；
-- 真机短时间验证；
-- Git 记录；
-- 可恢复。
-
-### 17.3 不追求靠近 100°C
-
-CPU Tjunction 并不是目标工作温度。
-
-v2 的目标是：
-
-> 在 heat soak 导致 firmware emergency throttle 之前，平滑降低持续 package power。
-
----
-
-## 18. 真机 thermal calibration
-
-v2 自动控制启用前必须完成 calibration。
+### network_intensity
 
 输出：
 
-```text
-config/machine.toml
-```
+- LOW；
+- INTERACTIVE；
+- TRANSFER。
 
-包含：
-
-- DMI fingerprint；
-- CPU model；
-- kernel；
-- BIOS；
-- thermald version；
-- RAPL domains；
-- idle thermal baseline；
-- normal-interactive thermal baseline；
-- cool-down rate；
-- passive threshold；
-- thermal pressure normalization；
-- emergency observations。
-
-### 18.1 Calibration A — cold idle
-
-机器充分冷却后：
-
-```text
-15–20 min idle
-```
-
-记录：
-
-- idle temperature；
-- package power；
-- battery power；
-- cool-down floor。
-
-### 18.2 Calibration B — normal interactive
-
-真实使用：
-
-```text
-30–60 min
-```
-
-包括：
-
-- 浏览；
-- 编辑；
-- 终端；
-- 远程操作。
-
-确定：
-
-- 正常 package power；
-- 正常 dT/dt；
-- 不应触发 heat-soak 的范围。
-
-### 18.3 Calibration C — bounded burst
-
-不是长时间 stress test。
-
-可选：
-
-```text
-30–90 s 受控 CPU burst
-```
-
-设置明确停止条件：
-
-- 温度达到保守阈值；
-- dT/dt 过高；
-- thermald 开始明显 clamp；
-- 用户中止。
-
-目标只是测：
-
-```text
-热惯性
-+
-升温斜率
-+
-冷却速度
-```
-
-不测试“极限性能”。
+只看吞吐和变化，不猜协议。
 
 ---
 
-## 19. 实验系统 v2
+## 13. Thermal Observer
 
-v1 trial 框架的“可回滚实验”思想保留，但实验对象改变。
+热管理不是主目标，但必须是强约束。
 
-### 19.1 允许实验
+Surface Pro 7 i5 为被动散热设备，持续 package power 会产生明显 heat soak。
 
-主要探索：
+因此不能只看当前温度。
 
-```text
-EPP
-max_perf_pct
-是否允许 turbo
-envelope dwell / hysteresis
-thermal pressure soft threshold
-非危险的设备节能设置
-```
+### 输入
 
-### 19.2 不允许自动实验
-
-禁止无人值守修改：
-
-- thermald hard trip；
-- RAPL hard safety limit；
-- kernel cmdline；
-- suspend mode；
-- ACPI / firmware；
-- arbitrary sysfs；
-- emergency threshold；
-- battery charging firmware setting。
-
-### 19.3 实验比较不再按 scene
-
-baseline/candidate 需要匹配：
-
-```text
-demand bucket
-thermal starting state
-brightness bucket
-battery state
-kernel / system fingerprint
-media state
-remote state
-```
-
-比较的不是：
-
-```text
-coding vs coding
-```
-
-而是：
-
-```text
-类似性能需求 + 类似热起点
-```
-
-### 19.4 主要 objective
-
-轻交互/远程：
-
-```text
-minimize whole-device battery W
-```
-
-约束：
-
-- CPU PSI 不恶化；
-- I/O PSI 不恶化；
-- thermal_pressure 不恶化；
-- 无 throttle；
-- 无明显用户负反馈。
-
-媒体：
-
-```text
-minimize whole-device battery W
-```
-
-约束：
-
-- MPRIS playing continuity；
-- 无明显播放中断；
-- 后续可增加 dropped-frame telemetry。
-
-### 19.5 热表现作为一等约束
-
-候选即使省电，如果：
-
-```text
-温度更高
-或
-dT/dt 更陡
-或
-heat soak 更严重
-```
-
-也不能自动晋升。
-
----
-
-## 20. 新 Envelope 生命周期
-
-状态：
-
-```text
-CANDIDATE
-VALIDATING
-REVALIDATING
-VERIFIED
-BLOCKED
-RETIRED
-```
-
-不再有 scene-scoped promotion。
-
-验证记录绑定：
-
-```text
-machine fingerprint
-kernel
-thermald config hash
-thermal calibration version
-demand region
-thermal starting region
-battery health
-```
-
-只要以下任意变化：
-
-- kernel；
-- BIOS；
-- thermald；
-- thermal config；
-- calibration；
-- CPU power driver；
-- battery health 明显变化；
-
-相关 envelope 自动变：
-
-```text
-NEEDS_REVALIDATION
-```
-
----
-
-## 21. LLM v2 的输入
-
-每小时 knowledge pack 不再以 scene summary 为主。
-
-核心：
-
-### 21.1 Energy
-
-- 最近 1h / 24h battery W；
-- envelope 分布；
-- idle vs active；
-- remote/media 时间；
--异常高功耗窗口。
-
-### 21.2 Thermal
-
-- thermal state 分布；
-- heat-soak episode；
-- max temp；
+- package/core temp；
 - dT/dt；
-- RAPL 60s/300s；
-- throttle event；
-- cool-down episode；
-- thermal-safe 触发次数。
-
-### 21.3 Demand
-
-- active / idle；
-- local compute pressure；
-- remote hint；
-- media；
-- network intensity；
-- PSI。
-
-### 21.4 Attribution
-
-仅在异常时提供：
-
-- top processes；
-- foreground app；
-- process tree；
-- app timeline。
-
-### 21.5 Learning
-
-- verified envelopes；
-- candidate trials；
-- rejections；
-- 用户反馈；
-- version drift。
-
----
-
-## 22. LLM v2 动作集合
-
-删除：
-
-```text
-UPDATE_CONTEXT_RULE
-```
-
-新动作：
-
-```text
-NO_CHANGE
-NEED_MORE_DATA
-INVESTIGATE_POWER_SPIKE
-INVESTIGATE_THERMAL_EVENT
-PROPOSE_ENVELOPE_TRIAL
-ROLLBACK_TRIAL
-PROMOTE_ENVELOPE
-PROPOSE_MANUAL_THERMAL_RECALIBRATION
-```
-
-其中：
-
-```text
-PROPOSE_MANUAL_THERMAL_RECALIBRATION
-```
-
-只能生成建议，不能自动执行 thermal safety 修改。
-
----
-
-## 23. 机器学习路线：明确延后
-
-v2.0 不引入 ML 控制。
-
-### 23.1 收集至少 30 天以后才评估
-
-只有积累：
-
-- 足够 demand windows；
-- 多个 thermal episode；
-- 多个 envelope trial；
-- 用户真实反馈；
-
-以后才考虑研究模型。
-
-### 23.2 ML 第一阶段只 shadow
-
-候选：
-
-- Gradient Boosting；
-- HDBSCAN；
--简单 anomaly detection。
-
-只能输出：
-
-```text
-prediction / cluster / anomaly
-```
-
-不允许改变 envelope。
-
-### 23.3 不允许“因为 ML 比较高级就上线”
-
-必须通过 replay：
-
-- 历史 trace；
-- train/test 按时间切分；
-- false positive；
-- thermal safety；
-- 控制抖动；
-- collector overhead。
-
-如果不能明显优于 deterministic v2：
-
-```text
-不启用
-```
-
----
-
-## 24. CLI v2：全部破坏式重命名
-
-旧 CLI 全部删除，不留 alias。
-
-删除：
-
-```text
-contexts
-profile
-task-run
-knowledge-pack(v1 semantics)
-trial with scene context
-override old profile semantics
-```
-
-新 CLI 建议：
-
-```bash
-sp7-powerlab doctor
-sp7-powerlab calibrate status
-sp7-powerlab calibrate start
-sp7-powerlab calibrate finish
-
-sp7-powerlab observe now
-sp7-powerlab observe thermal --hours 6
-sp7-powerlab observe demand --hours 6
-sp7-powerlab observe power --hours 24
-sp7-powerlab incidents
-
-sp7-powerlab envelope list
-sp7-powerlab envelope inspect NAME
-sp7-powerlab envelope set NAME
-sp7-powerlab envelope clear-override
-
-sp7-powerlab trial start proposal.json
-sp7-powerlab trial status
-sp7-powerlab trial rollback
-sp7-powerlab trial evaluate
-
-sp7-powerlab hourly --output runtime/hourly-pack.json
-sp7-powerlab llm-apply runtime/llm-decision.json
-
-sp7-powerlab service status
-```
-
----
-
-## 25. 配置文件 v2
-
-删除：
-
-```text
-config/contexts.toml
-config/policy.toml
-config/profiles/
-```
-
-新增：
-
-```text
-config/powerlab.toml
-config/machine.toml
-config/envelopes.toml
-config/thermal.toml
-```
-
-### 25.1 powerlab.toml
-
-只保存：
-
--采样周期；
-- retention；
-- LLM 周期；
-- automation 开关；
-- service 参数。
-
-### 25.2 machine.toml
-
-SP7 本机专属：
-
-- hardware fingerprint；
-- calibrated thermal parameters；
-- sensor paths；
-- capability assertions。
-
-### 25.3 envelopes.toml
-
-只包含：
-
-```text
-ECO_IDLE
-INTERACTIVE_EFFICIENT
-REMOTE_EFFICIENT
-MEDIA_EFFICIENT
-THERMAL_SAFE
-```
-
-及候选 envelope。
-
-### 25.4 thermal.toml
-
-包含：
-
-- thermal state threshold；
-- hysteresis；
-- slope limits；
-- rolling window；
-- hard guard。
-
-修改该文件必须进入 Class D 人工审核路径。
-
----
-
-## 26. 模块结构 v2
-
-建议直接删除 v1 模块后重建：
-
-```text
-src/sp7_powerlab/
-├── cli.py
-├── config.py
-├── hardware.py
-├── telemetry.py
-├── demand.py
-├── thermal.py
-├── controller.py
-├── envelopes.py
-├── experiments.py
-├── evaluation.py
-├── storage.py
-├── attribution.py
-├── llm.py
-└── actuators/
-    ├── hwp.py
-    └── base.py
-```
-
-不保留：
-
-```text
-context.py
-profiles.py
-policy.py
-jobs.py
-generic Power Options adapter
-generic PPD adapter
-v1 proposal compatibility
-```
-
-root helper 也重写成只允许 v2 HWP actuator 声明的固定操作。
-
----
-
-## 27. systemd v2
-
-常驻：
-
-```text
-sp7-powerlab.service
-thermald.service
-```
-
-定时：
-
-```text
-sp7-powerlab-hourly.timer
-```
-
-删除 v1 名称和多 service 拆分兼容逻辑。
-
-PowerLab service 启动顺序：
-
-```text
-systemd
-→ thermald active
-→ hardware contract
-→ machine calibration valid
-→ collector
-→ controller
-```
-
-如果 thermald 不健康：
-
-```text
-controller 进入 read-only
-```
-
----
-
-## 28. fail-safe 原则
-
-### 28.1 Sensor failure
-
-以下任意核心传感器失效：
-
-- battery；
-- CPU temperature；
-- RAPL；
-- intel_pstate state；
-
-行为：
-
-```text
-停止实验
-不做新的自动写入
-记录 incident
-保持 thermald
-```
-
-### 28.2 Controller crash
-
-重启后：
-
-- 重新读取真实 sysfs；
-- 不相信旧内存状态；
-- trial 未完成则恢复 baseline envelope；
-- thermald 永远独立继续运行。
-
-### 28.3 Suspend/resume
-
-resume 后：
-
-- 前 N 秒只观察；
-- thermal rolling window 重建；
-- 不把 suspend 时间计入 power/thermal 积分；
-- 不立即触发 envelope trial。
-
----
-
-## 29. v1 数据与兼容策略
-
-**没有兼容策略。**
-
-实施 v2 时：
-
-### 删除
-
-- v1 schemas；
-- v1 ContextEngine；
-- v1 scene policy；
-- v1 profile registry；
-- v1 scene tests；
-- v1 CLI；
-- v1 SQLite migration；
-- v1 proposal schema；
-- v1 docs。
-
-### 不迁移
-
-```text
-runtime/powerlab.sqlite3
-```
-
-v2 第一次启动要求：
-
-```bash
-rm -rf runtime/
-```
-
-### Git 历史
-
-Git commit 历史自然保留 v1。
-
-不在 v2 源码里放：
-
-- legacy reader；
-- compatibility parser；
-- legacy command alias；
-- schema migration code。
-
----
-
-## 30. 实现阶段
-
-### Phase 0 — Delete v1 control plane
-
-一次破坏性 commit：
-
-- 删除 ContextEngine；
-- 删除 scene policy；
-- 删除 profile abstraction；
-- 删除 task-run heavy job；
-- 删除旧 schemas/config/tests；
-- CLI 只保留暂时的 doctor/reset；
-- version -> 2.0.0-dev。
-
-验收：
-
-```text
-代码里不存在双架构
-```
-
-### Phase 1 — SP7 Hardware Contract
-
-实现：
-
-- DMI；
-- CPU model；
-- HWP；
-- intel_pstate；
-- battery；
-- thermal；
-- RAPL；
-- thermald health。
-
-验收：
-
-错误硬件必须 fail-fast。
-
-### Phase 2 — Telemetry v2
-
-实现：
-
-- 5–10s sample；
-- rolling power；
-- thermal slope；
-- PSI；
-- throttling evidence；
-- attribution。
-
-验收：
-
-- suspend gap 正确；
-- battery charging 不进入放电 objective；
-- collector overhead 真机测量。
-
-### Phase 3 — Thermal Observer
-
-实现：
+- RAPL 10s / 60s / 300s；
+- BAT power；
+- CPU frequency；
+- CPU utilization；
+- throttle counter；
+- thermald action；
+- cooldown rate。
+
+### 状态
 
 - COOL；
 - WARMING；
 - HEAT_SOAKED；
 - THERMAL_PRESSURE；
-- THROTTLING；
+- THROTTLING。
+
+### COOL
+
+- 温度稳定；
+- 持续 package power 低；
+- 无 throttle。
+
+允许正常短 burst。
+
+### WARMING
+
+- dT/dt 持续为正；
+- 持续功耗高于个人轻负载基线；
+- 尚未热到需要强制限制。
+
+不立即压性能，但避免进一步增加 sustained envelope。
+
+### HEAT_SOAKED
+
+- 一段时间内累计热负荷高；
+- 降温速度慢；
+- 即使瞬时温度不高，也不立即恢复激进 burst。
+
+### THERMAL_PRESSURE
+
+- 接近真机校准的软限制；
+- 或 thermald 已主动 clamp；
+- 或开始出现受热限制迹象。
+
+Controller 强制 THERMAL_SAFE。
+
+### THROTTLING
+
+检测到：
+
+- throttle counter 增长；
+- frequency collapse；
+- 明显 firmware / thermald clamp；
+- 校准定义的危险状态。
+
+立即：
+
+- 终止 trial；
+- 进入 THERMAL_SAFE；
+- 记录 incident；
+- 禁止新的自动实验。
+
+---
+
+## 14. Thermal Pressure 不用 ML
+
+维护连续 thermal_pressure 0–1。
+
+由以下量的归一化组合得到：
+
+- 温度水平；
+- 温度斜率；
+- 60s package power；
+- 300s package energy；
+- cooldown rate；
+- throttle evidence。
+
+作用：
+
+- 给状态机提供 hysteresis；
+- 提前识别 heat soak；
+- 匹配实验起始条件；
+- 判断候选是否让热行为恶化。
+
+具体阈值必须来自真机 calibration，不从社区帖子硬抄。
+
+---
+
+## 15. Waste Detector：续航优化的第一优先级
+
+v2 新增 Waste Detector，优先级高于 Envelope Tuner。
+
+它寻找：
+
+**当前性能需求很低，但整机功耗明显高于个人历史基线。**
+
+典型事件：
+
+- low demand + high BAT W；
+- low demand + high RAPL；
+- idle + CPU wakeups 异常；
+- 媒体 + CPU 异常高；
+- 网络低但 radio/device 功耗异常；
+- GPU 不进入 idle；
+- 某个进程长期吃 CPU；
+- 软件更新后功耗跃升。
+
+### Personal Baseline
+
+Waste Detector 使用个人历史而不是固定阈值。
+
+例如：
+
+- 相同 brightness bucket；
+- 相似 battery epoch；
+- 相同 media state；
+- 相近 demand；
+- COOL thermal start；
+
+历史正常窗口 P50 / P90。
+
+当前窗口若长期显著偏离，生成：
+
+WASTE_INCIDENT
+
+同时保存：
+
+- top processes；
+- foreground app（如果可用）；
+- RAPL；
+- GPU；
+- network；
+- brightness；
+- system fingerprint。
+
+### Waste Incident 的处理顺序
+
+1. 解释；
+2. 找软件/设备原因；
+3. 优先修浪费；
+4. 只有确认不是异常以后，才考虑进一步限制 CPU。
+
+---
+
+## 16. Operating Envelopes
+
+v2 不维护几十个 app/scene profile。
+
+初始只有少量 envelope。
+
+### ECO_IDLE
+
+目的：
+
+- 人不操作时最低功耗；
+- 提高深 idle residency；
+- 避免不必要 burst。
+
+不自动改变屏幕亮度。
+
+### INTERACTIVE_EFFICIENT
+
+默认主 envelope。
+
+目的：
+
+- 输入、点击、滚动、网页 burst 正常；
+- 任务完成后迅速回落；
+- 不保留无意义持续性能余量。
+
+预计这是用户最常用的 envelope，也是最重要的续航优化对象。
+
+### REMOTE_EFFICIENT
+
+目的：
+
+- 本地计算尽量低；
+- UI 和网络响应正常；
+- 远程服务器承担重计算；
+- 本地后台进程不得抢占大量功耗和热预算。
+
+### MEDIA_EFFICIENT
+
+目的：
+
+- 硬件解码正常；
+- 播放连续；
+- CPU 尽可能 idle；
+- 避免无意义 Turbo。
+
+### THERMAL_SAFE
+
+目的：
+
+- 只在 heat soak / thermal pressure 时使用；
+- 降低持续 package power；
+- 等待热压力恢复。
+
+它是恢复 envelope，不是正常日常工作模式。
+
+---
+
+## 17. Envelope 参数面
+
+v2 初始动态 CPU 控制面尽量小。
+
+允许研究：
+
+- energy_performance_preference；
+- intel_pstate max_perf_pct；
+- Turbo / no_turbo；
+- HWP dynamic boost（仅在硬件与 kernel 实测确认后）。
+
+不自动控制：
+
+- 任意 sysfs；
+- 任意 PCI；
+- 任意 ASPM；
+- 任意 USB autosuspend；
+- kernel cmdline；
+- ACPI；
+- thermald hard trip；
+- RAPL hard safety limit。
+
+设备级节能选项可以以后作为 Waste Elimination proposal 单独加入，不能混入 CPU envelope。
+
+---
+
+## 18. 控制 Ownership
+
+每个旋钮只能有一个 owner。
+
+| 层 | Owner | 责任 |
+| --- | --- | --- |
+| 实际 P-state | Intel HWP | 瞬时频率 |
+| 调度/利用率 | Linux scheduler | task scheduling |
+| CPU performance intent | PowerLab | EPP / max_perf_pct |
+| 热安全 | thermald | thermal/RAPL safety |
+| 最终保护 | CPU / Surface firmware | emergency protection |
+| 长期优化 | PowerLab experiments + LLM | 提案、验证、回滚 |
+
+PowerLab 不允许同时运行会持续写同一 EPP/max_perf_pct 的 TLP、auto-cpufreq、Power Options、PPD 等竞争控制器。
+
+安装阶段必须显式检查并报告 ownership conflict。
+
+---
+
+## 19. thermald 的定位
+
+thermald 是正式依赖，不是 PowerLab 的优化器。
+
+职责：
+
+- 热安全；
+- 必要时通过 Intel power/thermal mechanism 限制。
+
+PowerLab：
+
+- 不关闭 thermald；
+- 不自动提高热限制；
+- 不让 LLM 自动改 thermald 配置；
+- 将 thermald 的 clamp 视为安全 override。
+
+如果 thermald 不健康：
+
+- 停止自动实验；
+- controller 进入只读或 safe 模式；
+- 记录 incident；
+- 提示人工检查。
+
+如果 stock thermald 无法避免 SP7 emergency throttle，可以设计专门配置，但必须：
+
+- 人工审核；
+- 真机短时间验证；
+- Git 记录；
+- 明确回滚。
+
+---
+
+## 20. Controller
+
+本地 controller 每约 5–10 秒运行一次。
+
+基本优先级：
+
+1. Sensor invalid → 不做新的写入。
+2. Trial safety violation → 立即 rollback。
+3. THROTTLING → THERMAL_SAFE。
+4. THERMAL_PRESSURE → THERMAL_SAFE。
+5. HEAT_SOAKED → 禁止激进恢复。
+6. IDLE → ECO_IDLE。
+7. MEDIA continuity → MEDIA_EFFICIENT。
+8. remote hint 高 + local compute 低 → REMOTE_EFFICIENT。
+9. 其他活跃状态 → INTERACTIVE_EFFICIENT。
+
+### 防抖
+
+必须有：
+
+- minimum dwell time；
+- enter threshold；
+- exit threshold；
+- cooldown；
+- suspend/resume grace period。
+
+不能每个采样周期切 envelope。
+
+### Trial lock
+
+Trial 运行时：
+
+- 普通 controller 不得覆盖 candidate；
+- thermal safety 仍可抢占；
+- 用户 manual override 可以中止 trial。
+
+---
+
+## 21. Calibration
+
+v2 第一次安装后默认只读。
+
+没有 calibration：
+
+- 采集正常；
+- controller 不自动调参数；
+- 不启动自动 trial；
+- 不自动 promote。
+
+Calibration 生成 config/machine.toml。
+
+### A. Hardware calibration
+
+确认：
+
+- DMI；
+- CPU；
+- HWP；
+- intel_pstate；
+- RAPL；
+- thermal sensor；
+- BAT；
+- thermald。
+
+### B. Cold idle baseline
+
+机器充分冷却后观察一段时间。
+
+测：
+
+- 最低稳定 BAT W；
+- RAPL；
+- idle temperature；
+- cooldown floor；
+- C-state / wakeup diagnostics。
+
+### C. Normal interactive baseline
+
+用户按真实方式使用：
+
+- 浏览；
+- 编辑；
+- 终端；
+- 远程。
+
+记录：
+
+- 正常 BAT W 分布；
+- RAPL；
+- PSI；
+- 短 burst；
+- 温度；
+- dT/dt。
+
+### D. Media baseline
+
+确认：
+
+- 硬件解码；
+- 媒体 continuity；
+- CPU/RAPL；
+- GPU；
+- BAT W。
+
+### E. Bounded thermal burst
+
+只做短时受控 burst，不做长期烤机。
+
+目标：
+
+- 测升温速度；
+- 热惯性；
+- cooldown；
+- thermald 介入迹象。
+
+遇到停止条件立即结束。
+
+---
+
+## 22. Baseline 不是一个数字
+
+v2 不维护“这台机器正常是 5W”。
+
+Baseline 是条件化分布。
+
+至少按以下维度分桶：
+
+- battery epoch；
+- brightness bucket；
+- user active / idle；
+- media on/off；
+- remote hint；
+- network intensity；
+- demand region；
+- thermal starting state；
+- kernel / system fingerprint。
+
+因此实验比较的是：
+
+**相似需求 + 相似亮度 + 相似热起点下，candidate 是否更省电。**
+
+---
+
+## 23. Experiment Engine v2
+
+PowerLab 的学习来自实验，不来自 LLM 的主观判断。
+
+### 23.1 实验对象
+
+优先顺序：
+
+第一类：Waste elimination。
+
+例如：
+
+- 修硬件解码；
+- 处理异常服务；
+- 验证某设备 runtime PM；
+- 浏览器设置；
+- 后台程序配置。
+
+第二类：Envelope tuning。
+
+例如：
+
+- EPP；
+- max_perf_pct；
+- Turbo policy。
+
+第三类：体验换续航。
+
+默认不自动。
+
+### 23.2 一次一个主要变量
+
+默认实验：
+
+- 一个 primary change；
+- 其他条件保持不变。
+
+Envelope 级实验如果包含多项变化，必须把完整 diff 当成一个不可拆的 candidate，并且需要更严格验证。
+
+### 23.3 不使用单纯“历史前后对比”
+
+优先采用个人 N-of-1 crossover。
+
+推荐结构：
+
+- A1：当前 verified；
+- B1：candidate；
+- A2：回到 verified，完成第一次 crossover 判定；
+- 如果第一次判定胜出，revalidation 必须重新采一个新的 A3 baseline；
+- B2：只与同一轮新的 A3 比较，作为独立 revalidation。
+
+B1 的好结果不能进入 B2 的判分；A2 也不能在等待很久后继续作为 B2 的旧基线。
+只有 initial 和 revalidation 两轮都单独胜出，candidate 才能进入 VERIFIED_WINNER。
+
+尽量在：
+
+- 同一天；
+- 相似 brightness；
+- 相似 demand；
+- 相似 thermal start；
+
+进行。
+
+历史 baseline 只作为辅助证据，不作为单次自动 promotion 的唯一依据。
+
+### 23.4 自然使用，不要求人工 benchmark
+
+Interactive trial 可以进入 WAITING_FOR_COMPARABLE_WINDOW。
+
+只有出现：
+
+- 电池 Discharging；
+- 温度稳定；
+- 没有 suspend/resume；
+- 没有异常后台负载；
+- demand 合适；
+- brightness 可比；
+
+才开始记录 candidate。
+
+用户不需要为了实验刻意模拟工作。
+
+---
+
+## 24. Trial 状态机
+
+建议 v2 使用：
+
+- PROPOSED；
+- WAITING_FOR_COMPARABLE_WINDOW；
+- SNAPSHOTTED；
+- APPLIED；
+- SETTLING；
+- MEASURING；
+- EVALUATING；
+- REVALIDATING；
+- VERIFIED_WINNER；
+- REJECTED；
+- ROLLED_BACK；
+- FAILED。
+
+任何阶段：
+
+- sensor failure；
+- thermal violation；
+- user negative feedback；
+- thermald anomaly；
+- manual override；
+
+都可以中止并 rollback。
+
+---
+
+## 25. 实验评价
+
+### Interactive / Remote
+
+主目标：
+
+- 降低 BAT W。
+
+约束：
+
+- CPU PSI 不显著恶化；
+- I/O PSI 不显著恶化；
+- demand 不出现明显 backlog；
+- thermal pressure 不恶化；
+- 无 throttle；
+- 无用户负反馈。
+
+### Media
+
+主目标：
+
+- 降低 BAT W。
+
+约束：
+
+- MPRIS playing continuity；
+- 无明显播放中断；
+- 硬件解码状态正常；
+- CPU/RAPL 不出现异常；
+- thermal 不恶化。
+
+### Idle
+
+主目标：
+
+- 降低稳定 idle BAT W。
+
+约束：
+
+- 系统能够正常唤醒；
+- 后台关键服务不被破坏；
+- suspend/resume 不退化。
+
+### 统计
+
+至少使用：
+
+- time-weighted average；
+- median；
+- P90/P95；
+- valid duration；
+- gap filtering；
+- paired delta；
+- 独立 revalidation。
+
+后续可增加 block bootstrap / confidence interval，但 promotion 逻辑不能依赖只有两个点的平均值。
+
+---
+
+## 26. 用户体验是硬约束
+
+PowerLab 不假装完全自动量化“好不好用”。
+
+客观信号：
+
+- CPU PSI；
+- I/O PSI；
+- 响应 backlog proxy；
+- media continuity；
+- 系统错误；
+- network stalls（能可靠获取时）。
+
+主观信号：
+
+用户可以快速反馈：
+
+- good；
+- sluggish；
+- bad；
+- unstable。
+
+负反馈必须：
+
+- 绑定 envelope / trial；
+- 进入 rejection memory；
+- 自动阻止同一设置被短期重复推荐。
+
+即使 candidate 节省很多电，只要用户认为体验不可接受：
+
+**直接 reject。**
+
+---
+
+## 27. Waste Investigation
+
+当检测到异常功耗时，LLM 的首选动作不是调低 CPU。
+
+先生成 incident pack：
+
+- 当前 BAT W vs personal baseline；
+- RAPL；
+- thermal；
+- brightness；
+- GPU；
+- network；
+- top processes；
+- foreground app；
+- 最近软件版本变化；
+- kernel / BIOS / driver fingerprint。
+
+LLM 动作：
+
+- NO_CHANGE；
+- NEED_MORE_DATA；
+- INVESTIGATE_POWER_SPIKE；
+- INVESTIGATE_THERMAL_EVENT；
+- PROPOSE_WASTE_FIX；
+- PROPOSE_ENVELOPE_TRIAL；
+- ROLLBACK_TRIAL；
+- PROMOTE_ENVELOPE；
+- PROPOSE_MANUAL_RECALIBRATION。
+
+---
+
+## 28. LLM 的边界
+
+LLM 可以：
+
+- 解释异常；
+- 寻找社区已知回归；
+- 提出单变量实验；
+- 总结长期趋势；
+- 发现软件升级前后差异；
+- 建议用户检查某进程/浏览器/驱动。
+
+LLM 不可以：
+
+- 直接写 sysfs；
+- 直接调用 sudo shell；
+- 获得任意 Bash / Python / code-execution capability；
+- 调用人类 \`sp7-powerlab trial start/promote\` capability；
+- 直接连接 root helper socket；
+- 改 thermald hard limit；
+- 自己宣布 trial 成功；
+- 绕过 data quality；
+- 绕过 revalidation；
+- 因为“应该省电”就永久应用参数。
+
+最常见的合法动作应该是：
+
+**NO_CHANGE。**
+
+持续优化不等于持续改配置。
+
+---
+
+## 29. Root Helper v2
+
+v1 generic helper 删除。
+
+v2 root helper 重新实现，只暴露固定操作：
+
+- read HWP state；
+- set EPP；
+- set max_perf_pct；
+- set turbo policy（如果最终允许）；
+- restore exact pre-trial snapshot。
+
+要求：
+
+- 不接受任意 sysfs path；
+- 不接受任意 shell；
+- 每个参数都有 enum/range；
+- 真实 read-back；
+- 操作写审计日志；
+- root-owned 独立安装；
+- systemd hardening；
+- 客户端 socket 只允许目标用户。
+
+这里的 socket UID 限制**不是 LLM approval boundary**。如果 LLM/MCP 也拥有该 UID
+下的任意 shell/code execution，它就能够绕过上层审批直接调用 helper。因此 LLM
+只能获得单独的窄 \`sp7-powerlab-agent\` capability。
+
+---
+
+## 30. Storage v2
+
+SQLite schema 重新设计。
+
+不迁移 v1。
+
+核心表：
+
+- samples；
+- power_rollups；
+- demand_windows；
+- thermal_windows；
+- controller_states；
+- control_actions；
+- waste_incidents；
+- thermal_incidents；
+- envelopes；
+- envelope_validations；
+- trials；
+- trial_blocks；
+- trial_results；
+- user_feedback；
+- process_attribution；
+- system_fingerprints；
+- battery_epochs；
+- llm_runs；
+- llm_decisions；
+- rejections。
+
+删除 v1 的：
+
+- contexts；
+- context_policies；
+- scene sessions；
+- task_runs；
+- profile applications。
+
+---
+
+## 31. 数据保留
+
+高频 raw：
+
+- 默认有限天数；
+- 用于近期故障和 trial。
+
+长期保留：
+
+- 分钟 rollup；
+- hourly summary；
+- incidents；
+- trials；
+- envelope validation；
+- feedback；
+- system drift；
+- battery epoch。
+
+Git 不提交 raw SQLite。
+
+Git 只保存：
+
+- 配置；
+- calibration；
+- envelope 定义；
+- 审核后的 proposal；
+- 紧凑知识导出；
+- 重要 incident summary。
+
+---
+
+## 32. 系统漂移
+
+以下变化会让历史 envelope 进入 NEEDS_REVALIDATION：
+
+- kernel；
+- BIOS/UEFI；
+- intel_pstate/HWP 行为；
+- thermald 版本；
+- thermald 配置；
+- PowerLab calibration；
+- battery epoch；
+- 重大浏览器/媒体栈变化；
+- 关键 driver 变化。
+
+不是所有软件更新都立即废弃 envelope。
+
+只有与该 envelope 相关的 fingerprint 变化才触发 revalidation。
+
+---
+
+## 33. ActivityWatch 的新位置
+
+ActivityWatch / awatcher 变成可选 Attribution Provider。
+
+用途：
+
+- 解释哪一个 app 占据异常窗口；
+- 长期使用时间统计；
+- 给 LLM 更容易理解的上下文。
+
+不用于：
+
+- app name → envelope；
+- 实时 scene classification；
+- controller hard dependency。
+
+ActivityWatch 挂掉时：
+
+- 续航控制继续正常；
+- 只是 attribution 信息变少。
+
+---
+
+## 34. PowerTOP、turbostat、powerstat 的定位
+
+这些工具不做常驻控制器。
+
+### turbostat
+
+用于：
+
+- 真机 calibration；
+- C-state；
+- package power；
+- frequency；
+- throttle diagnostics。
+
+### PowerTOP
+
+用于：
+
+- wakeup；
+- device runtime PM；
+- idle residency；
+- 候选 waste fix 发现。
+
+不自动执行 powertop --auto-tune。
+
+### powerstat
+
+用于：
+
+- 人工基准；
+- 验证整机 battery discharge；
+- 与 PowerLab 结果交叉检查。
+
+这些工具用于诊断和验证，不与 PowerLab 抢控制权。
+
+---
+
+## 35. 媒体与浏览器
+
+媒体是续航的重要特殊路径。
+
+v2 必须关注：
+
+- VA-API / hardware decode 是否实际工作；
+- CPU package power；
+- GPU/i915 activity；
+- MPRIS continuity；
+- BAT W。
+
+如果硬解回归导致视频从正常低 CPU 变成持续高 CPU：
+
+优先修回归，不通过更激进 CPU 限频“掩盖”问题。
+
+---
+
+## 36. 网络与远程工作
+
+由于重计算主要在服务器上，REMOTE_EFFICIENT 是核心 envelope 之一。
+
+目标：
+
+- 本地 CPU 尽量低；
+- 短交互 burst 不迟钝；
+- 网络不因为激进 powersave 明显增加抖动；
+- remote UI 正常。
+
+Wi-Fi powersave 不默认无限激进。
+
+任何无线策略都必须验证：
+
+- 响应；
+- 断流；
+- 吞吐；
+- BAT W。
+
+---
+
+## 37. 设备级节能
+
+CPU 不是整机唯一耗电来源。
+
+v2 会记录并逐步研究：
+
+- display；
+- Wi-Fi；
+- Bluetooth；
+- USB；
+- GPU；
+- SSD/runtime PM；
+- Type Cover/backlight（能可靠读取时）。
+
+但这些不全部进入 v2.0 自动控制面。
+
+顺序：
+
+1. 只读测量；
+2. 识别浪费；
+3. 提出单独 proposal；
+4. 人工验证；
+5. 有足够证据后才允许自动使用。
+
+---
+
+## 38. Service 模型
+
+v2 只保留清晰的服务：
+
+- sp7-powerlab.service：collector + observers + controller；
+- sp7-powerlab-hourly.timer：生成 knowledge pack；
+- sp7-powerlab-root-helper.service：受限写入；
+- thermald.service：独立热安全。
+
+启动顺序：
+
+1. thermald health；
+2. hardware contract；
+3. database schema；
+4. calibration；
+5. telemetry；
+6. observers；
+7. controller。
+
+没有 calibration 时：
+
+- controller read-only；
+- 其他只读功能正常。
+
+---
+
+## 39. Fail-safe
+
+### Sensor failure
+
+核心传感器缺失：
+
+- 停止 trial；
+- 不做新自动写入；
+- 保留最后 verified baseline 或安全恢复；
+- 记录 incident。
+
+### thermald down
+
+- 禁止 trial；
+- controller 不做激进 envelope；
+- 提示人工处理。
+
+### Controller crash
+
+重启后：
+
+- 重新读取真实 sysfs；
+- 不信任旧内存状态；
+- 未完成 trial 回滚；
+- thermald 独立继续。
+
+### Suspend / resume
+
+resume 后：
+
+- rolling window 清空或标记 discontinuity；
+- 一段 grace period 只观察；
+- 不把 suspend 算作有效能耗时间；
+- 不立即进入 trial。
+
+### Low battery
+
+低于校准/配置阈值：
+
+- 禁止新实验；
+- 允许 verified envelope；
+- 不为了实验消耗剩余电量。
+
+---
+
+## 40. v1 破坏式删除清单
+
+实现 v2 时直接删除：
+
+- src/sp7_powerlab/context.py；
+- src/sp7_powerlab/profiles.py；
+- src/sp7_powerlab/policy.py；
+- src/sp7_powerlab/jobs.py；
+- v1 generic actuator manager；
+- Power Options / PPD 自动探测主控制；
+- config/contexts.toml；
+- config/policy.toml；
+- config/profiles/；
+- v1 context schemas；
+- v1 proposal/decision semantics；
+- scene-based tests；
+- task-run heavy-job 主流程；
+- v1 compatibility CLI；
+- v1 SQLite migration。
+
+不写：
+
+- legacy reader；
+- compatibility adapter；
+- old command alias；
+- scene → demand bridge。
+
+Git 历史就是 v1 的档案。
+
+---
+
+## 41. v2 配置文件
+
+重构后只保留：
+
+### config/powerlab.toml
+
+- 采样周期；
+- rollup；
+- retention；
+- LLM cadence；
+- automation 开关；
+- service 参数。
+
+### config/machine.toml
+
+只属于这台 SP7：
+
+- DMI / CPU fingerprint；
+- sensor mapping；
+- battery epoch；
+- calibration version；
+- thermal baseline；
+- cooldown；
+- pressure normalization。
+
+### config/envelopes.toml
+
+定义：
+
+- ECO_IDLE；
+- INTERACTIVE_EFFICIENT；
+- REMOTE_EFFICIENT；
+- MEDIA_EFFICIENT；
+- THERMAL_SAFE；
+- 候选 envelope。
+
+### config/thermal.toml
+
+- 状态阈值；
 - hysteresis；
-- thermal_pressure。
+- hard guard；
+- grace period。
+
+修改 thermal.toml 属于高风险人工审核。
+
+---
+
+## 42. CLI v2
+
+旧 CLI 全部删除。
+
+新 CLI 建议：
+
+- sp7-powerlab doctor
+- sp7-powerlab reset-runtime
+- sp7-powerlab calibrate status
+- sp7-powerlab calibrate start
+- sp7-powerlab calibrate finish
+- sp7-powerlab calibrate new-battery
+- sp7-powerlab observe now
+- sp7-powerlab observe power
+- sp7-powerlab observe demand
+- sp7-powerlab observe thermal
+- sp7-powerlab incidents
+- sp7-powerlab envelope list
+- sp7-powerlab envelope inspect
+- sp7-powerlab envelope adopt-current
+- sp7-powerlab envelope override
+- sp7-powerlab envelope clear-override
+- sp7-powerlab trial status
+- sp7-powerlab trial start
+- sp7-powerlab trial evaluate
+- sp7-powerlab trial rollback
+- sp7-powerlab trial promote
+- sp7-powerlab feedback
+- sp7-powerlab hourly
+- sp7-powerlab service status
+
+LLM/MCP 专用 CLI 与人类 CLI 分离，只暴露：
+
+- sp7-powerlab-agent observe
+- sp7-powerlab-agent hourly
+- sp7-powerlab-agent submit-decision
+
+agent CLI 不包含 trial start/promote、envelope 写操作或 root-helper。
+
+不保留 v1 alias。
+
+---
+
+## 43. LLM Knowledge Pack v2
+
+每小时只给 LLM 聚合数据，不给大量 raw samples。
+
+### Battery
+
+- 最近 1h / 24h BAT W；
+- battery drain；
+- brightness distribution；
+- envelope distribution；
+- battery epoch。
+
+### Demand
+
+- active/idle 时间；
+- latency need；
+- local compute pressure；
+- media；
+- remote；
+- network。
+
+### Thermal
+
+- 状态分布；
+- max temp；
+- dT/dt；
+- heat-soak episode；
+- throttle；
+- THERMAL_SAFE 时间。
+
+### Waste
+
+- 异常功耗窗口；
+- top processes；
+- GPU/network attribution；
+- 软件版本漂移。
+
+### Experiments
+
+- active trial；
+- 最近候选；
+- paired blocks；
+- revalidation；
+- rejection memory；
+- user feedback。
+
+---
+
+## 44. 自动化等级
+
+### Level 0 — Read only
+
+默认首次安装。
+
+- 只采集；
+- 只报告。
+
+### Level 1 — Verified control
+
+允许 controller 自动切换已经人工验证的 envelope。
+
+### Level 2 — Assisted trials
+
+LLM 提 proposal。
+
+用户批准后：
+
+- PowerLab 自动等待合适窗口；
+- 自动 A/B；
+- 自动回滚；
+- 自动评价。
+
+### Level 3 — Low-risk autonomous trials
+
+只允许白名单低风险参数。
+
+要求：
+
+- calibration 成熟；
+- 至少一段稳定 burn-in；
+- 回滚已经真机验证；
+- thermald 正常；
+- 用户显式开启。
+
+### Level 4 — Auto promotion
+
+不是 v2 初始默认。
+
+只有多次独立验证、无 UX 负反馈、无 thermal regression 后才允许。
+
+---
+
+## 45. 实现阶段
+
+### Phase 0 — 破坏式清场
+
+- version 改为 2.0.0-dev；
+- 删除 v1 control plane；
+- 删除旧 config/schema/tests/CLI；
+- 旧 runtime 检测后 fail-fast；
+- 要求清空 runtime。
 
 验收：
 
-用 synthetic trace + 真机 replay 测试无状态抖动。
+**源码中只剩一套 v2 架构。**
+
+### Phase 1 — SP7 Hardware Contract
+
+实现：
+
+- hardware.py；
+- DMI；
+- CPU；
+- HWP；
+- intel_pstate；
+- BAT；
+- RAPL；
+- thermal；
+- thermald health。
+
+### Phase 2 — Telemetry v2
+
+实现：
+
+- battery；
+- RAPL rolling power；
+- PSI；
+- thermal；
+- network；
+- brightness；
+- GPU；
+- process attribution；
+- suspend gap。
+
+### Phase 3 — Calibration + Battery Epoch
+
+实现：
+
+- machine.toml；
+- cold idle；
+- normal interactive；
+- media；
+- bounded burst；
+- battery epoch。
 
 ### Phase 4 — Demand Observer
 
@@ -1834,270 +1946,326 @@ Git commit 历史自然保留 v1。
 - active；
 - latency need；
 - local compute pressure；
-- remote hint；
 - media；
+- remote hint；
 - network；
-- PSI。
+- I/O pressure。
 
-不实现 semantic scene classifier。
-
-### Phase 5 — HWP Envelope Controller
+### Phase 5 — Thermal Observer
 
 实现：
 
-- v2 root helper；
+- rolling thermal model；
+- COOL；
+- WARMING；
+- HEAT_SOAKED；
+- THERMAL_PRESSURE；
+- THROTTLING；
+- hysteresis。
+
+### Phase 6 — HWP Actuator + Root Helper
+
+实现：
+
 - EPP；
 - max_perf_pct；
--可审查 turbo control；
+- 经过审查的 Turbo；
+- read-back；
+- snapshot；
+- rollback；
+- systemd hardening。
+
+### Phase 7 — Battery-Life Controller
+
+实现：
+
+- envelope selection；
 - dwell；
 - hysteresis；
 - manual override；
-- thermal preemption。
+- thermal preemption；
+- read-only degradation。
 
-### Phase 6 — Calibration
-
-实现：
-
-- calibration command；
-- machine.toml；
-- thermal baseline；
-- bounded burst；
-- validation hash。
-
-没有 calibration：
-
-```text
-controller read-only
-```
-
-### Phase 7 — Experiment Engine v2
+### Phase 8 — Waste Detector
 
 实现：
 
-- envelope trial；
-- thermal starting-state matching；
-- demand-region matching；
+- personal baseline；
+- power spike；
+- low-demand/high-power anomaly；
+- process attribution；
+- incident pack。
+
+### Phase 9 — Experiment Engine
+
+实现：
+
+- N-of-1 crossover；
+- WAITING_FOR_COMPARABLE_WINDOW；
+- A/B/A；
 - revalidation；
-- rollback；
-- user feedback。
+- UX feedback；
+- thermal constraints。
 
-### Phase 8 — Hourly LLM v2
+### Phase 10 — LLM v2
 
 重写：
 
 - knowledge pack；
 - decision schema；
-- thermal incident analysis；
-- power spike analysis；
-- envelope proposal。
+- waste investigation；
+- thermal investigation；
+- envelope trial proposal。
 
-### Phase 9 — 真机 burn-in
+### Phase 11 — 真机 burn-in
 
-至少：
+至少分阶段：
 
-```text
-7 天只读
-+
-7 天 verified envelope
-+
-再决定是否开启自动 trial
-```
+1. 只读；
+2. verified envelope；
+3. assisted trial；
+4. 再决定 autonomous trial。
 
 ---
 
-## 31. 测试要求
+## 46. 测试体系
 
-### 31.1 Unit
+### Unit
 
 必须覆盖：
 
-- thermal state transition；
-- hysteresis；
+- BAT 单位；
+- RAPL rolling power；
 - dT/dt；
-- rolling power；
-- demand vector；
-- thermal override；
-- sensor failure；
+- PSI；
+- demand；
+- thermal transitions；
+- hysteresis；
+- battery epoch；
+- brightness comparability；
 - suspend gap；
+- controller priorities；
+- root helper ranges；
 - trial rollback；
-- no-calibration read-only。
+- user rejection。
 
-### 31.2 Trace replay
+### Trace Replay
 
 构造：
 
-```text
-cold interactive
-short burst
-slow heat soak
-rapid heating
-thermald clamp
-frequency collapse
-cool-down
-remote session
-media playback
-runaway background process
-```
+- cold idle；
+- normal interactive；
+- remote interactive；
+- media；
+- short CPU burst；
+- runaway browser；
+- slow heat soak；
+- rapid heat；
+- thermald clamp；
+- frequency collapse；
+- cooldown；
+- suspend/resume；
+- sensor failure。
 
-重放必须得到预期 envelope。
+Replay 必须得到预期 action。
 
-### 31.3 Safety invariants
+### Safety Invariants
 
-测试直接断言：
+直接断言：
 
-```text
-THROTTLING => THERMAL_SAFE
-sensor invalid => no new write
-thermald down => no automatic experiment
-trial active => controller cannot overwrite trial
-manual override => trial stops
-no calibration => no automatic control
-```
+- THROTTLING => THERMAL_SAFE；
+- core sensor invalid => no new automatic write；
+- thermald unhealthy => no trial；
+- trial active => normal controller cannot overwrite candidate；
+- thermal safety may preempt trial；
+- negative feedback => rollback/reject；
+- no calibration => read-only；
+- low battery => no new trial；
+- wrong hardware => no write。
 
 ---
 
-## 32. 真机验收标准
+## 47. 真机验证流程
 
-v2 不是“代码测试过了”就完成。
+v2 不以 CI 绿灯作为完成。
 
-### 32.1 Collector
+### Stage A — 只读 7 天左右
 
-- 平均 CPU overhead < 1%；
-- 不产生可明显测出的额外续航损失；
-- 5–10s 采样稳定；
+目标：
+
+- 确认 sensor；
+- collector overhead；
+- normal BAT W；
+- thermal；
+- brightness；
+- waste incident；
+- suspend/resume。
+
+### Stage B — 单个 verified envelope
+
+只启用 INTERACTIVE_EFFICIENT。
+
+观察：
+
+- 体验；
+- BAT W；
+- thermal；
+- stability。
+
+### Stage C — 其他 envelope
+
+依次验证：
+
+- ECO_IDLE；
+- REMOTE_EFFICIENT；
+- MEDIA_EFFICIENT；
+- THERMAL_SAFE。
+
+### Stage D — Assisted Trials
+
+用户批准 proposal。
+
+验证：
+
+- snapshot；
+- apply；
+- read-back；
+- rollback；
+- revalidation。
+
+### Stage E — 可选自动实验
+
+只有前面稳定以后才讨论。
+
+---
+
+## 48. 真机验收标准
+
+### Collector
+
+- 平均 CPU overhead 目标 < 1%；
+- 不会明显增加整机 BAT W；
+- 长时间稳定；
 - suspend/resume 正常。
 
-### 32.2 Thermal
+### 续航
 
-在用户真实轻负载模式下：
+必须能给出：
 
-- 不应出现 200–400 MHz emergency collapse；
-- 不应频繁进入 THROTTLING；
-- 短 burst 后能恢复；
-- heat soak 能被提前识别；
-- thermald 与 PowerLab 不发生持续互相覆盖。
+- stock baseline；
+- verified v2；
+- 相同 brightness/demand 条件下的 paired comparison；
+- 日级平均 drain。
 
-### 32.3 Interaction
+项目成功不要求预先承诺“省 X%”。
+
+只要求：
+
+**真实数据证明它比 baseline 更省，同时用户愿意继续使用。**
+
+### 用户体验
+
+至少检查：
 
 - 网页滚动；
 - 文字输入；
 - 终端；
-- Remote IDE；
+- VS Code / 编辑器；
+- Remote IDE / SSH；
+- 媒体。
 
-不能因为节能产生明显主观延迟。
+任何明显退化都优先于功耗收益。
 
-### 32.4 Battery
+### Thermal
 
-最终才比较：
+正常日常轻负载：
 
-```text
-v2 verified envelope
-vs
-stock baseline
-```
-
-按：
-
-- idle；
-- normal interactive；
-- remote；
-- media；
-
-分别统计整机 battery W。
-
-不设“必须省 X%”的虚假目标。
+- 不应频繁进入 THERMAL_PRESSURE；
+- 不应发生 200–400 MHz 类 emergency collapse；
+- 短 burst 后应恢复；
+- heat soak 能够提前识别或由 thermald 平滑处理。
 
 ---
 
-## 33. 对 AI/ML 的最终定位
+## 49. ML 的未来路线
 
-v2 的原则是：
+只有 deterministic v2 收集足够真实数据后才重新评估。
 
-> 能用可靠物理量解决的问题，不交给 AI 猜。
+候选用途：
 
-实时路径：
+- 异常检测；
+- demand clustering；
+- 预测 heat soak；
+- 预测某 envelope 的节能收益。
 
-```text
-temperature
-power
-pressure
-activity
-network
-media
-→ deterministic control
-```
+第一阶段只能 shadow：
 
-LLM：
+- 不写参数；
+- 不影响 controller；
+- 只做离线 replay。
 
-```text
-历史分析
-异常解释
-实验假设
-社区研究
-```
+比较对象必须是现有规则系统。
 
-ML：
+如果不能在：
 
-```text
-以后
-shadow mode
-证明有效以后再讨论
-```
+- 准确性；
+- 稳定性；
+- 能耗；
+- 维护复杂度；
+
+上明显胜出，就不采用。
+
+不因为“深度学习更高级”而上线。
 
 ---
 
-## 34. 本次重构后的项目定位
+## 50. 明确的 Non-goals
 
-v1：
+v2 不做：
 
-> “识别用户场景，然后为不同场景学习省电 profile。”
-
-v2：
-
-> **“针对 Surface Pro 7 i5-1035G4 的热预算感知个人电源控制实验室：Linux/HWP 负责瞬时性能，thermald 负责热安全，PowerLab 根据实时性能需求和 thermal headroom 选择经过验证的 operating envelope，并用长期实验逐渐降低整机功耗。”**
-
-这是 v2 唯一主架构。
-
-不保留 v1 并行路径。
+- 通用 Linux 电源管理框架；
+- 全自动 AI agent 控制 root；
+- 实时工作内容理解；
+- 语义场景分类器；
+- 深度学习实时控制；
+- 本地重负载性能优化；
+- 极限温度挑战；
+- 一键启用所有 powertop tunables；
+- 同时兼容多套 power manager；
+- 自动修改 kernel cmdline；
+- 自动修改 thermald hard safety limit。
 
 ---
 
-## 35. 技术依据与社区参考
+## 51. 项目最终定位
 
-本计划的核心取向来自以下现有实现/文档，而不是凭空设计：
+PowerLab v2 的最终定义：
 
-- Linux Kernel `intel_pstate` / HWP：
-  https://www.kernel.org/doc/html/latest/admin-guide/pm/intel_pstate.html
-- Intel thermald：
-  https://github.com/intel/thermal_daemon
-- linux-surface SP7 thermal throttle issue #221：
-  https://github.com/linux-surface/linux-surface/issues/221
-- linux-surface SP7 thermal performance issue #1098：
-  https://github.com/linux-surface/linux-surface/issues/1098
-- auto-cpufreq：
-  https://github.com/AdnanHodzic/auto-cpufreq
-- dynamic-power-daemon：
-  https://github.com/evertvorster/dynamic-power-daemon
+**一个专门针对 Surface Pro 7 i5-1035G4 的个人续航优化实验系统。它持续测量整机电池功耗，优先发现并消除无意义的能耗；在没有明显用户体验损失、系统保持稳定且热状态可持续的前提下，通过少量经过验证的 operating envelope 调整 Intel HWP 性能意图，并用可回滚、可复测的个人 A/B 实验长期寻找更省电的配置。LLM 只负责慢速分析、解释和提出实验，不参与实时控制。**
 
-它们共同支持一个更可靠的工程结论：
+最终判断一个改动是否值得保留，只问三件事：
 
-```text
-低层实时控制
-→ kernel / HWP / traditional feedback
+1. **真实整机电池功耗是否下降？**
+2. **用户是否仍然觉得好用？**
+3. **这种状态是否能够长期稳定持续，而不是靠积热或隐藏问题换来的？**
 
-热保护
-→ thermald / RAPL / hardware
+三者同时成立，才是 PowerLab 的“优化”。
 
-个人长期优化
-→ PowerLab experiments
+---
 
-解释与研究
-→ LLM
-```
+## 52. 技术参考方向
 
-而不是：
+实现阶段主要参考：
 
-```text
-LLM / neural network
-→ 直接实时控制 Surface CPU
-```
+- Linux kernel intel_pstate / HWP 文档；
+- Intel thermald；
+- linux-surface Surface Pro 7 thermal issue；
+- auto-cpufreq 的负载/温度监测思路；
+- dynamic-power-daemon 的简单本地策略；
+- PowerTOP / turbostat / powerstat 的诊断方法。
+
+参考这些项目的职责划分和测量方法，但不把它们全部同时作为控制器。
+
+v2 的核心原则始终是：
+
+**能测量，就不要猜；能消除浪费，就不要先降性能；能交给 kernel/HWP/thermald，就不要在 Python 或 LLM 中重新实现；所有长期优化最终都必须回到真实 BAT 功耗和用户体验。**

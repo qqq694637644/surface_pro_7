@@ -4,22 +4,34 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sp7-powerlab"
-version = "1.0.0"
-description = "Continuous context-aware Surface Pro 7 Linux battery optimization lab"
+version = "2.0.0.dev0"
+description = "Surface Pro 7 battery-life optimization lab driven by measured demand, thermals, and reversible experiments"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "surface_pro_7 contributors" }]
 dependencies = [
+  "jsonschema>=4.23",
   "psutil>=5.9",
   "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]
 sp7-powerlab = "sp7_powerlab.cli:main"
+sp7-powerlab-agent = "sp7_powerlab.agent_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"sp7_powerlab.schemas" = ["*.json"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
