@@ -75,7 +75,7 @@ sp7-powerlab doctor
 bash scripts/check-integrations.sh
 ~~~
 
-重点检查 Surface Pro 7 DMI、i5-1035G4、intel_pstate/HWP、BAT、RAPL、thermal sensor、thermald，以及是否存在 TLP / auto-cpufreq / Power Options / PPD 等冲突写入者。
+重点检查 Surface Pro 7 DMI、i5-1035G4、`intel_pstate=active`、HWP/EPP、Turbo control、BAT、RAPL、thermal sensor、thermald，以及是否存在 TLP / auto-cpufreq / Power Options / PPD 等冲突写入者。
 
 ## 只读 burn-in
 
@@ -179,13 +179,13 @@ v2 使用 A baseline → B candidate → A baseline → 独立 B revalidation。
 
 thermal pressure、thermald 异常、低电量、suspend/resume、不可比窗口和负面用户反馈都会阻止或回滚实验。
 
-只有完成独立 revalidation、状态成为 VERIFIED_WINNER 后才能 promotion：
+只有完成独立 revalidation、状态成为 `VERIFIED_WINNER` 后才能显式 promotion：
 
 ~~~bash
 sp7-powerlab trial promote trial-xxxx
 ~~~
 
-Level 2 允许人工 promotion；未人工批准的自动 promotion 只在 Level 4 且 auto_promote=true 时允许。
+promotion 会把最优参数以 CANDIDATE 形式回写 `config/envelopes.toml` 供 Git 保存；当前机器的 VERIFIED 身份仍只存在于带 battery epoch / fingerprint / calibration 的 SQLite 验证记录中。Level 2 允许人工 promotion；未人工批准的自动 promotion 只在 Level 4 且 auto_promote=true 时允许。
 
 ## 用户反馈
 

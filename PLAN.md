@@ -1751,6 +1751,7 @@ Git 历史就是 v1 的档案。
 - sp7-powerlab calibrate status
 - sp7-powerlab calibrate start
 - sp7-powerlab calibrate finish
+- sp7-powerlab calibrate new-battery
 - sp7-powerlab observe now
 - sp7-powerlab observe power
 - sp7-powerlab observe demand
@@ -1765,6 +1766,7 @@ Git 历史就是 v1 的档案。
 - sp7-powerlab trial start
 - sp7-powerlab trial evaluate
 - sp7-powerlab trial rollback
+- sp7-powerlab trial promote
 - sp7-powerlab feedback
 - sp7-powerlab hourly
 - sp7-powerlab llm-apply

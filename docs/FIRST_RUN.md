@@ -14,7 +14,7 @@ sp7-powerlab reset-runtime --yes
 sp7-powerlab doctor
 ~~~
 
-自动写入要求 Surface Pro 7、i5-1035G4、intel_pstate、HWP/EPP、BAT、RAPL、thermal sensor、systemd、thermald active，并且没有冲突 power writer。
+自动写入要求 Surface Pro 7、i5-1035G4、`intel_pstate=active`、HWP/EPP、`no_turbo` 控制、BAT、RAPL、thermal sensor、systemd、thermald active，并且没有冲突 power writer。
 
 错误硬件仍可只读诊断，不允许写参数。
 

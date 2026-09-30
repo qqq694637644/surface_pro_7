@@ -31,6 +31,12 @@ THERMAL_PRESSURE / THROTTLING 会让 trial 自动 rollback，controller 优先 T
 
 超过 collector gap 后 RAPL/temp rolling window 重建，进入 resume grace，grace 内不自动控制，也不把 suspend 计入有效实验时长。
 
+## Service restart
+
+主 service 启动时不会继续一个跨重启的旧实验。任何未完成 trial 都会先尝试恢复 exact baseline snapshot 并标记为 rolled back；如果 helper/HWP 已不可用导致恢复失败，则 trial 进入 FAILED，controller 保持不可写状态直到硬件/ownership 条件重新通过。
+
+运行期间每 5 分钟重新检查硬件契约、thermald/ownership 冲突和 helper 可用性；calibration 或 thermal 配置文件变化也会同步到 observer/controller，并使受影响的 VERIFIED envelope 进入 revalidation。
+
 ## Manual override
 
 只接受 verified envelope：

@@ -32,3 +32,6 @@ LLM proposal 不是 reward。PowerLab 只接受真实 BAT 数据的 A/B/A + reva
 candidate 只有同时满足 BAT W 下降、PSI/体验不恶化、thermal 不恶化且无用户负反馈，才能成为 VERIFIED_WINNER。
 
 稳定运行时最常见动作应该是 NO_CHANGE。
+
+Level 2 的“人工批准”不属于 LLM decision JSON。用户通过
+`sp7-powerlab llm-apply decision.json --approve` 独立授权；模型自己输出任何 approval 字段都会被 schema/validator 拒绝。
