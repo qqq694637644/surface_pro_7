@@ -1,0 +1,11 @@
+[Unit]
+Description=Run SP7 PowerLab hourly analysis
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

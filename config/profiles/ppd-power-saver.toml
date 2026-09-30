@@ -1,0 +1,11 @@
+[profile]
+id = "ppd-power-saver"
+backend = "power-profiles-daemon"
+backend_profile = "power-saver"
+status = "experimental"
+scenes = ["idle", "reading", "media_playback"]
+
+[evidence]
+kind = "candidate"
+note = "Ready for SP7 validation; not auto-selected until promoted/marked verified."
+auto_trial_allowed = false

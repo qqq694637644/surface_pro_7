@@ -65,15 +65,49 @@ def test_summarize_power(tmp_path):
     result = summarize(tmp_path)
     assert result["samples"] == 2
     assert result["duration_seconds"] == 600.0
-    assert result["power_w"]["average"] == 6.0
+    assert result["power_w"]["average"] is None
     assert result["power_w"]["median"] == 6.0
     assert result["power_w"]["minimum"] == 5.0
     assert result["power_w"]["maximum"] == 7.0
+    assert result["conditions"]["gap_count"] == 1
+    assert result["conditions"]["valid_discharge_duration_seconds"] == 0.0
     assert result["conditions"]["average_brightness_percent"] == 30.0
     assert result["conditions"]["average_max_temp_c"] == 43.0
     assert result["conditions"]["wifi_rx_mb_delta"] == 10.0
     assert result["conditions"]["wifi_tx_mb_delta"] == 2.0
     assert result["conditions"]["cpu0_deep_idle_fraction"] == 0.5
+
+
+def test_summarize_uses_time_weighted_valid_discharge(tmp_path):
+    write_experiment(tmp_path)
+    path = tmp_path / "telemetry.csv"
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=TELEMETRY_FIELDS)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "timestamp": "2026-09-29T00:00:00+00:00",
+                "battery_status": "Discharging",
+                "power_w": 4.0,
+            }
+        )
+        writer.writerow(
+            {
+                "timestamp": "2026-09-29T00:00:10+00:00",
+                "battery_status": "Discharging",
+                "power_w": 6.0,
+            }
+        )
+        writer.writerow(
+            {
+                "timestamp": "2026-09-29T00:00:20+00:00",
+                "battery_status": "Discharging",
+                "power_w": 8.0,
+            }
+        )
+    result = summarize(tmp_path)
+    assert result["power_w"]["average"] == 6.0
+    assert result["conditions"]["valid_discharge_duration_seconds"] == 20.0
 
 
 def test_ai_summary_contains_guardrails(tmp_path, monkeypatch):

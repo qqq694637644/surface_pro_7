@@ -1,4 +1,6 @@
 .venv/
+build/
+dist/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -7,4 +9,5 @@ experiments/*
 !experiments/.gitkeep
 powerlab.sqlite3
 .powerlab-active
+runtime/
 *.log

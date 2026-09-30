@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SP7 PowerLab hourly LLM decision",
+  "type": "object",
+  "required": ["action", "reason", "payload"],
+  "properties": {
+    "decision_id": {"type": "string"},
+    "source": {"type": "string"},
+    "action": {
+      "enum": [
+        "NO_CHANGE",
+        "NEED_MORE_DATA",
+        "PROPOSE_TRIAL",
+        "ROLLBACK_TRIAL",
+        "PROMOTE_PROFILE",
+        "INVESTIGATE_REGRESSION",
+        "UPDATE_CONTEXT_RULE"
+      ]
+    },
+    "reason": {"type": "string", "minLength": 1},
+    "payload": {"type": "object"}
+  },
+  "additionalProperties": true
+}

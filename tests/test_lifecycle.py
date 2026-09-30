@@ -3,6 +3,7 @@ import csv
 import json
 
 import sp7_powerlab.cli as cli
+from sp7_powerlab.metrics import sha256_file
 from sp7_powerlab.proposals import normalize_proposal, proposal_template
 
 
@@ -67,7 +68,7 @@ def test_finish_archives_proposal_evaluation(tmp_path, monkeypatch):
         "started_at": "2026-09-29T01:00:00+00:00",
         "config_files": [],
         "proposal_id": proposal["id"],
-        "proposal_sha256": "test",
+        "proposal_sha256": sha256_file(proposal_path),
         "system": {
             "kernel": "6.0-test",
             "dmi": {"is_surface_pro_7": True},
@@ -103,9 +104,8 @@ def test_finish_archives_proposal_evaluation(tmp_path, monkeypatch):
 
     archived = json.loads((history / "candidate.json").read_text(encoding="utf-8"))
     evaluation = archived["proposal_evaluation"]
-    assert evaluation["observed"]["average_power_delta_w"] == -0.5
-    assert evaluation["checks"]["average_power_delta"] is True
-    assert evaluation["checks"]["temperature_delta"] is True
-    assert evaluation["checks"]["duration"] is True
-    assert evaluation["criteria_status"] == "criteria-met"
+    assert evaluation["observed"]["average_power_delta_w"] is None
+    assert evaluation["checks"]["sample_count"] is False
+    assert evaluation["checks"]["power_available"] is False
+    assert evaluation["criteria_status"] == "insufficient-data"
     assert evaluation["review_status"] == "pending-human-review"

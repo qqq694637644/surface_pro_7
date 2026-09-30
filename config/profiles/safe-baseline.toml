@@ -1,0 +1,14 @@
+[profile]
+id = "safe-baseline"
+backend = "noop"
+status = "verified"
+scenes = [
+  "idle", "reading", "web_interactive", "coding_interactive",
+  "office_interactive", "remote_interactive", "media_playback",
+  "video_call", "compile", "background_compute", "file_transfer",
+  "mixed", "unknown"
+]
+
+[evidence]
+kind = "safe-default"
+note = "No-op baseline: PowerLab observes without changing system power settings."

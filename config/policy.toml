@@ -1,0 +1,17 @@
+# All contexts start on the no-op safe baseline.
+# Promoted trial profiles are stored in SQLite context_policies and take precedence.
+
+[scene]
+idle = "safe-baseline"
+reading = "safe-baseline"
+web_interactive = "safe-baseline"
+coding_interactive = "safe-baseline"
+office_interactive = "safe-baseline"
+remote_interactive = "safe-baseline"
+media_playback = "safe-baseline"
+video_call = "safe-baseline"
+compile = "safe-baseline"
+background_compute = "safe-baseline"
+file_transfer = "safe-baseline"
+mixed = "safe-baseline"
+unknown = "safe-baseline"

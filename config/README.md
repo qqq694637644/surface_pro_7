@@ -1,14 +1,49 @@
-# Power profiles
+# PowerLab configuration
 
-This directory is reserved for reviewed, version-controlled power-management profiles.
+This directory contains the version-controlled policy surface for SP7 PowerLab.
 
-The initial project does not write to sysfs or mutate Power Options automatically. When Power Options is adopted on the target Surface Pro 7, keep copies or generated patches of the active profile here so every experiment can be tied to a reproducible configuration.
+## Files
 
-Recommended naming:
+- `powerlab.toml` — collector, LLM cadence, experiment gates, automation, storage and actuator settings.
+- `contexts.toml` — deterministic application/process groups used by the local context engine.
+- `policy.toml` — default scene → profile mapping. Promoted SQLite context policies take precedence.
+- `profiles/*.toml` — reviewed profile definitions.
 
-- `baseline.toml`
-- `web-balanced.toml`
-- `web-longlife.toml`
-- `video.toml`
+## Profile lifecycle
 
-Do not put secrets or machine credentials in profile files.
+A profile can be:
+
+```text
+experimental
+verified
+needs_revalidation
+deprecated
+blocked
+```
+
+Static TOML describes the reproducible profile definition. Runtime verification status, validation evidence and promoted scene mappings are kept in SQLite and exported to `history/continuous/`; reloading a TOML profile does not erase those learned states.
+
+The built-in `safe-baseline` is a verified no-op profile. Other bundled profiles are experimental until validated on the actual Surface Pro 7.
+
+## Single-writer rule
+
+`policy.actuator = "auto"` chooses one writer:
+
+```text
+Power Options
+→ power-profiles-daemon
+→ direct sysfs
+```
+
+Do not run multiple tools that continuously write the same EPP/frequency parameters.
+
+## Git
+
+Commit:
+
+- reviewed config changes;
+- promoted/validated profile definitions when you choose to materialize them;
+- `history/continuous/` knowledge snapshots;
+- reviewed context-rule proposals.
+
+Do not commit `runtime/`.

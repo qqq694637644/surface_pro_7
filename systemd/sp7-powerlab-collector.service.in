@@ -1,0 +1,16 @@
+[Unit]
+Description=Surface Pro 7 PowerLab continuous collector
+After=graphical-session.target network-online.target
+Wants=network-online.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+ExecStart=@POWERLAB_BIN@ service-run --config @ROOT@/config/powerlab.toml
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target

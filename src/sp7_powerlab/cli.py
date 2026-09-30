@@ -16,6 +16,18 @@ from .metrics import (
     system_snapshot as extended_system_snapshot,
     telemetry_snapshot,
 )
+from .actuators import ActuatorManager
+from .collector import Collector, benchmark_collector
+from .config import load_config
+from .experiments import TrialError, TrialManager
+from .knowledge import KnowledgeManager
+from .jobs import run_measured_task
+from .helper import RootHelperServer
+from .orchestrator import HourlyOrchestrator, OrchestratorError, validate_decision
+from .policy import PolicyEngine
+from .profiles import ProfileRegistry
+from .quality import integrate_energy
+from .storage import Database
 from .proposals import (
     SAFE_PARAMETERS,
     SENSITIVE_PREFIXES,
@@ -190,11 +202,30 @@ def evaluate_proposal(proposal: dict, result: dict) -> dict:
     )
     statuses = set(result.get("battery_statuses") or [])
     checks["battery_discharging_only"] = statuses == {"Discharging"} if statuses else None
-
-    decisive = [value for value in checks.values() if value is not None]
-    if not decisive:
+    base_statuses = set(base.get("battery_statuses") or [])
+    checks["baseline_battery_discharging_only"] = (
+        base_statuses == {"Discharging"} if base_statuses else None
+    )
+    checks["sample_count"] = (
+        int(result.get("samples") or 0) >= 30
+        and int(base.get("samples") or 0) >= 30
+    )
+    checks["power_available"] = base_avg is not None and candidate_avg is not None
+    required_checks = [
+        "duration",
+        "workload_match",
+        "battery_discharging_only",
+        "baseline_battery_discharging_only",
+        "sample_count",
+        "power_available",
+    ]
+    if power_limit is not None:
+        required_checks.append("average_power_delta")
+    if temp_limit is not None:
+        required_checks.append("temperature_delta")
+    if any(checks.get(key) is None for key in required_checks):
         criteria = "insufficient-data"
-    elif all(decisive):
+    elif all(bool(checks.get(key)) for key in required_checks):
         criteria = "criteria-met"
     else:
         criteria = "criteria-not-met"
@@ -397,12 +428,20 @@ def summarize(exp_dir: Path) -> dict:
     wifi_tx: list[float] = []
     deep_idle: list[float] = []
     battery_statuses: set[str] = set()
+    integration_samples: list[dict] = []
 
     with (exp_dir / "telemetry.csv").open(newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             ts = parse_time(row.get("timestamp"))
             if ts is not None:
                 timestamps.append(ts)
+                integration_samples.append(
+                    {
+                        "ts": ts.timestamp(),
+                        "power_w": number(row.get("power_w")),
+                        "battery_status": row.get("battery_status"),
+                    }
+                )
             for key, target in (
                 ("power_w", powers),
                 ("brightness_percent", brightness),
@@ -428,6 +467,11 @@ def summarize(exp_dir: Path) -> dict:
         delta = deep_idle[-1] - deep_idle[0]
         if delta >= 0:
             deep_idle_fraction = max(0.0, min(1.0, delta / (duration_seconds * 1_000_000.0)))
+    integrated = integrate_energy(
+        integration_samples,
+        max_gap_seconds=30.0,
+        require_discharging=True,
+    )
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -442,13 +486,16 @@ def summarize(exp_dir: Path) -> dict:
         "samples": len(powers),
         "battery_statuses": sorted(battery_statuses),
         "power_w": {
-            "average": statistics.fmean(powers) if powers else None,
+            "average": integrated["average_power_w"],
             "median": statistics.median(powers) if powers else None,
             "p95": percentile95(powers),
             "minimum": min(powers) if powers else None,
             "maximum": max(powers) if powers else None,
         },
         "conditions": {
+            "valid_discharge_duration_seconds": integrated["valid_duration_s"],
+            "integrated_energy_wh": integrated["energy_wh"],
+            "gap_count": integrated["gaps"],
             "average_brightness_percent": statistics.fmean(brightness) if brightness else None,
             "average_max_temp_c": statistics.fmean(temperatures) if temperatures else None,
             "average_load1": statistics.fmean(loads) if loads else None,
@@ -588,8 +635,20 @@ def cmd_finish(_: argparse.Namespace) -> int:
     proposal_evaluation = None
     proposal_id = meta.get("proposal_id")
     if proposal_id:
-        _, proposal = load_proposal(proposal_id)
-        proposal_evaluation = evaluate_proposal(proposal, result)
+        proposal_path, proposal = load_proposal(proposal_id)
+        expected_hash = meta.get("proposal_sha256")
+        current_hash = sha256_file(proposal_path)
+        if expected_hash and expected_hash != current_hash:
+            proposal_evaluation = {
+                "proposal_id": proposal_id,
+                "criteria_status": "insufficient-data",
+                "review_status": "blocked",
+                "reason": "proposal_hash_mismatch",
+                "expected_sha256": expected_hash,
+                "current_sha256": current_hash,
+            }
+        else:
+            proposal_evaluation = evaluate_proposal(proposal, result)
 
     (exp_dir / "result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (exp_dir / "ai-summary.json").write_text(
@@ -903,6 +962,638 @@ def cmd_ai_pack(args: argparse.Namespace) -> int:
     return 0
 
 
+def continuous_stack(config_path: str | None = None):
+    path = Path(config_path).expanduser() if config_path else None
+    config = load_config(ROOT, path)
+    db = Database(config.path("storage.database", "runtime/powerlab.sqlite3"))
+    registry = ProfileRegistry(config.root, db)
+    registry.load()
+    actuators = ActuatorManager(config)
+    trials = TrialManager(config, db, actuators, registry)
+    knowledge = KnowledgeManager(config, db, registry)
+    policy = PolicyEngine(config, db, registry, actuators)
+    orchestrator = HourlyOrchestrator(config, db, knowledge, trials)
+    return config, db, registry, actuators, trials, knowledge, policy, orchestrator
+
+
+def current_context_from_sample(sample: dict | None) -> dict | None:
+    if not sample:
+        return None
+    context = sample.get("context")
+    if isinstance(context, dict):
+        return {
+            **context,
+            "battery_pct": sample.get("battery_pct"),
+            "battery_status": sample.get("battery_status"),
+            "profile_id": sample.get("profile_id"),
+        }
+    scene = sample.get("context_scene")
+    if not scene:
+        return None
+    return {
+        "context_id": None,
+        "scene": scene,
+        "confidence": sample.get("context_confidence"),
+        "features": {},
+        "battery_pct": sample.get("battery_pct"),
+        "battery_status": sample.get("battery_status"),
+        "profile_id": sample.get("profile_id"),
+    }
+
+
+def cmd_service_run(args: argparse.Namespace) -> int:
+    config, db, registry, actuators, trials, knowledge, policy, _ = continuous_stack(
+        args.config
+    )
+    try:
+        if bool(config.get("automation.recover_trial_on_collector_start", True)):
+            recovered = trials.recover_stale_trial()
+            if recovered:
+                print(json.dumps({"trial_recovery": recovered}, ensure_ascii=False))
+        knowledge.detect_drift()
+        def guarded_policy(sample, context):
+            waiting = trials.status()
+            if waiting and waiting.get("state") == "WAITING_FOR_CONTEXT":
+                try:
+                    started = trials.maybe_start_waiting(
+                        {
+                            **context,
+                            "battery_pct": sample.get("battery_pct"),
+                            "battery_status": sample.get("battery_status"),
+                            "profile_id": sample.get("profile_id"),
+                        },
+                        unattended=bool(
+                            config.get("automation.auto_run_low_risk_trials", False)
+                        ),
+                    )
+                    if started:
+                        db.add_system_event(
+                            "waiting_trial_context_matched",
+                            {
+                                "trial_id": started["trial_id"],
+                                "scene": context.get("scene"),
+                            },
+                        )
+                except TrialError as exc:
+                    db.add_system_event(
+                        "waiting_trial_start_failed",
+                        {"error": str(exc), "context": context},
+                    )
+            temp = sample.get("temp_c")
+            if (
+                trials.status()
+                and isinstance(temp, (int, float))
+                and temp >= float(config.get("policy.thermal_emergency_c", 90.0))
+            ):
+                trials.rollback(reason=f"thermal emergency at {temp:.1f}C")
+            return policy.consider(sample, context)
+
+        def effective_profile():
+            active = trials.status()
+            if (
+                active
+                and active.get("state") not in {"WAITING_FOR_CONTEXT", "ROLLED_BACK", "FAILED"}
+                and active.get("candidate_profile")
+            ):
+                return active.get("candidate_profile")
+            return policy.current_profile()
+
+        collector = Collector(
+            config,
+            db,
+            profile_provider=effective_profile,
+            policy_callback=guarded_policy,
+        )
+        collector.run()
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_service_status(args: argparse.Namespace) -> int:
+    config, db, registry, actuators, trials, knowledge, policy, _ = continuous_stack(
+        args.config
+    )
+    try:
+        latest = db.latest_sample()
+        out = {
+            "database": db.health(),
+            "active_trial": trials.status(),
+            "actuators": actuators.inspect(),
+            "profiles": db.profiles(),
+            "context_policies": db.context_policies(),
+            "latest_sample": latest,
+            "config": str(config.source) if config.source else None,
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_collect_once_continuous(args: argparse.Namespace) -> int:
+    config, db, registry, actuators, trials, knowledge, policy, _ = continuous_stack(
+        args.config
+    )
+    try:
+        collector = Collector(
+            config,
+            db,
+            profile_provider=policy.current_profile,
+            policy_callback=policy.consider if args.apply_policy else None,
+        )
+        collector.startup_snapshot()
+        sample = collector.collect_once()
+        collector.sessions.flush(extra_reason="single_sample")
+        print(json.dumps(sample, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_collector_benchmark(args: argparse.Namespace) -> int:
+    config, db, *_ = continuous_stack(args.config)
+    try:
+        result = benchmark_collector(config, db, samples=args.samples)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_observe(args: argparse.Namespace) -> int:
+    _, db, _, _, _, knowledge, _, _ = continuous_stack(args.config)
+    try:
+        out = {
+            "summary": knowledge.scene_summary(args.hours),
+            "current": db.latest_sample(),
+            "active_trial": db.active_trial(),
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_contexts_continuous(args: argparse.Namespace) -> int:
+    _, db, _, _, _, knowledge, _, _ = continuous_stack(args.config)
+    try:
+        since = time.time() - args.hours * 3600
+        out = {
+            "summary": knowledge.scene_summary(args.hours),
+            "sessions": db.recent_sessions(since, scene=args.scene),
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_current_continuous(args: argparse.Namespace) -> int:
+    _, db, _, actuators, trials, _, _, _ = continuous_stack(args.config)
+    try:
+        print(
+            json.dumps(
+                {
+                    "sample": db.latest_sample(),
+                    "active_trial": trials.status(),
+                    "actuators": actuators.inspect(),
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_profile_list(args: argparse.Namespace) -> int:
+    _, db, registry, *_ = continuous_stack(args.config)
+    try:
+        print(
+            json.dumps(
+                {
+                    "profiles": registry.load(),
+                    "context_policies": db.context_policies(),
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_profile_inspect(args: argparse.Namespace) -> int:
+    _, db, registry, *_ = continuous_stack(args.config)
+    try:
+        profile = registry.get(args.profile_id)
+        if not profile:
+            raise SystemExit(f"Profile not found: {args.profile_id}")
+        print(json.dumps(profile, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_profile_apply(args: argparse.Namespace) -> int:
+    _, db, registry, _, _, _, policy, _ = continuous_stack(args.config)
+    try:
+        profile = registry.get(args.profile_id)
+        if not profile:
+            raise SystemExit(f"Profile not found: {args.profile_id}")
+        result = policy.apply_profile_id(
+            args.profile_id,
+            reason=args.reason or "manual profile apply",
+            force=True,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_profile_status(args: argparse.Namespace) -> int:
+    _, db, registry, *_ = continuous_stack(args.config)
+    try:
+        registry.set_status(args.profile_id, args.status)
+        if args.scene and args.status == "verified":
+            profile = registry.get(args.profile_id)
+            if not profile:
+                raise SystemExit(f"Profile not found: {args.profile_id}")
+            latest = db.latest_sample() or {}
+            app_version = latest.get("app_version")
+            last_validated = {
+                "ts": time.time(),
+                "scene": args.scene,
+                "kernel": latest.get("kernel"),
+                "app_major_version": (
+                    app_version.get("major")
+                    if isinstance(app_version, dict)
+                    else None
+                ),
+                "battery_health_pct": latest.get("battery_health_pct"),
+                "brightness_pct": latest.get("brightness_pct"),
+                "temperature_c": latest.get("temp_c"),
+            }
+            evidence = {
+                **(profile.get("evidence") or {}),
+                "manual_verification_note": args.note,
+                "scenes": sorted(
+                    set(
+                        [
+                            *(profile.get("evidence") or {}).get("scenes", []),
+                            args.scene,
+                        ]
+                    )
+                ),
+            }
+            db.upsert_profile(
+                {
+                    **profile,
+                    "status": "verified",
+                    "evidence": evidence,
+                    "last_validated": last_validated,
+                }
+            )
+            registry.load()
+            db.set_context_policy(
+                args.scene,
+                args.profile_id,
+                source="manual_profile_verification",
+                evidence={
+                    "note": args.note,
+                    "last_validated": last_validated,
+                },
+            )
+        print(
+            json.dumps(
+                {
+                    "profile_id": args.profile_id,
+                    "status": args.status,
+                    "scene": args.scene,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_trial_start(args: argparse.Namespace) -> int:
+    config, db, _, _, trials, _, _, _ = continuous_stack(args.config)
+    try:
+        proposal = load_json(Path(args.proposal))
+        errors = validate_proposal(proposal)
+        if errors:
+            raise SystemExit("Proposal validation failed:\n- " + "\n- ".join(errors))
+        proposal = normalize_proposal(proposal)
+        PROPOSALS.mkdir(parents=True, exist_ok=True)
+        proposal_path = PROPOSALS / f"{proposal['id']}.json"
+        proposal_path.write_text(
+            json.dumps(proposal, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        context = current_context_from_sample(db.latest_sample())
+        result = trials.start(
+            proposal,
+            current_context=None if args.ignore_context else context,
+            unattended=args.unattended,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_trial_status(args: argparse.Namespace) -> int:
+    _, db, _, _, trials, _, _, _ = continuous_stack(args.config)
+    try:
+        trial = db.get_trial(args.trial_id) if args.trial_id else trials.status()
+        print(json.dumps(trial, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_trial_evaluate(args: argparse.Namespace) -> int:
+    _, db, _, _, trials, _, _, _ = continuous_stack(args.config)
+    try:
+        result = trials.evaluate(args.trial_id)
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_trial_rollback(args: argparse.Namespace) -> int:
+    _, db, _, _, trials, _, _, _ = continuous_stack(args.config)
+    try:
+        result = trials.rollback(args.trial_id, reason=args.reason)
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_trial_promote(args: argparse.Namespace) -> int:
+    _, db, _, _, trials, _, _, _ = continuous_stack(args.config)
+    try:
+        result = trials.promote(args.trial_id, args.profile_id)
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_feedback(args: argparse.Namespace) -> int:
+    _, db, _, _, trials, _, _, _ = continuous_stack(args.config)
+    try:
+        feedback = {
+            "trial_id": args.trial_id,
+            "session_id": args.session_id,
+            "decision": args.decision,
+            "responsiveness": args.responsiveness,
+            "stability": args.stability,
+            "suspend_wake": args.suspend_wake,
+            "notes": args.notes,
+        }
+        db.add_feedback(feedback)
+        if args.decision == "rejected" and args.trial_id:
+            trial = db.get_trial(args.trial_id)
+            if trial:
+                proposal = trial.get("proposal") or {}
+                db.add_rejection(
+                    trial.get("context_scene"),
+                    trial.get("parameter"),
+                    (proposal.get("change") or {}).get("to"),
+                    args.notes or "human rejected",
+                    "human_feedback",
+                )
+                active = trials.status()
+                if active and active.get("trial_id") == args.trial_id:
+                    feedback["rollback"] = trials.rollback(
+                        args.trial_id, reason="human feedback rejected trial"
+                    )
+                for profile in db.profiles():
+                    if (profile.get("evidence") or {}).get("source_trial") == args.trial_id:
+                        db.set_profile_status(profile["profile_id"], "blocked")
+                        feedback.setdefault("blocked_profiles", []).append(
+                            profile["profile_id"]
+                        )
+        print(json.dumps(feedback, indent=2, ensure_ascii=False))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_knowledge_pack(args: argparse.Namespace) -> int:
+    _, db, _, _, _, knowledge, _, _ = continuous_stack(args.config)
+    try:
+        pack = knowledge.build_pack(args.hours)
+        text_out = json.dumps(pack, indent=2, ensure_ascii=False, default=str) + "\n"
+        if args.output:
+            target = Path(args.output)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text_out, encoding="utf-8")
+            print(target)
+        else:
+            print(text_out, end="")
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_knowledge_export(args: argparse.Namespace) -> int:
+    _, db, _, _, _, knowledge, _, _ = continuous_stack(args.config)
+    try:
+        result = knowledge.export_git_knowledge()
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_actuator_inspect(args: argparse.Namespace) -> int:
+    _, db, _, actuators, *_ = continuous_stack(args.config)
+    try:
+        print(json.dumps(actuators.inspect(), indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_hourly(args: argparse.Namespace) -> int:
+    config, db, registry, actuators, trials, knowledge, policy, orchestrator = continuous_stack(
+        args.config
+    )
+    try:
+        drift = knowledge.detect_drift()
+        evaluation = None
+        active = trials.status()
+        if active and active.get("state") in {"MEASURING", "REVALIDATION"}:
+            try:
+                evaluation = trials.evaluate(active["trial_id"])
+            except TrialError as exc:
+                evaluation = {"error": str(exc)}
+        active = trials.status()
+        if (
+            active
+            and active.get("state") == "CANDIDATE_WINNER"
+            and bool(config.get("automation.auto_promote_profiles", False))
+        ):
+            promotion = trials.promote(active["trial_id"])
+            if evaluation is None:
+                evaluation = {"verdict": "CANDIDATE_WINNER"}
+            evaluation["promotion"] = promotion
+        emitted = orchestrator.emit_pack(
+            Path(args.output) if args.output else None
+        )
+        knowledge_export = knowledge.export_git_knowledge()
+        print(
+            json.dumps(
+                {
+                    "run_id": emitted["run_id"],
+                    "pack_file": emitted["output"],
+                    "drift": drift,
+                    "trial_evaluation": evaluation,
+                    "knowledge_export": knowledge_export,
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_llm_apply(args: argparse.Namespace) -> int:
+    _, db, _, _, _, _, _, orchestrator = continuous_stack(args.config)
+    try:
+        decision = json.loads(Path(args.decision).read_text(encoding="utf-8"))
+        errors = validate_decision(decision)
+        if errors:
+            raise SystemExit("Decision validation failed:\n- " + "\n- ".join(errors))
+        result = orchestrator.apply_decision(
+            decision,
+            run_id=args.run_id,
+            current_context=current_context_from_sample(db.latest_sample()),
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+    except (json.JSONDecodeError, OrchestratorError) as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        db.close()
+
+
+def cmd_task_run(args: argparse.Namespace) -> int:
+    config, db, _, _, trials, _, policy, _ = continuous_stack(args.config)
+    try:
+        active = trials.status()
+        command = list(args.command)
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            raise SystemExit("task-run requires a command after --")
+        result = run_measured_task(
+            db,
+            scene=args.scene,
+            label=args.label,
+            command=command,
+            max_gap_seconds=float(config.get("collector.max_gap_seconds", 45)),
+            profile_id=(
+                active.get("candidate_profile")
+                if active and active.get("candidate_profile")
+                else policy.current_profile()
+            ),
+            trial_id=active.get("trial_id") if active else None,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return int(result.get("exit_code") or 0)
+    finally:
+        db.close()
+
+
+def cmd_root_helper(args: argparse.Namespace) -> int:
+    server = RootHelperServer(Path(args.socket), args.allow_user)
+    server.run()
+    return 0
+
+
+def cmd_config_get(args: argparse.Namespace) -> int:
+    path = Path(args.config).expanduser() if args.config else None
+    config = load_config(ROOT, path)
+    value = config.get(args.key)
+    if value is None:
+        raise SystemExit(f"Unknown config key: {args.key}")
+    if isinstance(value, (dict, list)):
+        print(json.dumps(value, ensure_ascii=False))
+    elif isinstance(value, bool):
+        print("true" if value else "false")
+    else:
+        print(value)
+    return 0
+
+
+def cmd_override(args: argparse.Namespace) -> int:
+    config, db, registry, _, trials, _, policy, _ = continuous_stack(args.config)
+    try:
+        path = config.root / "runtime" / "manual-override"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if args.override_command == "status":
+            print(
+                json.dumps(
+                    {
+                        "profile_id": policy.manual_override(),
+                        "file": str(path),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        if args.override_command == "clear":
+            path.unlink(missing_ok=True)
+            if trials.status():
+                trials.rollback(reason="manual override cleared")
+            result = policy.apply_profile_id(
+                str(config.get("policy.safe_profile", "safe-baseline")),
+                reason="manual override cleared",
+                force=True,
+            )
+            db.add_system_event("manual_override_cleared", {"result": result})
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+            return 0
+        profile = registry.get(args.profile_id)
+        if not profile:
+            raise SystemExit(f"Profile not found: {args.profile_id}")
+        if trials.status():
+            trials.rollback(reason="manual profile override")
+        result = policy.apply_profile_id(
+            args.profile_id,
+            reason="manual profile override",
+            force=True,
+        )
+        path.write_text(args.profile_id + "\n", encoding="utf-8")
+        db.add_system_event(
+            "manual_override_set",
+            {"profile_id": args.profile_id, "result": result},
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+    finally:
+        db.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sp7-powerlab")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1002,6 +1693,173 @@ def build_parser() -> argparse.ArgumentParser:
     ai_pack.add_argument("--workload")
     ai_pack.add_argument("--output")
     ai_pack.set_defaults(func=cmd_ai_pack)
+
+    service_run = sub.add_parser("service-run", help="run the continuous collector/policy service")
+    service_run.add_argument("--config")
+    service_run.set_defaults(func=cmd_service_run)
+
+    service_status = sub.add_parser("service-status", help="show continuous PowerLab health")
+    service_status.add_argument("--config")
+    service_status.set_defaults(func=cmd_service_status)
+
+    collect_once = sub.add_parser("collect-once", help="collect one continuous-mode sample")
+    collect_once.add_argument("--config")
+    collect_once.add_argument("--apply-policy", action="store_true")
+    collect_once.set_defaults(func=cmd_collect_once_continuous)
+
+    benchmark = sub.add_parser("collector-benchmark", help="measure collector overhead")
+    benchmark.add_argument("--config")
+    benchmark.add_argument("--samples", type=int, default=12)
+    benchmark.set_defaults(func=cmd_collector_benchmark)
+
+    observe = sub.add_parser("observe", help="summarize recent real usage")
+    observe.add_argument("--config")
+    observe.add_argument("--hours", type=float, default=1.0)
+    observe.set_defaults(func=cmd_observe)
+
+    contexts = sub.add_parser("contexts", help="show context/session history")
+    contexts.add_argument("--config")
+    contexts.add_argument("--hours", type=float, default=24.0)
+    contexts.add_argument("--scene")
+    contexts.set_defaults(func=cmd_contexts_continuous)
+
+    current = sub.add_parser("current", help="show latest sample, trial and actuator state")
+    current.add_argument("--config")
+    current.set_defaults(func=cmd_current_continuous)
+
+    profile = sub.add_parser("profile", help="manage verified/experimental profiles")
+    profile_sub = profile.add_subparsers(dest="profile_command", required=True)
+    profile_list_cmd = profile_sub.add_parser("list")
+    profile_list_cmd.add_argument("--config")
+    profile_list_cmd.set_defaults(func=cmd_profile_list)
+    profile_inspect_cmd = profile_sub.add_parser("inspect")
+    profile_inspect_cmd.add_argument("profile_id")
+    profile_inspect_cmd.add_argument("--config")
+    profile_inspect_cmd.set_defaults(func=cmd_profile_inspect)
+    profile_apply_cmd = profile_sub.add_parser("apply")
+    profile_apply_cmd.add_argument("profile_id")
+    profile_apply_cmd.add_argument("--config")
+    profile_apply_cmd.add_argument("--reason", default="")
+    profile_apply_cmd.set_defaults(func=cmd_profile_apply)
+    profile_status_cmd = profile_sub.add_parser("status")
+    profile_status_cmd.add_argument("profile_id")
+    profile_status_cmd.add_argument(
+        "status",
+        choices=["experimental", "verified", "needs_revalidation", "deprecated", "blocked"],
+    )
+    profile_status_cmd.add_argument("--scene")
+    profile_status_cmd.add_argument("--note", default="")
+    profile_status_cmd.add_argument("--config")
+    profile_status_cmd.set_defaults(func=cmd_profile_status)
+
+    trial = sub.add_parser("trial", help="manage bounded tuning trials")
+    trial_sub = trial.add_subparsers(dest="trial_command", required=True)
+    trial_start = trial_sub.add_parser("start")
+    trial_start.add_argument("proposal")
+    trial_start.add_argument("--config")
+    trial_start.add_argument("--unattended", action="store_true")
+    trial_start.add_argument("--ignore-context", action="store_true")
+    trial_start.set_defaults(func=cmd_trial_start)
+    trial_status = trial_sub.add_parser("status")
+    trial_status.add_argument("trial_id", nargs="?")
+    trial_status.add_argument("--config")
+    trial_status.set_defaults(func=cmd_trial_status)
+    trial_evaluate = trial_sub.add_parser("evaluate")
+    trial_evaluate.add_argument("trial_id", nargs="?")
+    trial_evaluate.add_argument("--config")
+    trial_evaluate.set_defaults(func=cmd_trial_evaluate)
+    trial_rollback = trial_sub.add_parser("rollback")
+    trial_rollback.add_argument("trial_id", nargs="?")
+    trial_rollback.add_argument("--reason", default="manual rollback")
+    trial_rollback.add_argument("--config")
+    trial_rollback.set_defaults(func=cmd_trial_rollback)
+    trial_promote = trial_sub.add_parser("promote")
+    trial_promote.add_argument("trial_id")
+    trial_promote.add_argument("--profile-id")
+    trial_promote.add_argument("--config")
+    trial_promote.set_defaults(func=cmd_trial_promote)
+
+    feedback = sub.add_parser("feedback", help="record human trial/session feedback")
+    feedback.add_argument("decision", choices=["accepted", "rejected", "inconclusive"])
+    feedback.add_argument("--trial-id")
+    feedback.add_argument("--session-id")
+    feedback.add_argument("--responsiveness", type=int)
+    feedback.add_argument(
+        "--stability", choices=["good", "degraded", "bad", "unknown"], default="unknown"
+    )
+    feedback.add_argument(
+        "--suspend-wake", choices=["good", "degraded", "bad", "untested"], default="untested"
+    )
+    feedback.add_argument("--notes", default="")
+    feedback.add_argument("--config")
+    feedback.set_defaults(func=cmd_feedback)
+
+    knowledge_pack = sub.add_parser("knowledge-pack", help="build the hourly LLM context pack")
+    knowledge_pack.add_argument("--config")
+    knowledge_pack.add_argument("--hours", type=float)
+    knowledge_pack.add_argument("--output")
+    knowledge_pack.set_defaults(func=cmd_knowledge_pack)
+
+    knowledge_export = sub.add_parser(
+        "knowledge-export",
+        help="export compact continuous learning history into Git-trackable files",
+    )
+    knowledge_export.add_argument("--config")
+    knowledge_export.set_defaults(func=cmd_knowledge_export)
+
+    actuator = sub.add_parser("actuator-inspect", help="inspect available power backends")
+    actuator.add_argument("--config")
+    actuator.set_defaults(func=cmd_actuator_inspect)
+
+    hourly = sub.add_parser("hourly", help="evaluate current trial and emit the next MCP/LLM pack")
+    hourly.add_argument("--config")
+    hourly.add_argument("--output")
+    hourly.set_defaults(func=cmd_hourly)
+
+    llm_apply = sub.add_parser("llm-apply", help="validate and apply one structured LLM decision")
+    llm_apply.add_argument("decision")
+    llm_apply.add_argument("--run-id")
+    llm_apply.add_argument("--config")
+    llm_apply.set_defaults(func=cmd_llm_apply)
+
+    task_run = sub.add_parser(
+        "task-run",
+        help="run a fixed-workload command and measure total battery energy/time",
+    )
+    task_run.add_argument("--scene", required=True)
+    task_run.add_argument("--label", required=True)
+    task_run.add_argument("--config")
+    task_run.add_argument("command", nargs=argparse.REMAINDER)
+    task_run.set_defaults(func=cmd_task_run)
+
+    root_helper = sub.add_parser(
+        "root-helper",
+        help="run the privileged allowlisted parameter helper (normally via systemd)",
+    )
+    root_helper.add_argument("--socket", default="/run/sp7-powerlab/helper.sock")
+    root_helper.add_argument("--allow-user", required=True)
+    root_helper.set_defaults(func=cmd_root_helper)
+
+    config_get = sub.add_parser(
+        "config-get",
+        help="print one resolved PowerLab configuration value",
+    )
+    config_get.add_argument("key")
+    config_get.add_argument("--config")
+    config_get.set_defaults(func=cmd_config_get)
+
+    override = sub.add_parser("override", help="set/clear a manual profile override")
+    override_sub = override.add_subparsers(dest="override_command", required=True)
+    override_set = override_sub.add_parser("set")
+    override_set.add_argument("profile_id")
+    override_set.add_argument("--config")
+    override_set.set_defaults(func=cmd_override)
+    override_clear = override_sub.add_parser("clear")
+    override_clear.add_argument("--config")
+    override_clear.set_defaults(func=cmd_override)
+    override_status = override_sub.add_parser("status")
+    override_status.add_argument("--config")
+    override_status.set_defaults(func=cmd_override)
 
     return p
 

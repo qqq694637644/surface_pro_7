@@ -1,0 +1,56 @@
+[collector]
+system_interval_seconds = 10
+process_interval_seconds = 20
+rollup_seconds = 60
+max_gap_seconds = 45
+top_processes = 12
+
+[llm]
+analysis_interval_minutes = 60
+history_days = 30
+recent_hours = 24
+max_trials_in_pack = 40
+
+[experiment]
+settle_seconds = 120
+interactive_min_sessions = 3
+interactive_min_valid_minutes = 60
+job_min_repetitions = 3
+max_one_primary_change = true
+revalidation_sessions = 2
+revalidation_min_valid_minutes = 30
+
+[automation]
+auto_switch_verified_profiles = true
+auto_run_low_risk_trials = false
+auto_promote_profiles = false
+recover_trial_on_collector_start = true
+
+[storage]
+database = "runtime/powerlab.sqlite3"
+raw_retention_days = 30
+keep_rollups_forever = true
+
+[activity]
+enabled = true
+server_url = "http://127.0.0.1:5600"
+timeout_seconds = 1.0
+store_window_title = true
+store_executable = true
+store_process_tree = true
+
+[policy]
+actuator = "auto"
+safe_profile = "safe-baseline"
+thermal_emergency_c = 90
+low_battery_percent = 15
+
+[power_options]
+binary = "power-daemon-mgr"
+
+[power_profiles_daemon]
+binary = "powerprofilesctl"
+
+[helper]
+enabled = true
+socket = "/run/sp7-powerlab/helper.sock"

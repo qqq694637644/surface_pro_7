@@ -4,7 +4,9 @@ import hashlib
 import os
 import platform
 import shutil
+import subprocess
 from pathlib import Path
+from typing import Any
 
 
 SYS = Path("/sys")
@@ -91,6 +93,8 @@ def battery_snapshot() -> dict:
         voltage_v = micro_to_unit(read_text(bat / "voltage_now"))
         if current_a is not None and voltage_v is not None:
             power_w = abs(current_a * voltage_v)
+    elif power_w < 0:
+        power_w = abs(power_w)
 
     health = None
     if energy_full_wh is not None and energy_full_design_wh:
@@ -156,7 +160,7 @@ def cpu_snapshot() -> dict:
     driver = read_text(base / "scaling_driver")
     try:
         load1, load5, load15 = os.getloadavg()
-    except OSError:
+    except (OSError, AttributeError):
         load1 = load5 = load15 = None
     idle_states = cpu_idle_states()
     return {
@@ -251,6 +255,119 @@ def network_snapshot() -> dict:
     return {"interfaces": interfaces, "wifi": wifi}
 
 
+def pressure_snapshot() -> dict:
+    result: dict[str, dict[str, float]] = {}
+    for resource in ("cpu", "memory", "io"):
+        path = Path("/proc/pressure") / resource
+        raw = read_text(path)
+        if not raw:
+            continue
+        values: dict[str, float] = {}
+        for line in raw.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            prefix = parts[0]
+            for item in parts[1:]:
+                if "=" not in item:
+                    continue
+                key, value = item.split("=", 1)
+                try:
+                    values[f"{prefix}_{key}"] = float(value)
+                except ValueError:
+                    continue
+        result[resource] = values
+    return result
+
+
+def rapl_snapshot() -> dict:
+    root = Path("/sys/class/powercap")
+    domains: list[dict] = []
+    if not root.exists():
+        return {"domains": domains}
+    for path in sorted(root.glob("intel-rapl:*")):
+        energy = safe_int(read_text(path / "energy_uj"))
+        maximum = safe_int(read_text(path / "max_energy_range_uj"))
+        domains.append(
+            {
+                "path": str(path),
+                "name": read_text(path / "name"),
+                "energy_uj": energy,
+                "max_energy_range_uj": maximum,
+            }
+        )
+    return {"domains": domains}
+
+
+def gpu_snapshot() -> dict:
+    cards: list[dict] = []
+    drm = Path("/sys/class/drm")
+    if not drm.exists():
+        return {"cards": cards}
+    for card in sorted(drm.glob("card[0-9]*")):
+        if not card.is_dir():
+            continue
+        values: dict[str, Any] = {"card": card.name}
+        for key, leaf in (
+            ("gt_cur_freq_mhz", "gt_cur_freq_mhz"),
+            ("gt_min_freq_mhz", "gt_min_freq_mhz"),
+            ("gt_max_freq_mhz", "gt_max_freq_mhz"),
+            ("gt_boost_freq_mhz", "gt_boost_freq_mhz"),
+        ):
+            values[key] = safe_int(read_text(card / leaf))
+        rc6 = read_text(card / "power/rc6_residency_ms")
+        values["rc6_residency_ms"] = safe_int(rc6)
+        device = card / "device"
+        values["vendor"] = read_text(device / "vendor")
+        values["device"] = read_text(device / "device")
+        cards.append(values)
+    return {"cards": cards}
+
+
+def power_source_snapshot() -> dict:
+    base = SYS / "class/power_supply"
+    sources = []
+    online = False
+    if base.exists():
+        for path in sorted(base.iterdir()):
+            typ = (read_text(path / "type") or "").lower()
+            if typ in {"mains", "usb", "usb_pd"} or path.name.startswith(("AC", "ADP")):
+                is_online = read_text(path / "online") == "1"
+                sources.append({"name": path.name, "type": typ, "online": is_online})
+                online = online or is_online
+    return {"ac_online": online, "sources": sources}
+
+
+def os_release_snapshot() -> dict:
+    path = Path("/etc/os-release")
+    values: dict[str, str] = {}
+    raw = read_text(path)
+    if raw:
+        for line in raw.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key] = value.strip().strip('"')
+    return values
+
+
+def command_version(binary: str, args: list[str] | None = None) -> str | None:
+    if not shutil.which(binary):
+        return None
+    try:
+        proc = subprocess.run(
+            [binary, *(args or ["--version"])],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        text = (proc.stdout or proc.stderr).strip().splitlines()
+        return text[0][:300] if text else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def system_snapshot() -> dict:
     return {
         "hostname": platform.node(),
@@ -263,13 +380,20 @@ def system_snapshot() -> dict:
         "display": backlight_snapshot(),
         "thermal": thermal_snapshot(),
         "network": network_snapshot(),
+        "pressure": pressure_snapshot(),
+        "rapl": rapl_snapshot(),
+        "gpu": gpu_snapshot(),
+        "power_source": power_source_snapshot(),
+        "os_release": os_release_snapshot(),
         "tools": {
-            name: shutil.which(name)
+            name: {
+                "path": shutil.which(name),
+                "version": command_version(name),
+            }
             for name in (
                 "powerstat",
                 "powerjoular",
                 "powertop",
-                "power-options",
                 "power-daemon-mgr",
                 "brightnessctl",
             )
@@ -283,6 +407,10 @@ def telemetry_snapshot() -> dict:
     display = backlight_snapshot()
     thermal = thermal_snapshot()
     network = network_snapshot()
+    pressure = pressure_snapshot()
+    rapl = rapl_snapshot()
+    gpu = gpu_snapshot()
+    source = power_source_snapshot()
     wifi = network.get("wifi") or {}
     return {
         "battery_percent": battery.get("capacity_percent"),
@@ -304,4 +432,8 @@ def telemetry_snapshot() -> dict:
         "wifi_operstate": wifi.get("operstate"),
         "wifi_rx_bytes": wifi.get("rx_bytes"),
         "wifi_tx_bytes": wifi.get("tx_bytes"),
+        "pressure": pressure,
+        "rapl": rapl,
+        "gpu": gpu,
+        "ac_online": source.get("ac_online"),
     }

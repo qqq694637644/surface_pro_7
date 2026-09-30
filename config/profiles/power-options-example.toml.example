@@ -1,0 +1,14 @@
+# Copy to a .toml file and replace backend_profile with a real name from:
+#   power-daemon-mgr list-profiles
+
+[profile]
+id = "power-options-longlife"
+backend = "power-options"
+backend_profile = "REPLACE_WITH_REAL_PROFILE_NAME"
+status = "experimental"
+scenes = ["idle", "reading", "web_interactive"]
+
+[evidence]
+kind = "candidate"
+note = "Power Options temporary overrides are applied with power-daemon-mgr."
+auto_trial_allowed = false
