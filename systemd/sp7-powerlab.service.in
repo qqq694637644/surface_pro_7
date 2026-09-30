@@ -1,0 +1,15 @@
+[Unit]
+Description=Surface Pro 7 PowerLab v2 battery-life controller
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT@
+ExecStart=@POWERLAB_BIN@ service run
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=SP7_POWERLAB_ROOT=@ROOT@
+
+[Install]
+WantedBy=default.target

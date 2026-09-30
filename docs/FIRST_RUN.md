@@ -1,236 +1,84 @@
-# Surface Pro 7 第一次运行
+# First run
 
-第一次运行目标不是马上“榨续航”，而是确认**传感器、场景识别、数据库、执行器和采集开销都是可信的**。
+## 1. 旧 v1 数据
 
-## 1. 安装 PowerLab
+v2 不迁移 v1 SQLite。若 doctor 报 legacy database：
 
-```bash
-git clone https://github.com/qqq694637644/surface_pro_7.git
-cd surface_pro_7
+~~~bash
+sp7-powerlab reset-runtime --yes
+~~~
 
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
+## 2. 硬件契约
 
-## 2. 准备桌面活动数据
-
-推荐运行：
-
-- ActivityWatch server
-- awatcher
-- GNOME Wayland：focused-window / D-Bus 对应 GNOME 扩展
-
-PowerLab 默认访问：
-
-```text
-http://127.0.0.1:5600
-```
-
-没有 ActivityWatch 也能运行，但场景识别会明显降级。
-
-## 3. 真机传感器检查
-
-拔掉外接电源：
-
-```bash
+~~~bash
 sp7-powerlab doctor
-```
+~~~
 
-重点检查：
+自动写入要求 Surface Pro 7、i5-1035G4、intel_pstate、HWP/EPP、BAT、RAPL、thermal sensor、systemd、thermald active，并且没有冲突 power writer。
 
-- `dmi.is_surface_pro_7`
-- battery present
-- numeric battery power
-- battery status = Discharging
-- brightness
-- thermal
-- CPU driver/EPP
-- Wi-Fi
-- RAPL（可用时）
-- GPU/DRM（可用时）
+错误硬件仍可只读诊断，不允许写参数。
 
-如果整机 battery power/energy 不可用，不要开启自动优化。
+## 3. thermald
 
-## 4. 检查执行器
+~~~bash
+systemctl status thermald
+journalctl -u thermald -b
+~~~
 
-```bash
-sp7-powerlab actuator-inspect
-```
+首次部署不要修改 thermald hard limits。
 
-默认 `policy.actuator = "auto"`。
+## 4. 只读服务
 
-PowerLab 只允许一个主要写入后端：
+默认 automation.level=0。
 
-```text
-Power Options > PPD > sysfs
-```
-
-如果自动发现 Power Options，就不要同时让另一个工具控制相同 EPP/频率参数。
-
-## 5. 先测 collector 自己
-
-```bash
-sp7-powerlab collector-benchmark --samples 12
-```
-
-关注：
-
-- mean collection time
-- max collection time
-- duty-cycle estimate
-
-如果 collector 本身开销异常，先调大：
-
-```toml
-[collector]
-system_interval_seconds = 10
-process_interval_seconds = 20
-```
-
-再测试。
-
-## 6. 单点 smoke test
-
-```bash
-sp7-powerlab collect-once
-```
-
-确认输出中能看到：
-
-- `activity.source`
-- `context.scene`
-- `process_summary`
-- battery power
-- app/window
-- media
-- profile
-
-## 7. 连续只读观察
-
-直接前台运行：
-
-```bash
-sp7-powerlab service-run
-```
-
-另一个终端：
-
-```bash
-sp7-powerlab service-status
-sp7-powerlab current
-sp7-powerlab observe --hours 1
-sp7-powerlab contexts --hours 6
-```
-
-第一阶段建议至少观察一个完整日常周期，再调整场景规则。
-
-默认 profile 是 `safe-baseline`，不会启动新 trial。
-
-## 8. 检查场景是否符合实际使用
-
-正常使用：
-
-- 浏览网页/PDF
-- 编辑代码
-- 编译
-- 播放视频
-- Office
-- 文件下载
-- AFK
-
-然后：
-
-```bash
-sp7-powerlab contexts --hours 24
-```
-
-如果大量时间落入 `unknown` 或明显错分，先修改：
-
-```text
-config/contexts.toml
-```
-
-不要先调电源参数。
-
-## 9. 安装常驻服务
-
-只读观察确认后：
-
-```bash
+~~~bash
 bash scripts/install-user-services.sh
-```
+sp7-powerlab observe power --hours 6
+sp7-powerlab observe thermal --hours 6
+sp7-powerlab incidents --hours 24
+~~~
 
-检查：
+先确认 collector 本身没有明显额外耗电。
 
-```bash
-systemctl --user status sp7-powerlab-collector
-systemctl --user list-timers | grep sp7-powerlab
-```
+## 5. 更换电池
 
-## 10. 建立第一批 verified profile
+~~~bash
+sp7-powerlab calibrate new-battery
+~~~
 
-先查看：
+会创建新的 battery epoch，并让 calibration 失效。
 
-```bash
-sp7-powerlab profile list
-```
+## 6. Calibration
 
-仓库附带：
+按 cold_idle、normal_interactive、media、bounded_burst 顺序完成。
 
-- safe-baseline：verified
-- ppd-balanced：experimental
-- ppd-power-saver：experimental
+bounded_burst 只测热惯性，不测极限性能。达到 bootstrap 温度、最大时长或检测到 throttling 时，service 会中止 calibration。
 
-在 SP7 上实测一个 profile 后，才人工标记：
+## 7. Verified envelope
 
-```bash
-sp7-powerlab profile status ppd-balanced verified   --scene coding_interactive   --note "SP7 real-world validation"
-```
+不要直接把仓库里的 candidate 参数标成 VERIFIED。
 
-之后本地 policy engine 才会在对应场景自动采用。
+建议把**当前真实 HWP 状态**先收编为 INTERACTIVE_EFFICIENT：
 
-## 11. 每小时 MCP
+~~~bash
+sp7-powerlab envelope adopt-current INTERACTIVE_EFFICIENT --note "current real HWP baseline"
+~~~
 
-先保持：
+这会读取 root helper 的实际 snapshot，只有硬件契约、thermald、ownership 和 calibration 都正常时才允许执行。
 
-```toml
-auto_run_low_risk_trials = false
-auto_promote_profiles = false
-```
+然后才把 automation.level 从 0 调到 1。
 
-让 MCP/LLM 只观察和提出建议。
+其他 ECO_IDLE / REMOTE_EFFICIENT / MEDIA_EFFICIENT / THERMAL_SAFE 使用
+`candidate_envelope` trial 验证，不使用“手工 verify TOML”捷径。
 
-```bash
-bash scripts/mcp-hourly.sh
-```
+## 8. Assisted trial
 
-把 `runtime/hourly-pack.json` 交给 LLM。
+先使用 level 2。LLM 只提 proposal，由用户批准。
 
-## 12. 最后才启用自动 trial
+等 snapshot、rollback、revalidation、thermal preemption 都真机验证后，再讨论 level 3。
 
-如果决定使用 direct sysfs：
+实验完成为 VERIFIED_WINNER 后，人工确认并 promotion：
 
-1. 停止会争抢同一参数的其他 power manager。
-2. `policy.actuator = "sysfs"`
-3. 安装 root helper：
-
-```bash
-bash scripts/install-root-helper.sh
-```
-
-4. 确认：
-
-```bash
-sp7-powerlab actuator-inspect
-```
-
-5. 先手工批准几轮 proposal。
-6. 确认 rollback/revalidation 正常。
-7. 最后才打开：
-
-```toml
-auto_run_low_risk_trials = true
-```
-
-`auto_promote_profiles` 建议再晚一步开启。
+~~~bash
+sp7-powerlab trial promote trial-xxxx
+~~~

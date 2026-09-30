@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+sp7-powerlab doctor
 
-echo "== doctor =="
-sp7-powerlab doctor || true
+echo
+echo "thermald:"
+systemctl --no-pager status thermald || true
 
-echo "== actuators =="
-sp7-powerlab actuator-inspect
+echo
+echo "intel_pstate:"
+cat /sys/devices/system/cpu/intel_pstate/status 2>/dev/null || true
 
-echo "== one sample =="
-sp7-powerlab collect-once
+echo
+echo "RAPL:"
+find /sys/class/powercap -maxdepth 2 -name energy_uj -print 2>/dev/null || true
 
-echo "== collector overhead =="
-sp7-powerlab collector-benchmark --samples 8
-
-echo "== service/database =="
-sp7-powerlab service-status
+echo
+echo "Battery:"
+find /sys/class/power_supply -maxdepth 2 -name power_now -print 2>/dev/null || true

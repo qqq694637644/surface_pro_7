@@ -2,139 +2,152 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import socket
+import struct
+import time
 from pathlib import Path
 from typing import Any
 
-from .actuators.base import ActuatorError, ParameterActuator
-from .actuators.sysfs import SysfsParameterActuator
-from .safety import PARAMETER_RULES, validate_parameter
+from .actuators.hwp import HWPActuator
 
 
-class RootHelperProtocolError(RuntimeError):
+class HelperProtocolError(RuntimeError):
     pass
 
 
-class RootHelperClient(ParameterActuator):
-    def __init__(self, socket_path: Path, timeout: float = 3.0):
+def _recv_line(conn: socket.socket, limit: int = 65536) -> bytes:
+    data = bytearray()
+    while len(data) < limit:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if b"\n" in chunk:
+            break
+    if len(data) >= limit:
+        raise HelperProtocolError("request too large")
+    return bytes(data).split(b"\n", 1)[0]
+
+
+class RootHelperClient:
+    def __init__(self, socket_path: Path):
         self.socket_path = socket_path
-        self.timeout = timeout
 
     def available(self) -> bool:
         return self.socket_path.exists()
 
-    def _request(self, action: str, parameter: str, value: Any = None) -> Any:
-        payload = {"action": action, "parameter": parameter}
-        if action in {"apply", "restore"}:
-            payload["value"] = value
-        raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+    def request(self, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request = {"action": action, "payload": payload or {}}
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.timeout)
-                sock.connect(str(self.socket_path))
-                sock.sendall(raw)
-                chunks = []
-                while True:
-                    part = sock.recv(65536)
-                    if not part:
-                        break
-                    chunks.append(part)
-                    if b"\n" in part:
-                        break
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(3.0)
+                client.connect(str(self.socket_path))
+                client.sendall(json.dumps(request).encode("utf-8") + b"\n")
+                raw = _recv_line(client)
         except OSError as exc:
-            raise ActuatorError(f"root helper unavailable: {exc}") from exc
-        try:
-            response = json.loads(b"".join(chunks).decode().strip())
-        except json.JSONDecodeError as exc:
-            raise ActuatorError("invalid root helper response") from exc
+            raise HelperProtocolError(str(exc)) from exc
+        response = json.loads(raw.decode("utf-8"))
         if not response.get("ok"):
-            raise ActuatorError(str(response.get("error") or "root helper failed"))
-        return response.get("result")
+            raise HelperProtocolError(str(response.get("error") or "helper error"))
+        return response["result"]
 
-    def snapshot(self, parameter: str) -> Any:
-        return self._request("snapshot", parameter)
+    def inspect(self) -> dict[str, Any]:
+        return self.request("inspect")
 
-    def apply(self, parameter: str, value: Any) -> dict[str, Any]:
-        return self._request("apply", parameter, value)
+    def snapshot(self) -> dict[str, Any]:
+        return self.request("snapshot")
 
-    def restore(self, parameter: str, value: Any) -> dict[str, Any]:
-        return self._request("restore", parameter, value)
+    def apply_envelope(self, envelope: dict[str, Any]) -> dict[str, Any]:
+        payload = {
+            "epp": envelope["epp"],
+            "max_perf_pct": int(envelope["max_perf_pct"]),
+            "turbo": bool(envelope["turbo"]),
+        }
+        return self.request("apply", payload)
+
+    def restore(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        return self.request("restore", {"snapshot": snapshot})
 
 
 class RootHelperServer:
-    def __init__(self, socket_path: Path, allow_user: str):
+    def __init__(
+        self,
+        socket_path: Path,
+        allow_uid: int,
+        actuator: HWPActuator | None = None,
+    ):
         self.socket_path = socket_path
-        self.allow_user = allow_user
-        self.actuator = SysfsParameterActuator()
-        self.stop = False
+        self.allow_uid = allow_uid
+        self.actuator = actuator or HWPActuator()
 
-    def _install_signals(self) -> None:
-        def stop(*_args):
-            self.stop = True
-        signal.signal(signal.SIGTERM, stop)
-        signal.signal(signal.SIGINT, stop)
+    def _peer_uid(self, conn: socket.socket) -> int | None:
+        if not hasattr(socket, "SO_PEERCRED"):
+            return None
+        raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", raw)
+        return uid
 
-    def _authorize_parameter(self, parameter: str) -> None:
-        if parameter not in PARAMETER_RULES:
-            raise RootHelperProtocolError(f"parameter not allowed by root helper: {parameter}")
-
-    def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+    def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         action = request.get("action")
-        parameter = str(request.get("parameter") or "")
-        self._authorize_parameter(parameter)
+        payload = request.get("payload") or {}
+        if action == "inspect":
+            return self.actuator.inspect()
         if action == "snapshot":
-            return {"ok": True, "result": self.actuator.snapshot(parameter)}
+            return self.actuator.snapshot()
         if action == "apply":
-            errors = validate_parameter(parameter, request.get("value"), for_auto_trial=False)
-            if errors:
-                raise RootHelperProtocolError("; ".join(errors))
-            return {
-                "ok": True,
-                "result": self.actuator.apply(parameter, request.get("value")),
-            }
+            allowed = {"epp", "max_perf_pct", "turbo"}
+            if set(payload) != allowed:
+                raise HelperProtocolError("apply payload must contain only epp/max_perf_pct/turbo")
+            return self.actuator.apply_values(
+                epp=str(payload["epp"]),
+                max_perf_pct=int(payload["max_perf_pct"]),
+                turbo=payload["turbo"],
+            )
         if action == "restore":
-            return {
-                "ok": True,
-                "result": self.actuator.restore(parameter, request.get("value")),
-            }
-        raise RootHelperProtocolError(f"unknown helper action: {action}")
+            if set(payload) != {"snapshot"} or not isinstance(payload["snapshot"], dict):
+                raise HelperProtocolError("restore requires one snapshot object")
+            return self.actuator.restore(payload["snapshot"])
+        raise HelperProtocolError(f"unsupported action: {action}")
 
-    def run(self) -> None:
-        if os.name != "posix":
-            raise SystemExit("root-helper is only supported on POSIX/Linux")
-        import pwd
-
-        if not hasattr(os, "geteuid") or os.geteuid() != 0:
-            raise SystemExit("root-helper must run as root")
-        user = pwd.getpwnam(self.allow_user)
+    def serve_forever(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.socket_path.unlink(missing_ok=True)
-        self._install_signals()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(str(self.socket_path))
-            os.chown(self.socket_path, user.pw_uid, user.pw_gid)
+            if hasattr(os, "chown"):
+                os.chown(self.socket_path, self.allow_uid, -1)
             os.chmod(self.socket_path, 0o600)
-            server.listen(8)
-            server.settimeout(1.0)
-            while not self.stop:
-                try:
-                    conn, _ = server.accept()
-                except socket.timeout:
-                    continue
+            server.listen(16)
+            while True:
+                conn, _ = server.accept()
                 with conn:
+                    uid = None
+                    request: dict[str, Any] = {}
                     try:
-                        raw = b""
-                        while b"\n" not in raw and len(raw) < 1024 * 1024:
-                            part = conn.recv(65536)
-                            if not part:
-                                break
-                            raw += part
-                        request = json.loads(raw.decode().strip())
-                        if not isinstance(request, dict):
-                            raise RootHelperProtocolError("request must be an object")
-                        response = self.handle(request)
-                    except Exception as exc:
-                        response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-                    conn.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode())
-        self.socket_path.unlink(missing_ok=True)
+                        uid = self._peer_uid(conn)
+                        if uid is not None and uid != self.allow_uid:
+                            raise HelperProtocolError(f"uid {uid} is not allowed")
+                        raw = _recv_line(conn)
+                        request = json.loads(raw.decode("utf-8"))
+                        result = self.dispatch(request)
+                        response = {"ok": True, "result": result}
+                        audit = {
+                            "ts": time.time(),
+                            "uid": uid,
+                            "action": request.get("action"),
+                            "success": True,
+                        }
+                    except Exception as exc:  # helper boundary
+                        response = {"ok": False, "error": str(exc)}
+                        audit = {
+                            "ts": time.time(),
+                            "uid": uid,
+                            "action": request.get("action"),
+                            "success": False,
+                            "error": str(exc),
+                        }
+                    print(
+                        json.dumps(audit, ensure_ascii=False, sort_keys=True),
+                        flush=True,
+                    )
+                    conn.sendall(json.dumps(response).encode("utf-8") + b"\n")

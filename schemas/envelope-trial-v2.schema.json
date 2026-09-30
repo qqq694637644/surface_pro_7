@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SP7 PowerLab v2 Envelope Trial",
+  "type": "object",
+  "required": ["baseline_envelope"],
+  "properties": {
+    "id": {"type": "string"},
+    "kind": {"const": "envelope"},
+    "baseline_envelope": {"type": "string"},
+    "candidate_envelope": {"type": "string"},
+    "changes": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "epp": {
+          "enum": ["performance", "balance_performance", "balance_power", "power"]
+        },
+        "max_perf_pct": {"type": "integer", "minimum": 10, "maximum": 100},
+        "turbo": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "target": {"type": "object"},
+    "validation": {
+      "type": "object",
+      "properties": {
+        "min_block_seconds": {"type": "number", "minimum": 60},
+        "settle_seconds": {"type": "number", "minimum": 0},
+        "min_power_saving_w": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": true
+    }
+  },
+  "oneOf": [
+    {"required": ["changes"], "not": {"required": ["candidate_envelope"]}},
+    {"required": ["candidate_envelope"], "not": {"required": ["changes"]}}
+  ],
+  "additionalProperties": true
+}

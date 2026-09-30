@@ -1,96 +1,81 @@
 from __future__ import annotations
 
-import copy
-import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 try:
     import tomllib
-except ModuleNotFoundError:  # Python 3.10
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib
 
 
 DEFAULTS: dict[str, Any] = {
     "collector": {
-        "system_interval_seconds": 10.0,
-        "process_interval_seconds": 20.0,
+        "sample_seconds": 10.0,
+        "process_seconds": 30.0,
         "rollup_seconds": 60.0,
         "max_gap_seconds": 45.0,
-        "top_processes": 12,
+        "top_processes": 10,
     },
-    "llm": {
-        "analysis_interval_minutes": 60,
-        "history_days": 30,
-        "recent_hours": 24,
-        "max_trials_in_pack": 40,
+    "controller": {
+        "minimum_dwell_seconds": 60.0,
+        "resume_grace_seconds": 45.0,
+        "low_battery_percent": 15.0,
+        "waste_window_minutes": 5,
+        "waste_min_baselines": 8,
+        "waste_relative_threshold": 0.20,
+        "waste_absolute_threshold_w": 0.8,
     },
-    "experiment": {
-        "settle_seconds": 120,
-        "interactive_min_sessions": 3,
-        "interactive_min_valid_minutes": 60,
-        "job_min_repetitions": 3,
-        "max_one_primary_change": True,
-        "revalidation_sessions": 2,
-        "revalidation_min_valid_minutes": 30,
+    "calibration": {
+        "cold_idle_min_seconds": 900.0,
+        "normal_interactive_min_seconds": 1800.0,
+        "media_min_seconds": 600.0,
+        "bounded_burst_min_seconds": 30.0,
     },
     "automation": {
-        "auto_switch_verified_profiles": True,
-        "auto_run_low_risk_trials": False,
-        "auto_promote_profiles": False,
-        "recover_trial_on_collector_start": True,
+        "level": 0,
+        "auto_promote": False,
     },
     "storage": {
         "database": "runtime/powerlab.sqlite3",
         "raw_retention_days": 30,
-        "keep_rollups_forever": True,
+    },
+    "llm": {
+        "analysis_interval_minutes": 60,
+        "history_hours": 24,
+        "max_incidents": 20,
+        "max_trials": 20,
     },
     "activity": {
         "enabled": True,
         "server_url": "http://127.0.0.1:5600",
         "timeout_seconds": 1.0,
         "store_window_title": True,
-        "store_executable": True,
-        "store_process_tree": True,
-    },
-    "policy": {
-        "actuator": "auto",
-        "safe_profile": "safe-baseline",
-        "thermal_emergency_c": 90.0,
-        "low_battery_percent": 15.0,
-    },
-    "power_options": {
-        "binary": "power-daemon-mgr",
-    },
-    "power_profiles_daemon": {
-        "binary": "powerprofilesctl",
     },
     "helper": {
-        "enabled": True,
         "socket": "/run/sp7-powerlab/helper.sock",
+        "enabled": True,
     },
 }
 
 
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    out = copy.deepcopy(base)
+def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in base.items():
+        result[key] = dict(value) if isinstance(value, dict) else value
     for key, value in override.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_merge(out[key], value)
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge(result[key], value)
         else:
-            out[key] = value
-    return out
+            result[key] = value
+    return result
 
 
-class PowerLabConfig:
-    def __init__(self, data: dict[str, Any], root: Path, source: Path | None = None):
-        self.data = data
-        self.root = root
-        self.source = source
-
-    def section(self, name: str) -> dict[str, Any]:
-        value = self.data.get(name, {})
-        return value if isinstance(value, dict) else {}
+@dataclass(frozen=True)
+class Config:
+    root: Path
+    data: dict[str, Any]
 
     def get(self, dotted: str, default: Any = None) -> Any:
         value: Any = self.data
@@ -100,27 +85,43 @@ class PowerLabConfig:
             value = value[part]
         return value
 
-    def path(self, dotted: str, default: str) -> Path:
-        raw = str(self.get(dotted, default))
-        path = Path(os.path.expandvars(os.path.expanduser(raw)))
+    def path(self, dotted: str) -> Path:
+        raw = str(self.get(dotted))
+        path = Path(raw).expanduser()
         return path if path.is_absolute() else self.root / path
 
 
-def load_config(root: Path | None = None, path: Path | None = None) -> PowerLabConfig:
-    root = (root or Path.cwd()).resolve()
-    if path is None:
-        env = os.environ.get("SP7_POWERLAB_CONFIG")
-        path = Path(env).expanduser() if env else root / "config" / "powerlab.toml"
-    if not path.is_absolute():
-        path = root / path
+def load_toml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
 
-    loaded: dict[str, Any] = {}
-    source: Path | None = None
-    if path.exists():
-        with path.open("rb") as fh:
-            parsed = tomllib.load(fh)
-        if not isinstance(parsed, dict):
-            raise ValueError("PowerLab config root must be a TOML table")
-        loaded = parsed
-        source = path
-    return PowerLabConfig(_deep_merge(DEFAULTS, loaded), root=root, source=source)
+
+def load_config(root: Path, path: Path | None = None) -> Config:
+    path = path or root / "config" / "powerlab.toml"
+    return Config(root=root, data=_merge(DEFAULTS, load_toml(path)))
+
+
+def machine_path(root: Path) -> Path:
+    return root / "config" / "machine.toml"
+
+
+def envelope_path(root: Path) -> Path:
+    return root / "config" / "envelopes.toml"
+
+
+def thermal_path(root: Path) -> Path:
+    return root / "config" / "thermal.toml"
+
+
+def load_machine(root: Path) -> dict[str, Any]:
+    return load_toml(machine_path(root))
+
+
+def load_envelope_config(root: Path) -> dict[str, Any]:
+    return load_toml(envelope_path(root))
+
+
+def load_thermal_config(root: Path) -> dict[str, Any]:
+    return load_toml(thermal_path(root))
