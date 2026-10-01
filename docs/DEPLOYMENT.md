@@ -35,6 +35,10 @@ root helper 尚未就绪，PowerLab 会先保持 READ_ONLY；helper 稍后恢复
 下一次 refresh 会重新绑定。是否恢复 CONTROL_ALLOWED 仍由 calibration/thermal/telemetry/rollback
 integrity 等 gate 决定。
 
+已经绑定可用 backend 后，单次 helper probe 失败不会立即把 reconnect-capable client 替换成
+UnavailableActuator；默认连续失败达到阈值后才允许降级。active trial 期间 backend identity 冻结，
+避免 helper 瞬时重启把正在执行的 candidate/rollback 路径切断。
+
 ## Breaking runtime schema
 
 项目不维护旧 SQLite runtime schema 迁移。schema mismatch 时 `sp7-powerlab service run` 使用 exit
@@ -48,6 +52,14 @@ systemctl --user restart sp7-powerlab.service
 ~~~
 
 这是破坏式 reset；不要自动兜底删除 runtime。
+
+本地提交/部署前可运行完整软件质量门：
+
+~~~bash
+bash scripts/quality-gate.sh
+~~~
+
+它覆盖 pytest、ruff check/format、wheel build + packaged schema smoke、shell syntax 和 `git diff --check`。
 
 ## thermald
 

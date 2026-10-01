@@ -87,7 +87,7 @@ jobs:
           assert len(wheel) == 1, wheel
           with zipfile.ZipFile(wheel[0]) as archive:
               names = set(archive.namelist())
-          assert "sp7_powerlab/schemas/envelope-trial-v2.schema.json" in names
+          assert "sp7_powerlab/schemas/envelope-trial.schema.json" in names
           print("packaged schema present in wheel")
           PY
 

@@ -15,6 +15,7 @@ from .config import load_config, load_machine
 from .demand import remote_process_tags
 from .envelopes import snapshot_matches_envelope
 from .hardware import thermal_sensor_path
+from .longterm import runtime_policy_snapshot
 from .measurement import MinimalMeter, measurement_trust_matches_epoch
 from .service import build_actuator
 from .storage import Database
@@ -134,6 +135,7 @@ def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dic
     if not envelope_record or envelope_record.get("status") != "VERIFIED":
         raise RuntimeError("MinimalMeter capture requires a current VERIFIED envelope")
     service_mode = _service_mode_status(config, db, mode)
+    policy = runtime_policy_snapshot(config, db)
 
     return {
         "evidence_epoch_id": str(epoch["epoch_id"]),
@@ -144,6 +146,8 @@ def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dic
         "evidence_semantics_version": int(epoch["evidence_semantics_version"]),
         "envelope": envelope,
         "envelope_content_hash": str(envelope_record.get("content_hash") or ""),
+        "runtime_policy_fingerprint": str(policy["fingerprint"]),
+        "runtime_policy": policy["payload"],
         "service_mode": service_mode,
     }
 
@@ -161,6 +165,7 @@ def _capture_context_change_reason(
         "hard_identity_hash",
         "calibration_version",
         "evidence_semantics_version",
+        "runtime_policy_fingerprint",
     )
     if any(final[field] != start[field] for field in stable_context_fields):
         return "capture_context_changed"
@@ -170,6 +175,61 @@ def _capture_context_change_reason(
     ):
         return "fixed_capture_envelope_changed"
     return None
+
+
+def _prepare_campaign(
+    db: Database,
+    *,
+    campaign_id: str,
+    mode: str,
+    context: dict[str, Any],
+    max_campaign_span_seconds: float,
+) -> dict[str, Any]:
+    campaign = db.net_benefit_campaign(campaign_id)
+    now = time.time()
+    if campaign is None:
+        if mode != "FIXED_GOOD":
+            raise RuntimeError("a new Net Benefit campaign must begin with a FIXED_GOOD capture")
+        return db.create_net_benefit_campaign(
+            campaign_id=campaign_id,
+            evidence_epoch_id=str(context["evidence_epoch_id"]),
+            battery_epoch=int(context["battery_epoch"]),
+            hard_identity_hash=str(context["hard_identity_hash"]),
+            calibration_version=int(context["calibration_version"]),
+            evidence_semantics_version=int(context["evidence_semantics_version"]),
+            fixed_baseline_envelope=str(context["envelope"]),
+            fixed_baseline_content_hash=str(context["envelope_content_hash"]),
+            payload={"comparisons": {}},
+        )
+    if campaign.get("status") != "OPEN":
+        raise RuntimeError(f"Net Benefit campaign is not OPEN: {campaign.get('status')}")
+    if now - float(campaign.get("created_ts") or 0.0) > float(max_campaign_span_seconds):
+        db.invalidate_net_benefit_campaign(campaign_id, "campaign_span_exceeded")
+        raise RuntimeError("Net Benefit campaign exceeded max_campaign_span_seconds")
+    context_fields = (
+        "evidence_epoch_id",
+        "battery_epoch",
+        "hard_identity_hash",
+        "calibration_version",
+        "evidence_semantics_version",
+    )
+    mismatched = [
+        field for field in context_fields if str(campaign.get(field)) != str(context.get(field))
+    ]
+    if mismatched:
+        db.invalidate_net_benefit_campaign(
+            campaign_id,
+            "campaign_context_changed:" + ",".join(sorted(mismatched)),
+        )
+        raise RuntimeError("Net Benefit campaign context changed: " + ", ".join(sorted(mismatched)))
+    if mode == "FIXED_GOOD" and (
+        str(campaign.get("fixed_baseline_envelope") or "") != str(context.get("envelope") or "")
+        or str(campaign.get("fixed_baseline_content_hash") or "")
+        != str(context.get("envelope_content_hash") or "")
+    ):
+        db.invalidate_net_benefit_campaign(campaign_id, "fixed_baseline_changed")
+        raise RuntimeError("Net Benefit fixed baseline changed within the campaign")
+    return campaign
 
 
 def _remote_present() -> bool:
@@ -248,6 +308,15 @@ def main(argv: list[str] | None = None) -> int:
         db.close()
         raise SystemExit("MinimalMeter Net Benefit capture requires readable actual HWP state")
     start_context = _capture_context(root, config, db, mode=args.mode)
+    _prepare_campaign(
+        db,
+        campaign_id=args.campaign,
+        mode=args.mode,
+        context=start_context,
+        max_campaign_span_seconds=float(
+            config.get("net_benefit.max_campaign_span_seconds", 86400.0)
+        ),
+    )
     fixed_envelope = db.envelope(str(start_context["envelope"]))
     if not fixed_envelope:
         db.close()
@@ -271,11 +340,13 @@ def main(argv: list[str] | None = None) -> int:
         evidence_semantics_version=start_context["evidence_semantics_version"],
         envelope=start_context["envelope"],
         envelope_content_hash=start_context["envelope_content_hash"],
+        runtime_policy_fingerprint=start_context["runtime_policy_fingerprint"],
         payload={
             "capture_contract_version": 2,
             "interval_seconds": float(args.interval),
             "actuator_mode": actuator_mode,
             "service_mode": start_context["service_mode"],
+            "runtime_policy": start_context["runtime_policy"],
             "start_hwp_snapshot": start_snapshot,
         },
     )

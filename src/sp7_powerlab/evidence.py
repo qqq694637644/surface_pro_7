@@ -45,12 +45,20 @@ def _mad(values: list[float]) -> float | None:
 def hard_strata_key(value: dict[str, Any]) -> str:
     epoch = int(value.get("battery_epoch") or 0)
     envelope = str(value.get("current_envelope") or value.get("envelope") or "UNMANAGED")
+    envelope_hash = str(
+        value.get("current_envelope_content_hash")
+        or value.get("envelope_content_hash")
+        or "missing"
+    )
     active = 1 if bool(value.get("user_active")) else 0
     media = 1 if bool(value.get("media_playing")) else 0
     remote = int(
         value.get("remote_bucket") or (1 if float(value.get("remote_hint") or 0.0) >= 0.5 else 0)
     )
-    return f"bat={epoch}|env={envelope}|active={active}|media={media}|remote={remote}"
+    return (
+        f"bat={epoch}|env={envelope}|envhash={envelope_hash}"
+        f"|active={active}|media={media}|remote={remote}"
+    )
 
 
 def relevant_compatibility_generation(value: dict[str, Any]) -> str:
@@ -149,6 +157,15 @@ class NoiseTracker:
             return None
         envelope = str(rollup.get("current_envelope") or "")
         if not envelope or envelope.startswith("TRIAL:"):
+            return None
+        envelope_hash = str(rollup.get("current_envelope_content_hash") or "")
+        envelope_record = self.db.envelope(envelope)
+        if (
+            not envelope_hash
+            or not envelope_record
+            or envelope_record.get("status") != "VERIFIED"
+            or str(envelope_record.get("content_hash") or "") != envelope_hash
+        ):
             return None
         if rollup.get("demand_region") == "MIXED":
             return None

@@ -331,7 +331,8 @@ sp7-powerlab lifecycle freeze --reason "real usage coverage and net benefit vali
 ## 14. PowerLab 本身的 Net Benefit
 
 用 sp7-powerlab-meter 分别记录可比较条件。capture 开始时就固定 battery/evidence epoch、hard
-fingerprint、calibration、campaign 和 mode；旧 JSONL 不能在比较时补贴成当前 epoch。
+fingerprint、calibration、campaign、mode、fixed baseline hash 和 runtime policy fingerprint；旧 JSONL
+不能在比较时补贴成当前 epoch。
 
 至少比较：
 
@@ -385,9 +386,16 @@ PowerLab 会检查 brightness、active/media/remote fraction、network、tempera
 fixed HWP、reference drift、两个 candidate delta 的方向和 spread。明显不可比时结果是
 `DATA_QUALITY_FAILURE`，不会进入 STABLE evidence。
 
+四个 block 的 runtime policy fingerprint 也必须一致。B1/B2 之间如果发生 envelope promotion、
+controller/config 修改或 manual override 变化，这组 comparison 作废，必须重新采集。
+
 monitoring / dynamic / full 三个 comparison 必须来自同一个 current evidence epoch、同一个
 battery/hard/calibration context、同一个 campaign 名称和同一个 fixed baseline content hash；否则不会
 作为一组完整 Net Benefit evidence 让 STABLE readiness 通过。
+
+campaign 不是可无限复用的字符串：它由数据库以 OPEN/COMPLETE/INVALID 生命周期管理，并受最大
+campaign span 限制。新 campaign 先采 FIXED_GOOD A1；三种 mode 各完成一次有效 comparison 后自动
+关闭。STABLE 还会确认保存的 FULL_POWERLAB policy fingerprint 仍代表当前 runtime policy。
 
 如果结果建议 FIXED_GOOD_ENVELOPE，就不要因为项目已经复杂而强行保留动态系统。
 

@@ -131,6 +131,10 @@ media/active/remote 状态稳定的 rollup。整个窗口还必须保持 Dischar
 sample gap、battery epoch 单一，并达到 minimum valid-discharge fraction；transitional/mixed 分钟
 不会进入 frozen reference/noise。
 
+sample 会冻结 `current_envelope_content_hash`。同名 envelope promotion 后，新 revision 会进入新的
+reference/noise scope；Evidence 层还会要求 envelope 当前仍是 VERIFIED 且 DB content hash 与 rollup
+冻结值完全一致。BLOCKED/RETIRED 或 hash 已变化的历史窗口不会继续生成/复用自然基线。
+
 如果旧 epoch 与当前环境不兼容，不要把历史 winner 直接当当前 winner。
 
 ## 7. Scheduler
@@ -311,7 +315,7 @@ sp7-powerlab lifecycle reopen --reason "confirmed regression"
 
 正式 Net Benefit capture 不接受任意旧 JSONL 后补 epoch/campaign 标签。每次采集开始时就绑定
 current evidence epoch、battery identity/epoch、hard fingerprint、calibration、campaign、fixed
-baseline content hash 和 mode。
+baseline content hash、mode 和 runtime policy fingerprint。
 
 每一种 candidate mode 使用 A1-B1-B2-A2：
 
@@ -337,10 +341,20 @@ mode 不是标签：MONITORING 要求 live Level 0；DYNAMIC_CONTROLLER 要求 l
 CONTROL_ALLOWED；FULL_POWERLAB 要求 live Level >=2 + CONTROL_ALLOWED；FIXED_GOOD 要求 service
 停止且每个 sample 的 actual HWP 都匹配 fixed VERIFIED envelope。
 
+同一个四段 comparison 的 runtime policy fingerprint 必须完全一致；它覆盖 relevant runtime/config、
+Automation Level、VERIFIED envelope 集合/content hashes 和 manual override。B1/B2 如果中间发生
+promotion/config/policy 修改，即使都叫 FULL_POWERLAB，也会被拒绝。
+
 MinimalMeter 还记录 brightness、active/media/remote、basic network、package temperature。任一 block
 BAT/data quality 失败、四段 provenance 不一致、inter-block gap 超限、fixed baseline 改变、covariate
 明显不可比、reference drift 过大、B1/B2 effect 方向冲突或 spread 过大时，都不会产生可用于
 STABLE 的有效 delta。
+
+`--campaign` 对应数据库中的 validation campaign entity。一个新 campaign 必须从 FIXED_GOOD A1
+开始；它固定 hard/battery/calibration/semantics context 与 fixed baseline，并受
+`net_benefit.max_campaign_span_seconds` 限制。context/baseline 改变或超时会 INVALID；Monitoring、
+Dynamic、Full 三种有效 comparison 各完成一次后 campaign 自动 COMPLETE/CLOSED，不能继续复用旧名字。
+STABLE 还会要求 FULL_POWERLAB 结果的 policy fingerprint 与当前 runtime policy 相同。
 
 历史：
 

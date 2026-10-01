@@ -10,7 +10,12 @@ from typing import Any
 
 from .measurement import valid_discharge_interval_seconds
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+NET_BENEFIT_CAMPAIGN_MODES = {
+    "MONITORING_OVERHEAD",
+    "DYNAMIC_CONTROLLER",
+    "FULL_POWERLAB",
+}
 
 ACTIVE_TRIAL_STATES = {
     "PROPOSED",
@@ -424,6 +429,22 @@ DDL = [
         mode TEXT NOT NULL,
         result_json TEXT
     )""",
+    """CREATE TABLE IF NOT EXISTS net_benefit_campaigns (
+        campaign_id TEXT PRIMARY KEY,
+        created_ts REAL NOT NULL,
+        updated_ts REAL NOT NULL,
+        closed_ts REAL,
+        status TEXT NOT NULL,
+        evidence_epoch_id TEXT NOT NULL,
+        battery_epoch INTEGER NOT NULL,
+        hard_identity_hash TEXT NOT NULL,
+        calibration_version INTEGER NOT NULL,
+        evidence_semantics_version INTEGER NOT NULL,
+        fixed_baseline_envelope TEXT NOT NULL,
+        fixed_baseline_content_hash TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_net_benefit_campaign_status ON net_benefit_campaigns(status,created_ts)",
     """CREATE TABLE IF NOT EXISTS minimal_meter_runs (
         run_id TEXT PRIMARY KEY,
         start_ts REAL NOT NULL,
@@ -439,6 +460,7 @@ DDL = [
         evidence_semantics_version INTEGER NOT NULL,
         envelope TEXT,
         envelope_content_hash TEXT NOT NULL,
+        runtime_policy_fingerprint TEXT NOT NULL,
         payload_json TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS minimal_meter_samples (
@@ -1570,6 +1592,132 @@ class Database:
             result.append(item)
         return result
 
+    def create_net_benefit_campaign(
+        self,
+        *,
+        campaign_id: str,
+        evidence_epoch_id: str,
+        battery_epoch: int,
+        hard_identity_hash: str,
+        calibration_version: int,
+        evidence_semantics_version: int,
+        fixed_baseline_envelope: str,
+        fixed_baseline_content_hash: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO net_benefit_campaigns(
+                    campaign_id,created_ts,updated_ts,status,evidence_epoch_id,battery_epoch,
+                    hard_identity_hash,calibration_version,evidence_semantics_version,
+                    fixed_baseline_envelope,fixed_baseline_content_hash,payload_json
+                ) VALUES(?,?,?,'OPEN',?,?,?,?,?,?,?,?)""",
+                (
+                    campaign_id,
+                    now,
+                    now,
+                    evidence_epoch_id,
+                    battery_epoch,
+                    hard_identity_hash,
+                    calibration_version,
+                    evidence_semantics_version,
+                    fixed_baseline_envelope,
+                    fixed_baseline_content_hash,
+                    _json(payload or {"comparisons": {}}),
+                ),
+            )
+        campaign = self.net_benefit_campaign(campaign_id)
+        assert campaign is not None
+        return campaign
+
+    def net_benefit_campaign(self, campaign_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM net_benefit_campaigns WHERE campaign_id=?",
+            (campaign_id,),
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
+    def net_benefit_campaigns(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM net_benefit_campaigns"
+        args: list[Any] = []
+        if status is not None:
+            sql += " WHERE status=?"
+            args.append(status)
+        sql += " ORDER BY created_ts DESC LIMIT ?"
+        args.append(limit)
+        result: list[dict[str, Any]] = []
+        for row in self.conn.execute(sql, args):
+            item = dict(row)
+            item["payload"] = _loads(item.pop("payload_json"), {})
+            result.append(item)
+        return result
+
+    def invalidate_net_benefit_campaign(self, campaign_id: str, reason: str) -> None:
+        campaign = self.net_benefit_campaign(campaign_id)
+        if not campaign:
+            raise KeyError(campaign_id)
+        payload = dict(campaign.get("payload") or {})
+        payload["invalid_reason"] = reason
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                """UPDATE net_benefit_campaigns
+                SET status='INVALID',updated_ts=?,closed_ts=?,payload_json=? WHERE campaign_id=?""",
+                (now, now, _json(payload), campaign_id),
+            )
+
+    def record_net_benefit_campaign_comparison(
+        self,
+        campaign_id: str,
+        *,
+        mode: str,
+        overhead_run_id: str,
+        runtime_policy_fingerprint: str,
+    ) -> dict[str, Any]:
+        if mode not in NET_BENEFIT_CAMPAIGN_MODES:
+            raise ValueError(f"invalid Net Benefit mode: {mode}")
+        campaign = self.net_benefit_campaign(campaign_id)
+        if not campaign:
+            raise KeyError(campaign_id)
+        if campaign.get("status") != "OPEN":
+            raise ValueError(f"Net Benefit campaign is not OPEN: {campaign.get('status')}")
+        payload = dict(campaign.get("payload") or {})
+        comparisons = dict(payload.get("comparisons") or {})
+        if mode in comparisons:
+            raise ValueError(f"Net Benefit campaign already has a {mode} comparison")
+        comparisons[mode] = {
+            "overhead_run_id": overhead_run_id,
+            "runtime_policy_fingerprint": runtime_policy_fingerprint,
+        }
+        payload["comparisons"] = comparisons
+        complete = NET_BENEFIT_CAMPAIGN_MODES <= set(comparisons)
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                """UPDATE net_benefit_campaigns
+                SET status=?,updated_ts=?,closed_ts=?,payload_json=? WHERE campaign_id=?""",
+                (
+                    "COMPLETE" if complete else "OPEN",
+                    now,
+                    now if complete else None,
+                    _json(payload),
+                    campaign_id,
+                ),
+            )
+        updated = self.net_benefit_campaign(campaign_id)
+        assert updated is not None
+        return updated
+
     def start_minimal_meter_run(
         self,
         *,
@@ -1583,6 +1731,7 @@ class Database:
         evidence_semantics_version: int,
         envelope: str | None,
         envelope_content_hash: str,
+        runtime_policy_fingerprint: str,
         payload: dict[str, Any] | None = None,
     ) -> str:
         run_id = f"meter-{uuid.uuid4().hex[:12]}"
@@ -1591,8 +1740,9 @@ class Database:
                 """INSERT INTO minimal_meter_runs(
                     run_id,start_ts,status,capture_mode,campaign_id,evidence_epoch_id,
                     battery_epoch,battery_identity_hash,hard_identity_hash,calibration_version,
-                    evidence_semantics_version,envelope,envelope_content_hash,payload_json
-                ) VALUES(?,?,'RUNNING',?,?,?,?,?,?,?,?,?,?,?)""",
+                    evidence_semantics_version,envelope,envelope_content_hash,
+                    runtime_policy_fingerprint,payload_json
+                ) VALUES(?,?,'RUNNING',?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
                     time.time(),
@@ -1606,6 +1756,7 @@ class Database:
                     evidence_semantics_version,
                     envelope,
                     envelope_content_hash,
+                    runtime_policy_fingerprint,
                     _json(payload or {}),
                 ),
             )

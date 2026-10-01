@@ -331,13 +331,54 @@ class PowerLabService:
             or None,
         )
         actuator, actuator_available, actuator_mode = build_actuator(self.config)
+        probed_actuator = actuator
+        probed_available = actuator_available
+        probed_mode = actuator_mode
+        previous_actuator = self.stack.get("actuator")
+        previous_available = bool(self.stack.get("actuator_available"))
         previous_actuator_mode = str(self.stack.get("actuator_mode") or "read-only")
-        self.stack["actuator"] = actuator
-        self.stack["actuator_available"] = actuator_available
-        self.stack["actuator_mode"] = actuator_mode
-        self.stack["controller"].actuator = actuator
-        self.stack["trials"].actuator = actuator
-        if actuator_mode != previous_actuator_mode:
+        active_trial = self.db.active_trial() is not None
+        failed_probes = int(self.db.get_meta("actuator_probe_failures", 0) or 0)
+        downgrade_after = max(
+            int(self.config.get("helper.downgrade_after_failed_probes", 3)),
+            1,
+        )
+        preserve_previous = False
+        if previous_available and active_trial:
+            preserve_previous = True
+        elif previous_available and not probed_available:
+            failed_probes += 1
+            self.db.set_meta("actuator_probe_failures", failed_probes)
+            preserve_previous = failed_probes < downgrade_after
+        elif probed_available:
+            failed_probes = 0
+            self.db.set_meta("actuator_probe_failures", 0)
+
+        if preserve_previous:
+            actuator = previous_actuator
+            actuator_available = previous_available
+            actuator_mode = previous_actuator_mode
+            self.db.set_meta(
+                "actuator_probe_degraded",
+                {
+                    "ts": ts,
+                    "active_trial": active_trial,
+                    "failed_probes": failed_probes,
+                    "probed_mode": probed_mode,
+                    "probed_available": probed_available,
+                    "preserved_mode": previous_actuator_mode,
+                },
+            )
+        else:
+            actuator = probed_actuator
+            actuator_available = probed_available
+            actuator_mode = probed_mode
+            self.stack["actuator"] = actuator
+            self.stack["actuator_available"] = actuator_available
+            self.stack["actuator_mode"] = actuator_mode
+            self.stack["controller"].actuator = actuator
+            self.stack["trials"].actuator = actuator
+        if not preserve_previous and actuator_mode != previous_actuator_mode:
             self.db.set_meta(
                 "actuator_rebind",
                 {
@@ -347,6 +388,8 @@ class PowerLabService:
                     "available": actuator_available,
                 },
             )
+        if preserve_previous:
+            self.stack["actuator_available"] = previous_available
         self.stack["report"] = report
         self.stack["controller"].hardware_writable = bool(
             report.control_capable and actuator_available
@@ -481,6 +524,12 @@ class PowerLabService:
         evidence_epochs = {
             str(row.get("evidence_epoch")) if row.get("evidence_epoch") else None for row in rows
         }
+        envelope_content_hashes = {
+            str(row.get("current_envelope_content_hash"))
+            if row.get("current_envelope_content_hash")
+            else None
+            for row in rows
+        }
         compatibility_generations = {
             str(row.get("compatibility_generation"))
             if row.get("compatibility_generation")
@@ -497,6 +546,7 @@ class PowerLabService:
             ("user_active", active_states),
             ("remote", remote_buckets),
             ("evidence_epoch", evidence_epochs),
+            ("envelope_content_hash", envelope_content_hashes),
             ("compatibility_generation", compatibility_generations),
         ):
             if len(values) != 1 or None in values:
@@ -552,6 +602,11 @@ class PowerLabService:
             "system_fingerprint": self.stack["fingerprint"],
             "current_envelope": (
                 next(iter(envelopes)) if len(envelopes) == 1 and None not in envelopes else "MIXED"
+            ),
+            "current_envelope_content_hash": (
+                next(iter(envelope_content_hashes))
+                if len(envelope_content_hashes) == 1 and None not in envelope_content_hashes
+                else None
             ),
             "evidence_epoch_id": (
                 next(iter(evidence_epochs))
@@ -750,6 +805,15 @@ class PowerLabService:
 
         trial_before = self.db.active_trial()
         trial_arm = trial_before.get("current_arm") if trial_before else None
+        current_envelope = self.stack["controller"].current_envelope()
+        current_envelope_record = (
+            self.db.envelope(str(current_envelope)) if current_envelope else None
+        )
+        current_envelope_content_hash = (
+            str(current_envelope_record.get("content_hash") or "")
+            if current_envelope_record
+            else None
+        )
         sample.update(
             {
                 "battery_epoch": epoch,
@@ -760,7 +824,8 @@ class PowerLabService:
                 "remote_hint": demand["remote_hint"],
                 "thermal_state": thermal["state"],
                 "thermal_pressure": thermal["pressure"],
-                "current_envelope": self.stack["controller"].current_envelope(),
+                "current_envelope": current_envelope,
+                "current_envelope_content_hash": current_envelope_content_hash,
                 "thermal_override": thermal["state"] in {"THERMAL_PRESSURE", "THROTTLING"},
                 "trial_id": trial_before.get("trial_id") if trial_before else None,
                 "trial_arm": trial_arm,

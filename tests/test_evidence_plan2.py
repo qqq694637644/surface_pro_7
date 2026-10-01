@@ -36,6 +36,7 @@ def rollup(ts: float, power: float) -> dict:
         "max_thermal_pressure": 0.1,
         "local_compute_pressure": "LOW",
         "current_envelope": "INTERACTIVE_EFFICIENT",
+        "current_envelope_content_hash": "env-hash",
         "trial_id": None,
     }
 
@@ -57,6 +58,19 @@ def measurement(arm: str, power: float) -> dict:
 
 
 def make_epoch(db: Database) -> str:
+    db.upsert_envelope(
+        {
+            "name": "INTERACTIVE_EFFICIENT",
+            "revision": 1,
+            "status": "VERIFIED",
+            "epp": "balance_power",
+            "max_perf_pct": 60,
+            "turbo": True,
+            "content_hash": "env-hash",
+            "source": "test",
+            "updated_ts": 1.0,
+        }
+    )
     return db.ensure_evidence_epoch(
         hard_identity_hash="hard-fp",
         battery_epoch=1,
@@ -185,6 +199,78 @@ def test_reference_noise_separates_brightness_buckets(project_root: Path):
         assert dim_ref is not None
         assert abs(dim_ref["median_power_w"] - 5.0) < 1e-9
         assert db.reference_baseline(epoch, bright_key) is None
+    finally:
+        db.close()
+
+
+def test_reference_noise_does_not_cross_envelope_content_revision(project_root: Path):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/evidence-envelope-revision.sqlite3")
+    try:
+        epoch = make_epoch(db)
+        bind_measurement_trust(db, epoch)
+        tracker = NoiseTracker(config, db)
+        old_items: list[dict] = []
+        for index, power in enumerate((5.0, 5.1, 4.9)):
+            item = rollup(100.0 + index * 60.0, power)
+            item["evidence_epoch_id"] = epoch
+            item["reference_eligible"] = True
+            old_items.append(item)
+            db.add_rollup(item)
+            tracker.observe_rollup(item, evidence_epoch_id=epoch)
+        old_key = reference_strata_key(old_items[-1])
+        assert db.reference_baseline(epoch, old_key) is not None
+
+        db.upsert_envelope(
+            {
+                "name": "INTERACTIVE_EFFICIENT",
+                "revision": 2,
+                "status": "VERIFIED",
+                "epp": "balance_power",
+                "max_perf_pct": 55,
+                "turbo": True,
+                "content_hash": "env-hash-v2",
+                "source": "test",
+                "updated_ts": 2.0,
+            }
+        )
+        new_item = rollup(400.0, 4.8)
+        new_item["current_envelope_content_hash"] = "env-hash-v2"
+        new_item["evidence_epoch_id"] = epoch
+        new_item["reference_eligible"] = True
+        db.add_rollup(new_item)
+        tracker.observe_rollup(new_item, evidence_epoch_id=epoch)
+
+        new_key = reference_strata_key(new_item)
+        assert new_key != old_key
+        assert db.reference_baseline(epoch, new_key) is None
+        recent = db.noise_distribution(epoch, new_key, window_seconds=7 * 86400)
+        assert recent is not None
+        assert recent["sample_count"] == 1
+    finally:
+        db.close()
+
+
+def test_noise_tracker_rejects_non_verified_envelope_even_when_rollup_is_clean(project_root: Path):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/evidence-blocked-envelope.sqlite3")
+    try:
+        epoch = make_epoch(db)
+        bind_measurement_trust(db, epoch)
+        envelope = db.envelope("INTERACTIVE_EFFICIENT")
+        assert envelope is not None
+        envelope["status"] = "BLOCKED"
+        db.upsert_envelope(envelope)
+        tracker = NoiseTracker(config, db)
+        for index in range(8):
+            item = rollup(100.0 + index * 60.0, 5.0)
+            item["evidence_epoch_id"] = epoch
+            item["reference_eligible"] = True
+            db.add_rollup(item)
+            assert tracker.observe_rollup(item, evidence_epoch_id=epoch) is None
+        key = reference_strata_key(rollup(999.0, 5.0))
+        assert db.reference_baseline(epoch, key) is None
+        assert db.noise_distribution(epoch, key, window_seconds=7 * 86400) is None
     finally:
         db.close()
 

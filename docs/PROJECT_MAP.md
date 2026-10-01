@@ -394,14 +394,17 @@ UnexpectedPower detector。
 - UsageCoverage
 - StableReadiness
 - DriftDetector
+- runtime policy fingerprint
 - MinimalMeter A1-B1-B2-A2 paired comparison
 - brightness/active/media/remote/network/temperature comparability veto
 - fixed baseline content hash / campaign coherence gate
+- Net Benefit campaign OPEN/COMPLETE/INVALID lifecycle + max span
 - minutes gained per charge
 - Net Benefit assessment
 
-`UsageCoverage` 的 total valid time 包含真实但脏的 transitional usage；只有 `reference_eligible=true`
-且有 VERIFIED policy/FrozenReference 的窗口进入 trusted coverage。
+`UsageCoverage` 的 total valid time 包含真实但脏的 transitional usage；只有 `reference_eligible=true`、
+frozen envelope content hash 仍与当前 VERIFIED record 匹配且有 FrozenReference 的窗口进入 trusted
+coverage。StableReadiness 还要求 minimum usage/trusted seconds、distinct usage days 和 observation span。
 
 ### src/sp7_powerlab/minimal_meter_cli.py
 
@@ -415,7 +418,8 @@ Stage E 的低开销 capture 入口。
 - FULL_POWERLAB：live CONTROL_ALLOWED service + Automation Level >= 2
 
 同时采集 brightness、active/media/remote fraction 所需信号、basic network、package temperature 和
-actual HWP snapshot。trial/calibration 或 hard context 变化会让 run INVALID。
+actual HWP snapshot，并冻结 runtime policy fingerprint。trial/calibration、hard context 或 policy 变化会让
+run INVALID；campaign 有独立 DB lifecycle，不允许跨周复用裸字符串拼结果。
 
 最终允许系统得出：
 

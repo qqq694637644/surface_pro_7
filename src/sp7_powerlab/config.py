@@ -61,7 +61,7 @@ DEFAULTS: dict[str, Any] = {
         "max_sustained_compute_delta": 0.10,
     },
     "evidence": {
-        "semantics_version": 5,
+        "semantics_version": 6,
         "practical_threshold_w": 0.10,
         "min_crossover_episodes": 2,
         "medium_effect_min_crossover_episodes": 3,
@@ -87,6 +87,7 @@ DEFAULTS: dict[str, Any] = {
         "max_reference_drift_w": 0.30,
         "max_candidate_delta_spread_w": 0.30,
         "max_interblock_gap_seconds": 900.0,
+        "max_campaign_span_seconds": 86400.0,
     },
     "calibration": {
         "cold_idle_min_seconds": 900.0,
@@ -117,6 +118,7 @@ DEFAULTS: dict[str, Any] = {
     "helper": {
         "socket": "/run/sp7-powerlab/helper.sock",
         "enabled": True,
+        "downgrade_after_failed_probes": 3,
     },
     "minimal_meter": {
         "sample_seconds": 60.0,
@@ -138,6 +140,10 @@ DEFAULTS: dict[str, Any] = {
     "stable": {
         "coverage_days": 30,
         "target_trusted_fraction": 0.90,
+        "minimum_total_valid_usage_seconds": 28800.0,
+        "minimum_total_trusted_usage_seconds": 25920.0,
+        "minimum_distinct_usage_days": 5,
+        "minimum_observation_span_days": 7.0,
         "feedback_lookback_days": 7,
     },
     "drift": {

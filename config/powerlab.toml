@@ -48,7 +48,7 @@ max_media_drop = 0.05
 max_sustained_compute_delta = 0.10
 
 [evidence]
-semantics_version = 5
+semantics_version = 6
 practical_threshold_w = 0.10
 min_crossover_episodes = 2
 medium_effect_min_crossover_episodes = 3
@@ -74,6 +74,7 @@ max_mean_temp_delta_c = 5.0
 max_reference_drift_w = 0.30
 max_candidate_delta_spread_w = 0.30
 max_interblock_gap_seconds = 900
+max_campaign_span_seconds = 86400
 
 [calibration]
 cold_idle_min_seconds = 900
@@ -107,6 +108,7 @@ store_window_title = true
 [helper]
 enabled = true
 socket = "/run/sp7-powerlab/helper.sock"
+downgrade_after_failed_probes = 3
 
 [minimal_meter]
 sample_seconds = 60
@@ -128,6 +130,10 @@ check_seconds = 60
 [stable]
 coverage_days = 30
 target_trusted_fraction = 0.90
+minimum_total_valid_usage_seconds = 28800
+minimum_total_trusted_usage_seconds = 25920
+minimum_distinct_usage_days = 5
+minimum_observation_span_days = 7
 feedback_lookback_days = 7
 
 [drift]

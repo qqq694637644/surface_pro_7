@@ -16,8 +16,8 @@ sp7-powerlab agent-context
 
 当前 runtime：
 
-- SQLite schema v7
-- evidence semantics v5
+- SQLite schema v8
+- evidence semantics v6
 - 旧 runtime schema fail-fast，不维护兼容迁移
 - AI 入口：AGENTS.md + sp7-powerlab agent-context
 - 设计合同：PLAN2.md
@@ -270,11 +270,15 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - diagnostic burst
 - MinimalMeter end-to-end comparison
 - MinimalMeter capture-time provenance（epoch/battery/fingerprint/calibration/campaign/mode）
+- natural Reference/Noise identity 包含 frozen envelope content hash；只接受 VERIFIED + matching hash
+- STABLE coverage 有真实 usage/trusted time、distinct days、observation span 的 denominator floor
 - Net Benefit 使用 time-weighted integrated BAT power，并对 data quality fail-closed
 - capture mode 验证真实 service Automation Level / ControlSafety；FIXED/MONITORING 每点核对实际 HWP
 - brightness/active/media/remote/network/temperature 作为低成本 comparability veto
 - 正式 Net Benefit 使用 A1-B1-B2-A2 paired campaign，检查两个 candidate delta 的方向/spread
-- STABLE 只接受同 hard epoch/campaign/fixed baseline content hash 的三类完整 comparison
+- runtime policy fingerprint 固定 controller/config、Automation Level、VERIFIED envelope set/hash 与 override
+- Net Benefit campaign 是 OPEN/COMPLETE/INVALID 实体，限制最大 campaign span，完成后三类结果即关闭
+- STABLE 只接受同 hard epoch/campaign/fixed baseline content hash 的三类完整 comparison，并验证 FULL policy 仍代表当前 runtime
 - KEEP_FULL_POWERLAB
 - KEEP_DYNAMIC_REDUCE_MONITORING
 - FIXED_GOOD_ENVELOPE

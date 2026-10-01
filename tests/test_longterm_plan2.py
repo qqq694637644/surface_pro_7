@@ -13,6 +13,7 @@ from sp7_powerlab.longterm import (
     compare_meter_runs,
     compare_paired_meter_runs,
     minutes_gained_per_charge,
+    runtime_policy_snapshot,
 )
 from sp7_powerlab.storage import Database
 
@@ -34,6 +35,13 @@ def rollup(ts: float, power: float) -> dict:
         "current_envelope": "INTERACTIVE_EFFICIENT",
         "trial_id": None,
     }
+
+
+def bind_current_envelope(db: Database, item: dict) -> dict:
+    envelope = db.envelope(str(item["current_envelope"]))
+    assert envelope is not None
+    item["current_envelope_content_hash"] = str(envelope["content_hash"])
+    return item
 
 
 def meter_row(ts: float, power: float, energy: float) -> dict:
@@ -84,7 +92,7 @@ def test_usage_coverage_requires_verified_policy_and_frozen_reference(project_ro
             payload={},
         )
         now = time.time()
-        item = rollup(now - 60, 5.0)
+        item = bind_current_envelope(db, rollup(now - 60, 5.0))
         item["evidence_epoch_id"] = epoch
         item["reference_eligible"] = True
         db.add_rollup(item)
@@ -241,10 +249,11 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
             },
         )
         now = time.time()
-        item = rollup(now - 60, 5.0)
+        item = bind_current_envelope(db, rollup(now - 60, 5.0))
         item["evidence_epoch_id"] = epoch
         item["reference_eligible"] = True
         db.add_rollup(item)
+        fixed_hash = str(item["current_envelope_content_hash"])
         db.upsert_reference_baseline(
             {
                 "reference_id": "ref-ready",
@@ -260,6 +269,17 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
                 "frozen": True,
             }
         )
+        policy_fingerprint = str(runtime_policy_snapshot(config, db)["fingerprint"])
+        db.create_net_benefit_campaign(
+            campaign_id="stable-campaign",
+            evidence_epoch_id=epoch,
+            battery_epoch=1,
+            hard_identity_hash="hard",
+            calibration_version=1,
+            evidence_semantics_version=1,
+            fixed_baseline_envelope="INTERACTIVE_EFFICIENT",
+            fixed_baseline_content_hash=fixed_hash,
+        )
         for mode in ("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB"):
             run_id = db.start_monitoring_overhead_run(mode=mode)
             db.finish_monitoring_overhead_run(
@@ -271,13 +291,43 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
                     "evidence_epoch_id": epoch,
                     "campaign_id": "stable-campaign",
                     "fixed_baseline_envelope": "INTERACTIVE_EFFICIENT",
-                    "fixed_baseline_content_hash": "fixed-hash",
+                    "fixed_baseline_content_hash": fixed_hash,
+                    "runtime_policy_fingerprint": policy_fingerprint,
                 },
             )
+            db.record_net_benefit_campaign_comparison(
+                "stable-campaign",
+                mode=mode,
+                overhead_run_id=run_id,
+                runtime_policy_fingerprint=policy_fingerprint,
+            )
+
+        too_short = StableReadiness(config, db).assess(now=now)
+        assert too_short["ready"] is False
+        assert "total_valid_usage_below_minimum" in too_short["reasons"]
+        assert "distinct_usage_days_below_minimum" in too_short["reasons"]
+        assert "observation_span_below_minimum" in too_short["reasons"]
+
+        for days_ago in (7, 5, 3, 1):
+            observed = bind_current_envelope(
+                db,
+                rollup(now - days_ago * 86400.0 - 60.0, 5.0),
+            )
+            observed["evidence_epoch_id"] = epoch
+            observed["reference_eligible"] = True
+            observed["valid_seconds"] = 7200.0
+            db.add_rollup(observed)
 
         ready = StableReadiness(config, db).assess(now=now)
         assert ready["ready"] is True
         assert ready["usage_coverage"]["trusted_fraction"] == 1.0
+        assert ready["usage_coverage"]["distinct_usage_days"] == 5
+        assert ready["usage_coverage"]["observation_span_seconds"] >= 7 * 86400.0
+
+        config.data["automation"]["level"] = 4
+        stale = StableReadiness(config, db).assess(now=now)
+        assert stale["ready"] is False
+        assert "net_benefit_full_policy_is_stale" in stale["reasons"]
     finally:
         db.close()
 
@@ -295,6 +345,7 @@ def _completed_run(mode: str, delta_w: float, ts: float) -> dict:
             "campaign_id": "unit-campaign",
             "fixed_baseline_envelope": "INTERACTIVE_EFFICIENT",
             "fixed_baseline_content_hash": "fixed-hash",
+            "runtime_policy_fingerprint": "policy-fingerprint",
         },
     }
 
@@ -350,7 +401,7 @@ def test_usage_coverage_ignores_rollups_from_other_evidence_epochs(project_root:
             payload={},
         )
         now = time.time()
-        old = rollup(now - 120, 5.0)
+        old = bind_current_envelope(db, rollup(now - 120, 5.0))
         old["evidence_epoch_id"] = old_epoch
         old["reference_eligible"] = True
         db.add_rollup(old)
@@ -362,7 +413,7 @@ def test_usage_coverage_ignores_rollups_from_other_evidence_epochs(project_root:
             evidence_semantics_version=1,
             payload={},
         )
-        new = rollup(now - 60, 6.0)
+        new = bind_current_envelope(db, rollup(now - 60, 6.0))
         new["evidence_epoch_id"] = new_epoch
         new["reference_eligible"] = True
         db.add_rollup(new)
@@ -404,7 +455,7 @@ def test_usage_coverage_keeps_dirty_rollup_in_total_but_not_trusted(project_root
             payload={},
         )
         now = time.time()
-        item = rollup(now - 60, 5.0)
+        item = bind_current_envelope(db, rollup(now - 60, 5.0))
         item["evidence_epoch_id"] = epoch
         item["reference_eligible"] = False
         item["reference_ineligible_reasons"] = ["power_source_not_all_discharging"]
@@ -438,29 +489,77 @@ def test_usage_coverage_keeps_dirty_rollup_in_total_but_not_trusted(project_root
         db.close()
 
 
+def test_usage_coverage_does_not_trust_old_envelope_revision(project_root: Path):
+    db = Database(project_root / "runtime/coverage-envelope-revision.sqlite3")
+    registry = EnvelopeRegistry(project_root, db)
+    registry.load()
+    try:
+        epoch = db.ensure_evidence_epoch(
+            hard_identity_hash="hard",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=1,
+            payload={},
+        )
+        now = time.time()
+        old = bind_current_envelope(db, rollup(now - 60, 5.0))
+        old["evidence_epoch_id"] = epoch
+        old["reference_eligible"] = True
+        db.add_rollup(old)
+        db.upsert_reference_baseline(
+            {
+                "reference_id": "ref-old-revision",
+                "created_ts": now,
+                "evidence_epoch_id": epoch,
+                "strata_key": reference_strata_key(old),
+                "envelope": "INTERACTIVE_EFFICIENT",
+                "median_power_w": 5.0,
+                "mad_power_w": 0.05,
+                "p25_power_w": 4.95,
+                "p75_power_w": 5.05,
+                "sample_count": 10,
+                "frozen": True,
+            }
+        )
+        envelope = db.envelope("INTERACTIVE_EFFICIENT")
+        assert envelope is not None
+        envelope["revision"] = int(envelope.get("revision") or 1) + 1
+        envelope["content_hash"] = "new-content-hash"
+        envelope["max_perf_pct"] = max(30, int(envelope["max_perf_pct"]) - 5)
+        envelope["status"] = "VERIFIED"
+        db.upsert_envelope(envelope)
+
+        coverage = UsageCoverage(db).summarize(
+            since_ts=now - 3600,
+            evidence_epoch_id=epoch,
+        )
+        assert coverage["total_valid_seconds"] == 60.0
+        assert coverage["verified_seconds"] == 0.0
+        assert coverage["trusted_seconds"] == 0.0
+    finally:
+        db.close()
+
+
 def test_net_benefit_filters_runs_by_current_evidence_epoch():
     runs = [
         {
             **_completed_run("MONITORING_OVERHEAD", 0.01, 100),
             "result": {
-                "candidate_minus_reference_w": 0.01,
-                "comparison_quality": "OK",
+                **_completed_run("MONITORING_OVERHEAD", 0.01, 100)["result"],
                 "evidence_epoch_id": "old",
             },
         },
         {
             **_completed_run("DYNAMIC_CONTROLLER", -0.2, 110),
             "result": {
-                "candidate_minus_reference_w": -0.2,
-                "comparison_quality": "OK",
+                **_completed_run("DYNAMIC_CONTROLLER", -0.2, 110)["result"],
                 "evidence_epoch_id": "old",
             },
         },
         {
             **_completed_run("FULL_POWERLAB", -0.2, 120),
             "result": {
-                "candidate_minus_reference_w": -0.2,
-                "comparison_quality": "OK",
+                **_completed_run("FULL_POWERLAB", -0.2, 120)["result"],
                 "evidence_epoch_id": "old",
             },
         },
@@ -479,8 +578,7 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
         {
             **_completed_run("MONITORING_OVERHEAD", 0.01, 100),
             "result": {
-                "candidate_minus_reference_w": 0.01,
-                "comparison_quality": "OK",
+                **_completed_run("MONITORING_OVERHEAD", 0.01, 100)["result"],
                 "evidence_epoch_id": "current",
                 "campaign_id": "a",
             },
@@ -488,8 +586,7 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
         {
             **_completed_run("DYNAMIC_CONTROLLER", -0.2, 110),
             "result": {
-                "candidate_minus_reference_w": -0.2,
-                "comparison_quality": "OK",
+                **_completed_run("DYNAMIC_CONTROLLER", -0.2, 110)["result"],
                 "evidence_epoch_id": "current",
                 "campaign_id": "b",
             },
@@ -497,8 +594,7 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
         {
             **_completed_run("FULL_POWERLAB", -0.2, 120),
             "result": {
-                "candidate_minus_reference_w": -0.2,
-                "comparison_quality": "OK",
+                **_completed_run("FULL_POWERLAB", -0.2, 120)["result"],
                 "evidence_epoch_id": "current",
                 "campaign_id": "c",
             },
@@ -528,6 +624,22 @@ def test_net_benefit_rejects_same_campaign_with_different_fixed_baselines():
         runs,
         practical_threshold_w=0.1,
         evidence_epoch_id="current",
+    )
+    assert result["complete"] is False
+    assert result["recommendation"] == "NEED_MORE_DATA"
+
+
+def test_net_benefit_rejects_same_campaign_string_across_long_time_span():
+    runs = [
+        _completed_run("MONITORING_OVERHEAD", 0.02, 100.0),
+        _completed_run("DYNAMIC_CONTROLLER", -0.2, 8 * 86400.0),
+        _completed_run("FULL_POWERLAB", -0.25, 16 * 86400.0),
+    ]
+    result = assess_net_benefit(
+        runs,
+        practical_threshold_w=0.1,
+        complete_campaign_ids={"unit-campaign"},
+        max_campaign_span_seconds=86400.0,
     )
     assert result["complete"] is False
     assert result["recommendation"] == "NEED_MORE_DATA"

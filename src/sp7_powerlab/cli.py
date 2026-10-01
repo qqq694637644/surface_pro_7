@@ -704,6 +704,7 @@ def _meter_campaign(
     reference_after_id: str,
     *,
     max_interblock_gap_seconds: float = 900.0,
+    max_campaign_span_seconds: float = 86400.0,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], str]:
     reference_before = db.minimal_meter_run(reference_before_id)
     candidate_first = db.minimal_meter_run(candidate_first_id)
@@ -750,6 +751,9 @@ def _meter_campaign(
     ]
     if mismatched:
         raise SystemExit("MinimalMeter provenance mismatch: " + ", ".join(sorted(mismatched)))
+    policy_fingerprints = {str(run.get("runtime_policy_fingerprint") or "") for run in runs}
+    if len(policy_fingerprints) != 1 or "" in policy_fingerprints:
+        raise SystemExit("MinimalMeter runtime policy fingerprint changed within A-B-B-A")
     if reference_before.get("envelope") != reference_after.get("envelope") or reference_before.get(
         "envelope_content_hash"
     ) != reference_after.get("envelope_content_hash"):
@@ -788,6 +792,44 @@ def _meter_campaign(
     if any(gap > float(max_interblock_gap_seconds) for gap in interblock_gaps):
         raise SystemExit("Net Benefit A-B-B-A inter-block gap exceeds the paired-campaign limit")
 
+    campaign_id = str(candidate_first.get("campaign_id") or "")
+    campaign = db.net_benefit_campaign(campaign_id)
+    if not campaign:
+        raise SystemExit(f"Net Benefit campaign entity does not exist: {campaign_id}")
+    if campaign.get("status") != "OPEN":
+        raise SystemExit(f"Net Benefit campaign is not OPEN: {campaign.get('status')}")
+    if time.time() - float(campaign.get("created_ts") or 0.0) > float(max_campaign_span_seconds):
+        db.invalidate_net_benefit_campaign(campaign_id, "campaign_span_exceeded")
+        raise SystemExit("Net Benefit campaign exceeded max_campaign_span_seconds")
+    campaign_context = {
+        "evidence_epoch_id": candidate_first.get("evidence_epoch_id"),
+        "battery_epoch": candidate_first.get("battery_epoch"),
+        "hard_identity_hash": candidate_first.get("hard_identity_hash"),
+        "calibration_version": candidate_first.get("calibration_version"),
+        "evidence_semantics_version": candidate_first.get("evidence_semantics_version"),
+    }
+    campaign_mismatch = [
+        field for field, value in campaign_context.items() if str(campaign.get(field)) != str(value)
+    ]
+    if campaign_mismatch:
+        db.invalidate_net_benefit_campaign(
+            campaign_id,
+            "campaign_context_changed:" + ",".join(sorted(campaign_mismatch)),
+        )
+        raise SystemExit(
+            "Net Benefit campaign context mismatch: " + ", ".join(sorted(campaign_mismatch))
+        )
+    if str(campaign.get("fixed_baseline_envelope") or "") != str(
+        reference_before.get("envelope") or ""
+    ) or str(campaign.get("fixed_baseline_content_hash") or "") != str(
+        reference_before.get("envelope_content_hash") or ""
+    ):
+        db.invalidate_net_benefit_campaign(campaign_id, "fixed_baseline_changed")
+        raise SystemExit("Net Benefit campaign fixed baseline no longer matches its contract")
+    comparisons = dict((campaign.get("payload") or {}).get("comparisons") or {})
+    if result_mode in comparisons:
+        raise SystemExit(f"Net Benefit campaign already contains {result_mode}")
+
     active_epoch = db.active_evidence_epoch()
     if not active_epoch or str(active_epoch.get("epoch_id") or "") != str(
         candidate_first.get("evidence_epoch_id") or ""
@@ -808,6 +850,9 @@ def cmd_overhead_compare(args: argparse.Namespace) -> int:
                 args.reference_after_run,
                 max_interblock_gap_seconds=float(
                     config.get("net_benefit.max_interblock_gap_seconds", 900.0)
+                ),
+                max_campaign_span_seconds=float(
+                    config.get("net_benefit.max_campaign_span_seconds", 86400.0)
                 ),
             )
         )
@@ -863,6 +908,7 @@ def cmd_overhead_compare(args: argparse.Namespace) -> int:
             "evidence_semantics_version": candidate_first["evidence_semantics_version"],
             "fixed_baseline_envelope": reference_before["envelope"],
             "fixed_baseline_content_hash": reference_before["envelope_content_hash"],
+            "runtime_policy_fingerprint": candidate_first["runtime_policy_fingerprint"],
         }
         run_id = db.start_monitoring_overhead_run(
             mode=result_mode,
@@ -878,7 +924,15 @@ def cmd_overhead_compare(args: argparse.Namespace) -> int:
             },
         )
         db.finish_monitoring_overhead_run(run_id, result)
-        emit({"run_id": run_id, **result})
+        campaign = None
+        if result.get("comparison_quality") == "OK":
+            campaign = db.record_net_benefit_campaign_comparison(
+                str(candidate_first["campaign_id"]),
+                mode=result_mode,
+                overhead_run_id=run_id,
+                runtime_policy_fingerprint=str(candidate_first["runtime_policy_fingerprint"]),
+            )
+        emit({"run_id": run_id, "campaign": campaign, **result})
     finally:
         db.close()
     return 0
@@ -897,11 +951,19 @@ def cmd_overhead_summary(args: argparse.Namespace) -> int:
     config, db = db_from_args(args)
     try:
         epoch = db.active_evidence_epoch()
+        complete_campaign_ids = {
+            str(item["campaign_id"])
+            for item in db.net_benefit_campaigns(status="COMPLETE", limit=args.limit)
+        }
         emit(
             assess_net_benefit(
                 db.monitoring_overhead_runs(args.limit),
                 practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
                 evidence_epoch_id=(epoch or {}).get("epoch_id"),
+                complete_campaign_ids=complete_campaign_ids,
+                max_campaign_span_seconds=float(
+                    config.get("net_benefit.max_campaign_span_seconds", 86400.0)
+                ),
             )
         )
     finally:

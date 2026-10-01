@@ -61,6 +61,17 @@ def test_v6_database_fails_fast_after_evidence_scope_schema_break(tmp_path: Path
         Database(path)
 
 
+def test_v7_database_fails_fast_after_campaign_schema_break(tmp_path: Path):
+    path = tmp_path / "powerlab.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value_json TEXT NOT NULL)")
+    conn.execute("INSERT INTO metadata(key,value_json) VALUES('schema_version','7')")
+    conn.commit()
+    conn.close()
+    with pytest.raises(LegacyDatabaseError, match="schema 7"):
+        Database(path)
+
+
 def test_v1_database_fails_fast(tmp_path: Path):
     path = tmp_path / "powerlab.sqlite3"
     conn = sqlite3.connect(path)
@@ -115,9 +126,10 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
             battery_identity_hash="battery-a",
             hard_identity_hash="hard-a",
             calibration_version=3,
-            evidence_semantics_version=5,
+            evidence_semantics_version=6,
             envelope="INTERACTIVE_EFFICIENT",
             envelope_content_hash="env-hash",
+            runtime_policy_fingerprint="policy-hash",
             payload={"capture_contract_version": 2, "start_marker": True},
         )
         db.add_minimal_meter_sample(
@@ -140,12 +152,55 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
         assert run["battery_identity_hash"] == "battery-a"
         assert run["hard_identity_hash"] == "hard-a"
         assert run["calibration_version"] == 3
-        assert run["evidence_semantics_version"] == 5
+        assert run["evidence_semantics_version"] == 6
         assert run["envelope"] == "INTERACTIVE_EFFICIENT"
         assert run["envelope_content_hash"] == "env-hash"
+        assert run["runtime_policy_fingerprint"] == "policy-hash"
         assert run["payload"]["start_marker"] is True
         assert run["payload"]["sample_count"] == 1
         assert len(run["samples"]) == 1
+    finally:
+        db.close()
+
+
+def test_net_benefit_campaign_closes_after_three_distinct_comparisons(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite3")
+    try:
+        campaign = db.create_net_benefit_campaign(
+            campaign_id="campaign-a",
+            evidence_epoch_id="epoch-a",
+            battery_epoch=1,
+            hard_identity_hash="hard-a",
+            calibration_version=1,
+            evidence_semantics_version=6,
+            fixed_baseline_envelope="INTERACTIVE_EFFICIENT",
+            fixed_baseline_content_hash="fixed-hash",
+        )
+        assert campaign["status"] == "OPEN"
+        for index, mode in enumerate(
+            ("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB"),
+            start=1,
+        ):
+            campaign = db.record_net_benefit_campaign_comparison(
+                "campaign-a",
+                mode=mode,
+                overhead_run_id=f"overhead-{index}",
+                runtime_policy_fingerprint=f"policy-{index}",
+            )
+        assert campaign["status"] == "COMPLETE"
+        assert campaign["closed_ts"] is not None
+        assert set(campaign["payload"]["comparisons"]) == {
+            "MONITORING_OVERHEAD",
+            "DYNAMIC_CONTROLLER",
+            "FULL_POWERLAB",
+        }
+        with pytest.raises(ValueError, match="not OPEN"):
+            db.record_net_benefit_campaign_comparison(
+                "campaign-a",
+                mode="FULL_POWERLAB",
+                overhead_run_id="overhead-late",
+                runtime_policy_fingerprint="policy-late",
+            )
     finally:
         db.close()
 

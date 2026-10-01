@@ -215,6 +215,12 @@ power source 保持 Discharging、没有 resume grace、没有超限 sample gap�
 单一，并达到 minimum valid-discharge fraction。被 Charging/resume/gap 切碎的 transitional
 rollup 可以保留作普通 telemetry，但不能作为一个完整 reference/noise observation。
 
+sample 产生时必须同时冻结 `current_envelope` 和 `current_envelope_content_hash`。同一分钟内 envelope
+name 或 content hash 任一发生变化，rollup 都不能进入 reference/noise。Reference/Noise identity 必须
+包含 envelope content hash；同名 envelope promotion 后的新 revision 不得继承旧 revision 的 Frozen
+Reference 或 RecentNoiseDistribution。Evidence 层还必须独立确认 DB 中该 envelope 仍为 VERIFIED，
+且当前 DB content hash 与 rollup 中冻结的 hash 完全一致，否则 fail-closed。
+
 ### 3.5 避免 bucket explosion
 
 个人单机数据只使用少量主分层，例如：
@@ -577,6 +583,16 @@ STABLE 下：
 transitional rollup 的 valid seconds 仍属于真实 usage 分母，但只能计为 uncovered/untrusted，不能因为
 同一 stratum 已经存在 Frozen Reference 就被重新称为 trusted。
 
+`target_trusted_fraction` 不能脱离 denominator floor 单独使用。STABLE 还必须至少满足配置中的：
+
+- minimum total valid usage seconds
+- minimum total trusted usage seconds
+- minimum distinct usage days
+- minimum observation span days
+
+`coverage_days` 只定义 lookback window，不表示系统已经实际观察了这么久。目标是要求足量真实使用，
+并且这些使用分散在足够长的时间范围内，而不是机械等待完整自然月。
+
 还需要：
 
 - Measurement Trust READY
@@ -928,8 +944,12 @@ Net Benefit 直接来自 end-to-end paired comparison，而不是两个任意历
 
 MinimalMeter capture 的 provenance 必须在**采集开始时**固定并持久化，至少包括 run/campaign、
 capture mode、battery identity/epoch、hard evidence epoch/fingerprint、calibration version、evidence
-semantics 和起始 verified envelope。比较时只能读取 capture-time provenance；禁止读取“当前 epoch”
-后给旧采集文件事后贴标签。
+semantics、起始 verified envelope 和 runtime policy fingerprint。比较时只能读取 capture-time provenance；
+禁止读取“当前 epoch”后给旧采集文件事后贴标签。
+
+runtime policy fingerprint 至少覆盖会改变 Dynamic/Full 行为的 controller/runtime config、Automation
+Level、VERIFIED envelope names/content hashes 和 manual override state。一个 A1-B1-B2-A2 comparison 的
+四个 block 必须具有同一个 policy fingerprint；尤其 B1/B2 不能只是 mode 名相同而实际 treatment 已变。
 
 Net Benefit 使用 gap-aware integrated BAT energy / valid discharge duration 计算 time-weighted mean
 power。reference 或 candidate 的 BAT consistency / provenance / data-quality gate 失败时，不产生可供
@@ -967,6 +987,12 @@ run 标记 INVALID。
 epoch、同一个显式 validation campaign、同一个 fixed baseline content hash，并且每种结果本身都已经
 通过 A1-B1-B2-A2 comparability gate。不能把不同周、不同 fixed reference 或不同系统条件下各自最新的
 一次结果拼成“完整比较”。
+
+validation campaign 是有生命周期的 DB entity，不是可无限复用的字符串。campaign 从 OPEN 开始，
+固定 hard/battery/calibration/semantics context 与 fixed baseline identity；超过 `max_campaign_span_seconds`
+或 context/baseline 变化时 INVALID。三种有效 comparison 各完成一次后自动 COMPLETE/CLOSED，禁止继续
+往旧 campaign 塞新结果。STABLE 还必须验证用于 FULL_POWERLAB 的 policy fingerprint 与当前 runtime
+policy fingerprint 一致；policy 已改变时旧 Net Benefit 只能作为历史记录，不能继续为当前系统背书。
 
 MonitoringOverhead 只用于解释，不从已经包含 monitoring 的结果中重复扣除。
 

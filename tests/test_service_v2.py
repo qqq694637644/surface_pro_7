@@ -392,6 +392,81 @@ def test_rollup_with_mixed_envelope_and_brightness_is_not_reference_eligible(
         db.close()
 
 
+def test_rollup_with_same_envelope_name_but_mixed_content_hash_is_not_reference_eligible(
+    project_root: Path,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/mixed-envelope-hash-rollup.sqlite3")
+    lifecycle = LifecycleManager(db)
+    epoch = db.ensure_evidence_epoch(
+        hard_identity_hash="fp",
+        battery_epoch=1,
+        calibration_version=1,
+        evidence_semantics_version=1,
+        payload={},
+    )
+    service = object.__new__(PowerLabService)
+    service.root = project_root
+    service.config = config
+    service.db = db
+    service.stack = {
+        "fingerprint": "fp",
+        "noise": SimpleNamespace(observe_rollup=lambda *_args, **_kwargs: None),
+        "drift": SimpleNamespace(detect=lambda *_args, **_kwargs: None),
+        "unexpected_power": SimpleNamespace(detect=lambda *_args, **_kwargs: None),
+        "lifecycle": lifecycle,
+        "collector": SimpleNamespace(trigger_diagnostic_burst=lambda: None),
+    }
+    try:
+        common = {
+            "wall_ts": "x",
+            "battery_status": "Discharging",
+            "battery_pct": 80,
+            "battery_power_w": 5.0,
+            "battery_energy_wh": 30.0,
+            "battery_epoch": 1,
+            "brightness_pct": 40,
+            "cpu_psi": 0.1,
+            "io_psi": 0.1,
+            "rapl_power_60s_w": 2.0,
+            "thermal_pressure": 0.1,
+            "thermal_state": "COOL",
+            "demand_region": "ACTIVE|LAT_MEDIUM|CPU_LOW|NO_MEDIA|NET_LOW|LOCAL",
+            "local_compute_pressure": "LOW",
+            "media_playing": False,
+            "user_active": True,
+            "remote_hint": 0.0,
+            "network_rx_mbps": 0.0,
+            "network_tx_mbps": 0.0,
+            "evidence_epoch": epoch,
+            "resume_grace": False,
+            "current_envelope": "INTERACTIVE_EFFICIENT",
+        }
+        db.add_sample(
+            {
+                **common,
+                "ts": 100.0,
+                "current_envelope_content_hash": "revision-a",
+            }
+        )
+        db.add_sample(
+            {
+                **common,
+                "ts": 120.0,
+                "current_envelope_content_hash": "revision-b",
+            }
+        )
+        result = service._rollup(100.0, 120.0)
+        assert result is not None
+        assert result["reference_eligible"] is False
+        assert result["current_envelope"] == "INTERACTIVE_EFFICIENT"
+        assert result["current_envelope_content_hash"] is None
+        assert "envelope_content_hash" in result["mixed_dimensions"]
+        assert "mixed_envelope_content_hash" in result["reference_ineligible_reasons"]
+    finally:
+        db.close()
+
+
 def test_rollup_with_charging_transition_is_not_reference_eligible(project_root: Path):
     config = load_config(project_root)
     db = Database(project_root / "runtime/charging-rollup.sqlite3")
@@ -597,5 +672,99 @@ def test_hardware_refresh_rebinds_actuator_when_helper_becomes_available(
         assert trials.actuator is new_actuator
         assert controller.hardware_writable is True
         assert db.get_meta("actuator_rebind")["previous_mode"] == "read-only"
+    finally:
+        db.close()
+
+
+def test_hardware_refresh_does_not_downgrade_live_reconnecting_actuator_on_one_failed_probe(
+    project_root: Path,
+    monkeypatch,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/actuator-transient.sqlite3")
+    service = object.__new__(PowerLabService)
+    service.config = config
+    service.db = db
+    service._last_hardware_refresh_ts = 0.0
+    old_actuator = SimpleNamespace(name="helper-client")
+    unavailable = SimpleNamespace(name="unavailable")
+    controller = SimpleNamespace(hardware_writable=True, actuator=old_actuator)
+    trials = SimpleNamespace(actuator=old_actuator)
+    service.stack = {
+        "machine": {"identity": {}, "calibration": {"version": 1}},
+        "actuator": old_actuator,
+        "actuator_available": True,
+        "actuator_mode": "root-helper",
+        "controller": controller,
+        "trials": trials,
+        "lifecycle": SimpleNamespace(set_control=lambda *_args, **_kwargs: None),
+        "registry": SimpleNamespace(),
+        "thermal_config": {},
+        "fingerprint": "old",
+    }
+    report = SimpleNamespace(control_capable=True, errors=[])
+    monkeypatch.setattr(service_module, "inspect_hardware", lambda **_kwargs: report)
+    monkeypatch.setattr(
+        service_module,
+        "build_actuator",
+        lambda _config: (unavailable, False, "read-only"),
+    )
+    monkeypatch.setattr(service_module, "_refresh_fingerprint_state", lambda **_kwargs: "new-fp")
+    try:
+        service._refresh_hardware_contract(400.0)
+        assert service.stack["actuator"] is old_actuator
+        assert service.stack["actuator_available"] is True
+        assert service.stack["actuator_mode"] == "root-helper"
+        assert controller.actuator is old_actuator
+        assert trials.actuator is old_actuator
+        assert controller.hardware_writable is True
+        assert db.get_meta("actuator_probe_failures") == 1
+        assert db.get_meta("actuator_probe_degraded")["probed_available"] is False
+    finally:
+        db.close()
+
+
+def test_hardware_refresh_freezes_actuator_backend_during_active_trial(
+    project_root: Path,
+    monkeypatch,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/actuator-trial-freeze.sqlite3")
+    service = object.__new__(PowerLabService)
+    service.config = config
+    service.db = db
+    service._last_hardware_refresh_ts = 0.0
+    old_actuator = SimpleNamespace(name="helper-client")
+    new_actuator = SimpleNamespace(name="direct")
+    controller = SimpleNamespace(hardware_writable=True, actuator=old_actuator)
+    trials = SimpleNamespace(actuator=old_actuator)
+    service.stack = {
+        "machine": {"identity": {}, "calibration": {"version": 1}},
+        "actuator": old_actuator,
+        "actuator_available": True,
+        "actuator_mode": "root-helper",
+        "controller": controller,
+        "trials": trials,
+        "lifecycle": SimpleNamespace(set_control=lambda *_args, **_kwargs: None),
+        "registry": SimpleNamespace(),
+        "thermal_config": {},
+        "fingerprint": "old",
+    }
+    report = SimpleNamespace(control_capable=True, errors=[])
+    monkeypatch.setattr(db, "active_trial", lambda: {"trial_id": "trial-active"})
+    monkeypatch.setattr(service_module, "inspect_hardware", lambda **_kwargs: report)
+    monkeypatch.setattr(
+        service_module,
+        "build_actuator",
+        lambda _config: (new_actuator, True, "direct"),
+    )
+    monkeypatch.setattr(service_module, "_refresh_fingerprint_state", lambda **_kwargs: "new-fp")
+    try:
+        service._refresh_hardware_contract(400.0)
+        assert service.stack["actuator"] is old_actuator
+        assert service.stack["actuator_mode"] == "root-helper"
+        assert controller.actuator is old_actuator
+        assert trials.actuator is old_actuator
+        assert db.get_meta("actuator_probe_degraded")["active_trial"] is True
     finally:
         db.close()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import statistics
 import time
 from dataclasses import dataclass
@@ -19,6 +21,33 @@ NET_BENEFIT_MODES = (
     "DYNAMIC_CONTROLLER",
     "FULL_POWERLAB",
 )
+
+
+def runtime_policy_snapshot(config: Config, db: Database) -> dict[str, Any]:
+    excluded_config_sections = {"storage", "helper", "minimal_meter", "net_benefit", "stable"}
+    policy_config = {
+        key: value for key, value in config.data.items() if key not in excluded_config_sections
+    }
+    verified_envelopes = [
+        {
+            "name": str(item.get("name") or ""),
+            "revision": int(item.get("revision") or 0),
+            "content_hash": str(item.get("content_hash") or ""),
+        }
+        for item in db.envelopes()
+        if item.get("status") == "VERIFIED"
+    ]
+    verified_envelopes.sort(key=lambda item: item["name"])
+    payload = {
+        "config": policy_config,
+        "verified_envelopes": verified_envelopes,
+        "manual_override": db.get_meta("manual_override"),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "fingerprint": hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24],
+        "payload": payload,
+    }
 
 
 def minutes_gained_per_charge(
@@ -55,6 +84,8 @@ class UsageCoverage:
         trusted_seconds = 0.0
         by_envelope: dict[str, float] = {}
         uncovered: dict[str, float] = {}
+        usage_timestamps: list[float] = []
+        usage_days: set[int] = set()
 
         for row in rows:
             if evidence_epoch_id and str(row.get("evidence_epoch_id") or "") != str(
@@ -64,11 +95,21 @@ class UsageCoverage:
             seconds = float(row.get("valid_seconds") or 0.0)
             if seconds <= 0 or row.get("trial_id"):
                 continue
+            bucket_ts = float(row.get("bucket_ts") or 0.0)
+            if bucket_ts > 0:
+                usage_timestamps.append(bucket_ts)
+                usage_days.add(int(bucket_ts // 86400.0))
             total_seconds += seconds
             envelope_name = str(row.get("current_envelope") or "UNMANAGED")
             by_envelope[envelope_name] = by_envelope.get(envelope_name, 0.0) + seconds
             envelope = self.db.envelope(envelope_name)
-            verified = bool(envelope and envelope.get("status") == "VERIFIED")
+            envelope_hash = str(row.get("current_envelope_content_hash") or "")
+            verified = bool(
+                envelope
+                and envelope.get("status") == "VERIFIED"
+                and envelope_hash
+                and str(envelope.get("content_hash") or "") == envelope_hash
+            )
             if verified:
                 verified_seconds += seconds
 
@@ -93,6 +134,14 @@ class UsageCoverage:
         def fraction(value: float) -> float | None:
             return value / total_seconds if total_seconds > 0 else None
 
+        first_usage_ts = min(usage_timestamps) if usage_timestamps else None
+        last_usage_ts = max(usage_timestamps) if usage_timestamps else None
+        observation_span_seconds = (
+            last_usage_ts - first_usage_ts
+            if first_usage_ts is not None and last_usage_ts is not None
+            else 0.0
+        )
+
         return {
             "since_ts": since_ts,
             "total_valid_seconds": total_seconds,
@@ -100,6 +149,10 @@ class UsageCoverage:
             "trusted_seconds": trusted_seconds,
             "verified_fraction": fraction(verified_seconds),
             "trusted_fraction": fraction(trusted_seconds),
+            "first_usage_ts": first_usage_ts,
+            "last_usage_ts": last_usage_ts,
+            "observation_span_seconds": observation_span_seconds,
+            "distinct_usage_days": len(usage_days),
             "by_envelope_seconds": dict(
                 sorted(by_envelope.items(), key=lambda item: item[1], reverse=True)
             ),
@@ -114,6 +167,8 @@ def assess_net_benefit(
     *,
     practical_threshold_w: float,
     evidence_epoch_id: str | None = None,
+    complete_campaign_ids: set[str] | None = None,
+    max_campaign_span_seconds: float = 86400.0,
 ) -> dict[str, Any]:
     selected_campaign: str | None = None
     filtered_runs = [
@@ -124,6 +179,11 @@ def assess_net_benefit(
         and (run.get("result") or {}).get("comparison_design") == "A_B_B_A"
         and bool((run.get("result") or {}).get("fixed_baseline_envelope"))
         and bool((run.get("result") or {}).get("fixed_baseline_content_hash"))
+        and bool((run.get("result") or {}).get("runtime_policy_fingerprint"))
+        and (
+            complete_campaign_ids is None
+            or str((run.get("result") or {}).get("campaign_id") or "") in complete_campaign_ids
+        )
         and (
             evidence_epoch_id is None
             or str(((run.get("result") or {}).get("evidence_epoch_id")) or "")
@@ -143,6 +203,10 @@ def assess_net_benefit(
             str(result.get("fixed_baseline_content_hash") or "") for result in results
         }
         baseline_names = {str(result.get("fixed_baseline_envelope") or "") for result in results}
+        timestamps = [
+            float(run.get("end_ts") or run.get("start_ts") or 0.0) for run in campaign_runs
+        ]
+        campaign_span = max(timestamps) - min(timestamps) if timestamps else float("inf")
         if (
             set(NET_BENEFIT_MODES) <= modes
             and all(result.get("comparison_design") == "A_B_B_A" for result in results)
@@ -150,6 +214,7 @@ def assess_net_benefit(
             and "" not in baseline_hashes
             and len(baseline_names) == 1
             and "" not in baseline_names
+            and campaign_span <= float(max_campaign_span_seconds)
         ):
             complete_campaigns.append((campaign, campaign_runs))
     if complete_campaigns:
@@ -196,6 +261,7 @@ def assess_net_benefit(
             ],
             "campaign_id": selected_campaign,
             "fixed_baseline_content_hash": None,
+            "full_policy_fingerprint": None,
             "latest_runs": latest,
         }
 
@@ -207,6 +273,10 @@ def assess_net_benefit(
         ((latest.get("MONITORING_OVERHEAD") or {}).get("result") or {}).get(
             "fixed_baseline_content_hash"
         )
+        or ""
+    )
+    full_policy_fingerprint = str(
+        ((latest.get("FULL_POWERLAB") or {}).get("result") or {}).get("runtime_policy_fingerprint")
         or ""
     )
 
@@ -236,6 +306,7 @@ def assess_net_benefit(
         "reasons": reasons,
         "campaign_id": selected_campaign,
         "fixed_baseline_content_hash": fixed_baseline_content_hash or None,
+        "full_policy_fingerprint": full_policy_fingerprint or None,
         "latest_runs": latest,
     }
 
@@ -267,6 +338,26 @@ class StableReadiness:
             reasons.append("trusted_usage_coverage_unavailable")
         elif float(trusted_fraction) < target_fraction:
             reasons.append("trusted_usage_coverage_below_target")
+        minimum_total_valid_usage_seconds = float(
+            self.config.get("stable.minimum_total_valid_usage_seconds", 28800.0)
+        )
+        minimum_total_trusted_usage_seconds = float(
+            self.config.get("stable.minimum_total_trusted_usage_seconds", 25920.0)
+        )
+        minimum_distinct_usage_days = int(self.config.get("stable.minimum_distinct_usage_days", 5))
+        minimum_observation_span_days = float(
+            self.config.get("stable.minimum_observation_span_days", 7.0)
+        )
+        if float(coverage.get("total_valid_seconds") or 0.0) < minimum_total_valid_usage_seconds:
+            reasons.append("total_valid_usage_below_minimum")
+        if float(coverage.get("trusted_seconds") or 0.0) < minimum_total_trusted_usage_seconds:
+            reasons.append("trusted_usage_below_minimum")
+        if int(coverage.get("distinct_usage_days") or 0) < minimum_distinct_usage_days:
+            reasons.append("distinct_usage_days_below_minimum")
+        if float(coverage.get("observation_span_seconds") or 0.0) < (
+            minimum_observation_span_days * 86400.0
+        ):
+            reasons.append("observation_span_below_minimum")
 
         reference_count = 0
         if epoch:
@@ -296,13 +387,27 @@ class StableReadiness:
         overhead_runs = [
             run for run in self.db.monitoring_overhead_runs(100) if run.get("end_ts") is not None
         ]
+        complete_campaign_ids = {
+            str(item["campaign_id"])
+            for item in self.db.net_benefit_campaigns(status="COMPLETE", limit=100)
+        }
         net_benefit = assess_net_benefit(
             overhead_runs,
             practical_threshold_w=float(self.config.get("evidence.practical_threshold_w", 0.10)),
             evidence_epoch_id=(epoch or {}).get("epoch_id"),
+            complete_campaign_ids=complete_campaign_ids,
+            max_campaign_span_seconds=float(
+                self.config.get("net_benefit.max_campaign_span_seconds", 86400.0)
+            ),
         )
         if not net_benefit["complete"]:
             reasons.append("net_benefit_validation_incomplete")
+        current_policy = runtime_policy_snapshot(self.config, self.db)
+        full_policy_fingerprint = str(net_benefit.get("full_policy_fingerprint") or "")
+        if net_benefit["complete"] and full_policy_fingerprint != str(
+            current_policy["fingerprint"]
+        ):
+            reasons.append("net_benefit_full_policy_is_stale")
 
         feedback_lookback_days = int(self.config.get("stable.feedback_lookback_days", 7))
         negative_feedback = [
@@ -321,9 +426,14 @@ class StableReadiness:
             "measurement_trust": measurement_trust,
             "coverage_days": coverage_days,
             "target_trusted_fraction": target_fraction,
+            "minimum_total_valid_usage_seconds": minimum_total_valid_usage_seconds,
+            "minimum_total_trusted_usage_seconds": minimum_total_trusted_usage_seconds,
+            "minimum_distinct_usage_days": minimum_distinct_usage_days,
+            "minimum_observation_span_days": minimum_observation_span_days,
             "usage_coverage": coverage,
             "frozen_reference_count": reference_count,
             "net_benefit": net_benefit,
+            "current_runtime_policy": current_policy,
             "open_unexpected_power_events": len(open_events),
             "recent_negative_feedback_count": len(negative_feedback),
         }
