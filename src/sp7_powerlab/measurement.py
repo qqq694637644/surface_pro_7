@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+import statistics
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .hardware import battery_directory
+
+
+def _valid_interval(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    max_gap_seconds: float,
+) -> float | None:
+    dt = float(current["ts"]) - float(previous["ts"])
+    if not (0 < dt <= max_gap_seconds):
+        return None
+    if previous.get("battery_status") != "Discharging":
+        return None
+    if current.get("battery_status") != "Discharging":
+        return None
+    if previous.get("resume_grace") or current.get("resume_grace"):
+        return None
+    return dt
+
+
+def integrate_battery_energy_wh(
+    rows: list[dict[str, Any]],
+    *,
+    max_gap_seconds: float,
+) -> tuple[float | None, float]:
+    energy_ws = 0.0
+    valid_seconds = 0.0
+    for previous, current in zip(rows, rows[1:], strict=False):
+        dt = _valid_interval(previous, current, max_gap_seconds=max_gap_seconds)
+        if dt is None:
+            continue
+        left = previous.get("battery_power_w")
+        right = current.get("battery_power_w")
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            continue
+        energy_ws += (float(left) + float(right)) * 0.5 * dt
+        valid_seconds += dt
+    if valid_seconds <= 0:
+        return None, 0.0
+    return energy_ws / 3600.0, valid_seconds
+
+
+def battery_energy_delta_wh(
+    rows: list[dict[str, Any]],
+    *,
+    max_gap_seconds: float,
+) -> float | None:
+    # Only use a contiguous all-discharging segment. A charging/suspend/gap event
+    # makes the endpoint delta untrustworthy for this arm.
+    if len(rows) < 2:
+        return None
+    for previous, current in zip(rows, rows[1:], strict=False):
+        if _valid_interval(previous, current, max_gap_seconds=max_gap_seconds) is None:
+            return None
+    first = rows[0].get("battery_energy_wh")
+    last = rows[-1].get("battery_energy_wh")
+    if not isinstance(first, (int, float)) or not isinstance(last, (int, float)):
+        return None
+    delta = float(first) - float(last)
+    return delta if delta >= 0 else None
+
+
+def measurement_energy_summary(
+    rows: list[dict[str, Any]],
+    *,
+    max_gap_seconds: float,
+    max_consistency_ratio: float = 0.35,
+    max_consistency_abs_wh: float = 0.05,
+) -> dict[str, Any]:
+    integrated, valid_seconds = integrate_battery_energy_wh(
+        rows,
+        max_gap_seconds=max_gap_seconds,
+    )
+    delta = battery_energy_delta_wh(rows, max_gap_seconds=max_gap_seconds)
+    error_wh = None
+    error_ratio = None
+    consistency_status = "UNAVAILABLE"
+    quality = "OK"
+
+    if integrated is None:
+        quality = "DATA_QUALITY_FAILURE"
+        consistency_status = "NO_INTEGRATED_ENERGY"
+    elif delta is None or delta == 0:
+        # A coarse fuel gauge can legitimately stay flat during a short arm.
+        # Treat power integration as usable but record that endpoint consistency
+        # could not be checked. Stage A gauge characterization determines how
+        # long future arms must be before endpoint delta is required.
+        consistency_status = "UNAVAILABLE_OR_QUANTIZED"
+    else:
+        error_wh = abs(integrated - delta)
+        error_ratio = error_wh / max(integrated, delta, 1e-9)
+        if error_wh > max_consistency_abs_wh and error_ratio > max_consistency_ratio:
+            quality = "DATA_QUALITY_FAILURE"
+            consistency_status = "MISMATCH"
+        else:
+            consistency_status = "CONSISTENT"
+
+    return {
+        "integrated_energy_wh": integrated,
+        "battery_energy_delta_wh": delta,
+        "consistency_error_wh": error_wh,
+        "consistency_error_ratio": error_ratio,
+        "consistency_status": consistency_status,
+        "energy_valid_seconds": valid_seconds,
+        "data_quality": quality,
+    }
+
+
+def _minimum_positive_step(values: list[float]) -> float | None:
+    steps = sorted(
+        {
+            round(abs(right - left), 9)
+            for left, right in zip(values, values[1:], strict=False)
+            if right != left
+        }
+    )
+    return steps[0] if steps else None
+
+
+def _median_change_cadence(
+    rows: list[dict[str, Any]],
+    key: str,
+) -> float | None:
+    changed_at: list[float] = []
+    previous_value: Any = object()
+    for row in rows:
+        value = row.get(key)
+        if not isinstance(value, (int, float)):
+            continue
+        if value != previous_value:
+            changed_at.append(float(row["ts"]))
+            previous_value = value
+    intervals = [
+        right - left
+        for left, right in zip(changed_at, changed_at[1:], strict=False)
+        if right > left
+    ]
+    return statistics.median(intervals) if intervals else None
+
+
+def characterize_battery_gauge(
+    rows: list[dict[str, Any]],
+    *,
+    expected_power_w: float | None = None,
+    energy_quantum_multiplier: float = 8.0,
+) -> dict[str, Any]:
+    energy_values = [
+        float(row["battery_energy_wh"])
+        for row in rows
+        if isinstance(row.get("battery_energy_wh"), (int, float))
+    ]
+    power_values = [
+        float(row["battery_power_w"])
+        for row in rows
+        if isinstance(row.get("battery_power_w"), (int, float))
+    ]
+    quantum = _minimum_positive_step(energy_values)
+    power_quantum = _minimum_positive_step(power_values)
+    energy_cadence = _median_change_cadence(rows, "battery_energy_wh")
+    power_cadence = _median_change_cadence(rows, "battery_power_w")
+    minimum_arm_seconds = None
+    if (
+        quantum is not None
+        and isinstance(expected_power_w, (int, float))
+        and float(expected_power_w) > 0
+    ):
+        minimum_arm_seconds = quantum * energy_quantum_multiplier / float(expected_power_w) * 3600.0
+    return {
+        "energy_quantum_wh": quantum,
+        "power_quantum_w": power_quantum,
+        "energy_update_cadence_seconds": energy_cadence,
+        "power_update_cadence_seconds": power_cadence,
+        "observed_energy_points": len(energy_values),
+        "observed_power_points": len(power_values),
+        "energy_quantum_multiplier": energy_quantum_multiplier,
+        "minimum_arm_seconds_from_quantum": minimum_arm_seconds,
+    }
+
+
+def assess_measurement_trust(
+    rows: list[dict[str, Any]],
+    *,
+    min_samples: int,
+    min_observation_seconds: float,
+    configured_min_arm_seconds: float,
+    energy_quantum_multiplier: float,
+    max_gap_seconds: float,
+) -> dict[str, Any]:
+    discharge = [
+        row
+        for row in rows
+        if row.get("battery_status") == "Discharging"
+        and isinstance(row.get("battery_power_w"), (int, float))
+        and isinstance(row.get("battery_energy_wh"), (int, float))
+        and not row.get("resume_grace")
+    ]
+    powers = [float(row["battery_power_w"]) for row in discharge]
+    expected_power = statistics.fmean(powers) if powers else None
+    gauge = characterize_battery_gauge(
+        discharge,
+        expected_power_w=expected_power,
+        energy_quantum_multiplier=energy_quantum_multiplier,
+    )
+    observed_seconds = (
+        float(discharge[-1]["ts"]) - float(discharge[0]["ts"]) if len(discharge) >= 2 else 0.0
+    )
+    energy_summary = measurement_energy_summary(
+        discharge,
+        max_gap_seconds=max_gap_seconds,
+    )
+    quantum_arm = gauge.get("minimum_arm_seconds_from_quantum")
+    recommended_min_arm_seconds = max(
+        configured_min_arm_seconds,
+        float(quantum_arm) if isinstance(quantum_arm, (int, float)) else 0.0,
+    )
+
+    reasons: list[str] = []
+    if len(discharge) < min_samples:
+        reasons.append("insufficient_discharging_samples")
+    if observed_seconds < min_observation_seconds:
+        reasons.append("insufficient_observation_duration")
+    if not isinstance(expected_power, (int, float)) or expected_power <= 0:
+        reasons.append("missing_battery_power")
+    if gauge.get("energy_quantum_wh") is None:
+        reasons.append("battery_energy_quantum_not_observed")
+    if gauge.get("minimum_arm_seconds_from_quantum") is None:
+        reasons.append("minimum_arm_duration_not_resolved")
+    if energy_summary.get("data_quality") != "OK":
+        reasons.append("battery_energy_measurement_quality_failed")
+
+    return {
+        "status": "READY" if not reasons else "BLOCKED",
+        "reasons": reasons,
+        "sample_count": len(discharge),
+        "observation_seconds": observed_seconds,
+        "expected_power_w": expected_power,
+        "configured_min_arm_seconds": configured_min_arm_seconds,
+        "recommended_min_arm_seconds": recommended_min_arm_seconds,
+        "gauge": gauge,
+        "energy_quality": energy_summary,
+    }
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _read_number(path: Path, divisor: float = 1.0) -> float | None:
+    value = _read_text(path)
+    if value is None:
+        return None
+    try:
+        return float(value) / divisor
+    except ValueError:
+        return None
+
+
+@dataclass
+class MinimalMeter:
+    sys_root: Path = Path("/sys")
+
+    def sample(self) -> dict[str, Any]:
+        battery = battery_directory(self.sys_root)
+        if battery is None:
+            raise RuntimeError("battery sysfs directory is unavailable")
+        power = _read_number(battery / "power_now", 1_000_000.0)
+        if power is not None:
+            power = abs(power)
+        return {
+            "ts": time.time(),
+            "battery_status": _read_text(battery / "status"),
+            "battery_power_w": power,
+            "battery_energy_wh": _read_number(battery / "energy_now", 1_000_000.0),
+        }

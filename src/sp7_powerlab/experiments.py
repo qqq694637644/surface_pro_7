@@ -10,7 +10,8 @@ from jsonschema import Draft202012Validator
 
 from .config import Config, load_machine
 from .envelopes import EnvelopeRegistry, snapshot_matches_envelope
-from .evaluation import compare_candidate, summarize_block
+from .evaluation import compare_arm_constraints, summarize_block
+from .evidence import EvidenceEngine, build_crossover_episode, hard_strata_key
 from .storage import Database
 from .waste import brightness_bucket, remote_bucket
 
@@ -33,11 +34,39 @@ class TrialManager:
         self.db = db
         self.registry = registry
         self.actuator = actuator
+        self.evidence = EvidenceEngine(config, db)
 
-    def _default_validation(self) -> dict[str, Any]:
+    def _default_validation(self, current_sample: dict[str, Any]) -> dict[str, Any]:
+        configured_min = float(self.config.get("experiments.min_block_seconds", 300.0))
+        measurement_trust = self.db.get_meta("measurement_trust", {})
+        gauge_min = (
+            float(measurement_trust.get("recommended_min_arm_seconds") or 0.0)
+            if isinstance(measurement_trust, dict)
+            else 0.0
+        )
+        evidence_epoch = self.db.active_evidence_epoch()
+        arm = self.evidence.recommended_arm_seconds(
+            evidence_epoch_id=(evidence_epoch or {}).get("epoch_id"),
+            strata_key=hard_strata_key(current_sample),
+            configured_min_seconds=configured_min,
+            gauge_min_seconds=gauge_min,
+        )
         return {
-            "min_block_seconds": float(self.config.get("experiments.min_block_seconds", 300.0)),
-            "settle_seconds": float(self.config.get("experiments.settle_seconds", 60.0)),
+            "min_block_seconds": float(arm["recommended_min_arm_seconds"]),
+            "min_block_components": arm,
+            "settle_min_seconds": float(self.config.get("experiments.settle_min_seconds", 30.0)),
+            "settle_max_seconds": float(self.config.get("experiments.settle_max_seconds", 300.0)),
+            "settle_min_samples": int(self.config.get("experiments.settle_min_samples", 3)),
+            "settle_window_seconds": float(
+                self.config.get("experiments.settle_window_seconds", 30.0)
+            ),
+            "settle_max_temp_slope_c_per_min": float(
+                self.config.get("experiments.settle_max_temp_slope_c_per_min", 1.0)
+            ),
+            "settle_max_rapl_range_w": float(
+                self.config.get("experiments.settle_max_rapl_range_w", 1.5)
+            ),
+            "settle_max_cpu_psi": float(self.config.get("experiments.settle_max_cpu_psi", 5.0)),
             "max_gap_seconds": float(self.config.get("collector.max_gap_seconds", 45.0)),
             "max_brightness_delta": float(
                 self.config.get("experiments.max_brightness_delta", 10.0)
@@ -73,8 +102,12 @@ class TrialManager:
             )
         ]
 
-    def _validation_for_proposal(self, proposal: dict[str, Any]) -> dict[str, Any]:
-        effective = self._default_validation()
+    def _validation_for_proposal(
+        self,
+        proposal: dict[str, Any],
+        current_sample: dict[str, Any],
+    ) -> dict[str, Any]:
+        effective = self._default_validation(current_sample)
         if proposal.get("candidate_envelope"):
             effective["min_block_seconds"] = max(
                 float(effective["min_block_seconds"]),
@@ -181,7 +214,7 @@ class TrialManager:
             candidate = self.registry.candidate_from_named(str(proposal["candidate_envelope"]))
         else:
             candidate = self.registry.candidate_from_change(baseline, dict(proposal["changes"]))
-        validation = self._validation_for_proposal(proposal)
+        validation = self._validation_for_proposal(proposal, current_sample)
         target = {
             "battery_epoch": current_sample.get("battery_epoch"),
             "brightness_bucket": brightness_bucket(current_sample.get("brightness_pct")),
@@ -205,6 +238,7 @@ class TrialManager:
             "created_ts": time.time(),
         }
         self.db.create_trial(trial)
+        self._record_frontier_status(trial, "TESTING")
         return self.db.get_trial(trial["trial_id"]) or trial
 
     def _entry_comparable(
@@ -340,6 +374,34 @@ class TrialManager:
         )
         return self.db.get_trial(trial["trial_id"]) or trial
 
+    def _record_frontier_status(
+        self,
+        trial: dict[str, Any],
+        status: str,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        candidate_key = str(trial.get("candidate", {}).get("content_hash") or "")
+        if not candidate_key:
+            return
+        epoch = self.db.active_evidence_epoch()
+        previous = self.db.candidate_frontier_entry(candidate_key) or {}
+        if previous.get("evidence_epoch_id") != (epoch or {}).get("epoch_id"):
+            previous = {}
+        attempts = int(previous.get("attempts") or 0)
+        if status == "TESTING":
+            attempts += 1
+        self.db.upsert_candidate_frontier(
+            {
+                "candidate_key": candidate_key,
+                "evidence_epoch_id": (epoch or {}).get("epoch_id"),
+                "baseline_envelope": str(trial.get("baseline_envelope") or ""),
+                "status": status,
+                "attempts": attempts,
+                "updated_ts": time.time(),
+                "result": result or {},
+            }
+        )
+
     def _apply_candidate(self, trial: dict[str, Any]) -> bool:
         before: dict[str, Any] | None = None
         try:
@@ -421,6 +483,68 @@ class TrialManager:
             arm_start_ts=ts,
         )
 
+    def _settling_status(
+        self,
+        trial: dict[str, Any],
+        sample: dict[str, Any],
+    ) -> tuple[bool, str | None]:
+        validation = trial.get("validation") or {}
+        start = float(trial.get("arm_start_ts") or sample["ts"])
+        elapsed = float(sample["ts"]) - start
+        minimum = float(validation.get("settle_min_seconds", 30.0))
+        maximum = float(validation.get("settle_max_seconds", 300.0))
+        if elapsed >= maximum:
+            return False, "settling timeout"
+        if elapsed < minimum:
+            return False, None
+
+        arm = str(trial.get("current_arm") or "")
+        expected = (
+            trial.get("candidate")
+            if arm.startswith("B")
+            else self.registry.get(str(trial.get("baseline_envelope") or ""))
+        )
+        if not isinstance(expected, dict):
+            return False, "expected envelope is unavailable during settling"
+        try:
+            snapshot = self.actuator.snapshot()
+        except Exception as exc:
+            return False, f"cannot read HWP state during settling: {exc}"
+        if not snapshot_matches_envelope(snapshot, expected):
+            return False, None
+
+        slope = sample.get("temp_slope_c_per_min")
+        if isinstance(slope, (int, float)) and abs(float(slope)) > float(
+            validation.get("settle_max_temp_slope_c_per_min", 1.0)
+        ):
+            return False, None
+        cpu_psi = sample.get("cpu_psi")
+        if isinstance(cpu_psi, (int, float)) and float(cpu_psi) > float(
+            validation.get("settle_max_cpu_psi", 5.0)
+        ):
+            return False, None
+
+        minimum_samples = int(validation.get("settle_min_samples", 3))
+        if minimum_samples <= 0:
+            return True, None
+        window_seconds = float(validation.get("settle_window_seconds", 30.0))
+        rows = self.db.samples_between(
+            max(start, float(sample["ts"]) - window_seconds),
+            float(sample["ts"]),
+            trial_id=trial["trial_id"],
+            trial_arm=arm,
+        )
+        rapl = [
+            float(row["rapl_power_10s_w"])
+            for row in rows
+            if isinstance(row.get("rapl_power_10s_w"), (int, float))
+        ]
+        if len(rapl) < minimum_samples:
+            return False, None
+        if max(rapl) - min(rapl) > float(validation.get("settle_max_rapl_range_w", 1.5)):
+            return False, None
+        return True, None
+
     def _block_rows(self, trial: dict[str, Any], sample_ts: float) -> list[dict[str, Any]]:
         arm = str(trial.get("current_arm") or "")
         start = float(trial.get("arm_start_ts") or sample_ts)
@@ -438,27 +562,34 @@ class TrialManager:
         summary = summarize_block(
             rows,
             max_gap_seconds=float(validation.get("max_gap_seconds", 45.0)),
+            max_consistency_ratio=float(
+                self.config.get("evidence.max_energy_consistency_ratio", 0.35)
+            ),
+            max_consistency_abs_wh=float(
+                self.config.get("evidence.max_energy_consistency_abs_wh", 0.05)
+            ),
         )
         if float(summary.get("valid_seconds") or 0.0) < float(
             validation.get("min_block_seconds", 300.0)
         ):
             return None
 
-        block = {
-            "block_id": f"block-{uuid.uuid4().hex[:12]}",
+        measurement = {
+            "arm_id": f"arm-{uuid.uuid4().hex[:12]}",
             "trial_id": trial["trial_id"],
             "arm": trial["current_arm"],
+            "role": ("candidate" if str(trial["current_arm"]).startswith("B") else "baseline"),
             "start_ts": float(trial["arm_start_ts"]),
             "end_ts": sample_ts,
             "brightness_bucket": int((trial.get("target") or {}).get("brightness_bucket", -1)),
             "demand_region": (trial.get("target") or {}).get("demand_region"),
             **summary,
         }
-        self.db.add_trial_block(block)
-        return block
+        self.db.add_arm_measurement(measurement)
+        return measurement
 
     def _evaluate(self, trial: dict[str, Any], *, stage: str) -> dict[str, Any]:
-        blocks = self.db.trial_blocks(trial["trial_id"])
+        measurements = self.db.arm_measurements(trial["trial_id"])
         if stage == "initial":
             baseline_arms = {"A1", "A2"}
             candidate_arms = {"B1"}
@@ -467,10 +598,10 @@ class TrialManager:
             candidate_arms = {"B2"}
         else:
             raise TrialError(f"unknown evaluation stage: {stage}")
-        baseline = [block for block in blocks if str(block["arm"]) in baseline_arms]
-        candidate = [block for block in blocks if str(block["arm"]) in candidate_arms]
+        baseline = [item for item in measurements if str(item["arm"]) in baseline_arms]
+        candidate = [item for item in measurements if str(item["arm"]) in candidate_arms]
         validation = trial.get("validation") or {}
-        result = compare_candidate(
+        result = compare_arm_constraints(
             baseline,
             candidate,
             min_power_saving_w=float(validation.get("min_power_saving_w", 0.10)),
@@ -480,6 +611,83 @@ class TrialManager:
             max_media_drop=float(validation.get("max_media_drop", 0.05)),
             max_sustained_compute_delta=float(validation.get("max_sustained_compute_delta", 0.10)),
         )
+        hard_reasons = [
+            reason for reason in (result.get("reasons") or []) if reason != "power_saving_too_small"
+        ]
+        evidence_epoch = self.db.active_evidence_epoch() or {}
+        candidate_key = str(trial["candidate"].get("content_hash") or "")
+        episode = build_crossover_episode(
+            trial_id=trial["trial_id"],
+            candidate_key=candidate_key,
+            stage=stage,
+            arm_measurements=measurements,
+            evidence_epoch_id=evidence_epoch.get("epoch_id"),
+            constraint_reasons=hard_reasons,
+        )
+        self.db.add_crossover_episode(episode)
+
+        strata_source = {
+            **(trial.get("target") or {}),
+            "current_envelope": trial.get("baseline_envelope"),
+        }
+        useful_effect = self.evidence.minimum_useful_effect(
+            evidence_epoch_id=episode.get("evidence_epoch_id"),
+            strata_key=hard_strata_key(strata_source),
+        )
+        minimum_useful_effect_w = float(useful_effect["minimum_useful_effect_w"])
+        if stage == "initial":
+            evidence_result = self.evidence.provisional(
+                episode,
+                minimum_useful_effect_w=minimum_useful_effect_w,
+            )
+        else:
+            independent = self.evidence.provisional(
+                episode,
+                minimum_useful_effect_w=minimum_useful_effect_w,
+            )
+            if independent["verdict"] != "PROVISIONAL_WIN":
+                evidence_result = independent
+                self.db.add_evidence_decision(
+                    {
+                        "decision_id": f"ed-{uuid.uuid4().hex[:12]}",
+                        "trial_id": trial["trial_id"],
+                        "candidate_key": candidate_key,
+                        "evidence_epoch_id": episode.get("evidence_epoch_id"),
+                        "verdict": independent["verdict"],
+                        "minimum_useful_effect_w": minimum_useful_effect_w,
+                        "median_effect_w": episode.get("paired_effect_w"),
+                        "direction_consistency": (
+                            1.0
+                            if isinstance(episode.get("paired_effect_w"), (int, float))
+                            and float(episode["paired_effect_w"]) < 0
+                            else 0.0
+                        ),
+                        "evidence_count": 1,
+                        "episode_ids": [episode["episode_id"]],
+                        "reasons": [
+                            *(independent.get("reasons") or []),
+                            "revalidation_must_independently_win",
+                        ],
+                        "created_ts": time.time(),
+                    }
+                )
+            else:
+                evidence_result = self.evidence.decide(
+                    self.db.candidate_crossover_episodes(
+                        candidate_key,
+                        evidence_epoch_id=episode.get("evidence_epoch_id"),
+                    ),
+                    minimum_useful_effect_w=minimum_useful_effect_w,
+                    trial_id=trial["trial_id"],
+                    candidate_key=candidate_key,
+                    evidence_epoch_id=episode.get("evidence_epoch_id"),
+                )
+        result = {
+            **result,
+            **evidence_result,
+            "crossover_episode": episode,
+            "minimum_useful_effect": useful_effect,
+        }
         feedback = [
             item
             for item in self.db.recent_feedback(100)
@@ -489,7 +697,7 @@ class TrialManager:
         if negative:
             result = {
                 **result,
-                "verdict": "REJECT",
+                "verdict": "LOSE",
                 "reasons": [*(result.get("reasons") or []), "negative_user_feedback"],
                 "negative_feedback": negative,
             }
@@ -497,16 +705,49 @@ class TrialManager:
         self.db.add_trial_result(trial["trial_id"], stage, result["verdict"], result)
         return result
 
+    def _finish_nonwinner(
+        self,
+        trial: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self._restore_baseline(trial):
+            return self._fail_trial(trial, "trial ended but baseline restore failed")
+        verdict = str(result.get("verdict") or "INCONCLUSIVE")
+        state = {
+            "PRACTICALLY_EQUIVALENT": "EQUIVALENT",
+            "INCONCLUSIVE": "INCONCLUSIVE",
+        }.get(verdict, "REJECTED")
+        self.db.update_trial(
+            trial["trial_id"],
+            state=state,
+            current_arm=None,
+            arm_start_ts=None,
+            result=result,
+        )
+        if state == "REJECTED":
+            self.db.add_rejection(
+                f"trial:{trial['baseline_envelope']}:{trial['candidate'].get('content_hash')}",
+                "; ".join(result.get("reasons") or ["candidate lost"]),
+                result,
+            )
+        frontier_status = {
+            "EQUIVALENT": "PRACTICALLY_EQUIVALENT",
+            "INCONCLUSIVE": "INCONCLUSIVE",
+            "REJECTED": "LOSE",
+        }[state]
+        self._record_frontier_status(trial, frontier_status, result)
+        return self.db.get_trial(trial["trial_id"]) or trial
+
     def _pause_for_window(self, trial: dict[str, Any], reason: str) -> dict[str, Any]:
         arm = str(trial.get("current_arm") or "")
         if arm.startswith("B") and not self._restore_baseline(trial):
             return self._fail_trial(trial, f"{reason}; failed to restore baseline")
         if arm in {"A3", "B2"}:
             next_state = "REVALIDATING"
-            self.db.delete_trial_blocks(trial["trial_id"], {"A3", "B2"})
+            self.db.delete_arm_measurements(trial["trial_id"], {"A3", "B2"})
         else:
             next_state = "WAITING_FOR_COMPARABLE_WINDOW"
-            self.db.delete_trial_blocks(trial["trial_id"], {"A1", "B1", "A2"})
+            self.db.delete_arm_measurements(trial["trial_id"], {"A1", "B1", "A2"})
         self.db.update_trial(
             trial["trial_id"],
             state=next_state,
@@ -616,8 +857,10 @@ class TrialManager:
             return trial
 
         if trial["state"] == "SETTLING":
-            settle = float((trial.get("validation") or {}).get("settle_seconds", 60.0))
-            if float(sample["ts"]) - float(trial.get("arm_start_ts") or sample["ts"]) >= settle:
+            ready, failure = self._settling_status(trial, sample)
+            if failure:
+                return self._pause_for_window(trial, failure)
+            if ready:
                 self.db.update_trial(
                     trial["trial_id"],
                     state="MEASURING",
@@ -648,8 +891,8 @@ class TrialManager:
 
         if arm == "A2":
             result = self._evaluate(trial, stage="initial")
-            if result["verdict"] != "CANDIDATE_WINNER":
-                return self.reject(trial, result)
+            if result["verdict"] != "PROVISIONAL_WIN":
+                return self._finish_nonwinner(trial, result)
             self.db.update_trial(
                 trial["trial_id"],
                 state="REVALIDATING",
@@ -669,18 +912,18 @@ class TrialManager:
             if not self._restore_baseline(trial):
                 return self._fail_trial(trial, "failed to restore baseline after B2")
             result = self._evaluate(trial, stage="revalidation")
-            if result["verdict"] != "CANDIDATE_WINNER":
-                return self.reject(
+            if result["verdict"] != "WIN":
+                return self._finish_nonwinner(
                     trial,
                     {
-                        "verdict": "REJECT",
+                        "verdict": result["verdict"],
                         "reasons": result.get("reasons") or [],
                         "initial_result": (trial.get("result") or {}).get("initial_result"),
                         "revalidation_result": result,
                     },
                 )
             combined = {
-                "verdict": "CANDIDATE_WINNER",
+                "verdict": "WIN",
                 "initial_result": (trial.get("result") or {}).get("initial_result"),
                 "revalidation_result": result,
             }
@@ -691,6 +934,7 @@ class TrialManager:
                 arm_start_ts=None,
                 result=combined,
             )
+            self._record_frontier_status(trial, "WIN", combined)
             return self.db.get_trial(trial["trial_id"])
 
         raise TrialError(f"unknown trial arm: {arm}")

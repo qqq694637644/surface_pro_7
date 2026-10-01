@@ -8,13 +8,35 @@ import pytest
 from sp7_powerlab.storage import SCHEMA_VERSION, Database, LegacyDatabaseError
 
 
-def test_fresh_database_has_v2_schema(tmp_path: Path):
+def test_fresh_database_has_current_schema(tmp_path: Path):
     db = Database(tmp_path / "powerlab.sqlite3")
     try:
         assert db.health()["schema_version"] == SCHEMA_VERSION
         assert db.health()["samples"] == 0
     finally:
         db.close()
+
+
+def test_v2_database_fails_fast_after_plan2_breaking_schema(tmp_path: Path):
+    path = tmp_path / "powerlab.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value_json TEXT NOT NULL)")
+    conn.execute("INSERT INTO metadata(key,value_json) VALUES('schema_version','2')")
+    conn.commit()
+    conn.close()
+    with pytest.raises(LegacyDatabaseError, match="schema 2"):
+        Database(path)
+
+
+def test_v3_database_fails_fast_after_arm_measurement_schema_cleanup(tmp_path: Path):
+    path = tmp_path / "powerlab.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value_json TEXT NOT NULL)")
+    conn.execute("INSERT INTO metadata(key,value_json) VALUES('schema_version','3')")
+    conn.commit()
+    conn.close()
+    with pytest.raises(LegacyDatabaseError, match="schema 3"):
+        Database(path)
 
 
 def test_v1_database_fails_fast(tmp_path: Path):

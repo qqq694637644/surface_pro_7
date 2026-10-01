@@ -236,3 +236,35 @@ def test_reconcile_does_not_guess_between_identical_verified_envelopes(project_r
         assert controller.current_envelope() is None
     finally:
         db.close()
+
+
+def test_control_safety_state_blocks_normal_hwp_write(project_root):
+    _config, db, _registry, actuator, controller = make_controller(project_root)
+    try:
+        db.add_runtime_state(
+            "control",
+            "READ_ONLY",
+            "validated thermal safety provider is unhealthy",
+        )
+        result = controller.step(sample(), demand(), thermal())
+        assert result.read_only is True
+        assert "control safety state READ_ONLY" in result.reason
+        assert not actuator.applied
+    finally:
+        db.close()
+
+
+def test_emergency_state_still_allows_thermal_safe_preemption(project_root):
+    _config, db, _registry, actuator, controller = make_controller(project_root)
+    try:
+        db.add_runtime_state("control", "EMERGENCY", "thermal emergency")
+        result = controller.step(
+            sample(),
+            demand(),
+            thermal("THERMAL_PRESSURE"),
+        )
+        assert result.desired_envelope == "THERMAL_SAFE"
+        assert result.read_only is False
+        assert actuator.applied == ["THERMAL_SAFE"]
+    finally:
+        db.close()

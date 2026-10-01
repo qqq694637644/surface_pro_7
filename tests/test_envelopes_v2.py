@@ -95,7 +95,7 @@ def test_promoted_trial_revision_survives_static_config_reload(project_root: Pat
             battery_epoch=1,
             system_fingerprint="fp",
             calibration_version=1,
-            result={"verdict": "CANDIDATE_WINNER"},
+            result={"verdict": "WIN"},
         )
         assert promoted["revision"] == 2
         assert promoted["max_perf_pct"] == 50

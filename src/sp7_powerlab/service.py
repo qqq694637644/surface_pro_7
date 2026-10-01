@@ -24,13 +24,17 @@ from .controller import BatteryLifeController
 from .demand import DemandObserver
 from .envelopes import EnvelopeRegistry
 from .evaluation import valid_duration
-from .experiments import TrialManager
+from .evidence import NoiseTracker
+from .experiments import TrialError, TrialManager
 from .hardware import inspect_hardware, system_fingerprint, thermal_sensor_path
 from .helper import RootHelperClient
+from .lifecycle import CONTROL_ALLOWED, EMERGENCY, STABLE, LifecycleManager
+from .longterm import DriftDetector
+from .scheduler import CandidateScheduler
 from .storage import Database
 from .telemetry import TelemetryCollector
 from .thermal import ThermalObserver
-from .waste import WasteDetector, brightness_bucket, remote_bucket
+from .waste import UnexpectedPowerDetector, brightness_bucket, remote_bucket
 
 
 def fingerprint_hash(value: dict[str, Any]) -> str:
@@ -54,7 +58,9 @@ def _refresh_fingerprint_state(
     fingerprint_payload = system_fingerprint(report)
     versions = fingerprint_payload.get("versions") or {}
     control_fingerprint = {
-        key: value for key, value in fingerprint_payload.items() if key != "versions"
+        key: value
+        for key, value in fingerprint_payload.items()
+        if key not in {"versions", "kernel"}
     }
     control_fingerprint["thermald_version"] = versions.get("thermald")
     control_fingerprint["thermal_config_hash"] = fingerprint_hash(thermal_config)
@@ -65,16 +71,24 @@ def _refresh_fingerprint_state(
     changed = db.set_system_fingerprint(fp_hash, fingerprint_payload)
     if changed:
         registry.mark_verified_needs_revalidation(
-            "kernel/BIOS/HWP/thermald/calibration control fingerprint changed"
+            "BIOS/HWP/thermal-safety/calibration hard control fingerprint changed"
         )
 
-    software_versions = {key: value for key, value in versions.items() if key != "thermald"}
+    software_versions = {
+        "kernel": fingerprint_payload.get("kernel"),
+        **{key: value for key, value in versions.items() if key != "thermald"},
+    }
     previous_versions = db.get_meta("software_versions", {})
     if previous_versions and previous_versions != software_versions:
-        registry.mark_needs_revalidation(
-            {"MEDIA_EFFICIENT"},
-            "browser/media software fingerprint changed",
+        media_keys = {"firefox", "chromium", "google-chrome", "playerctl", "mesa"}
+        media_changed = any(
+            previous_versions.get(key) != software_versions.get(key) for key in media_keys
         )
+        if media_changed:
+            registry.mark_needs_revalidation(
+                {"MEDIA_EFFICIENT"},
+                "browser/media compatibility tags changed",
+            )
         db.set_meta(
             "software_version_drift",
             {
@@ -84,6 +98,7 @@ def _refresh_fingerprint_state(
             },
         )
     db.set_meta("software_versions", software_versions)
+    db.set_compatibility_tags("global", software_versions)
     return fp_hash
 
 
@@ -156,7 +171,27 @@ def prepare_stack(root: Path, config_path: Path | None = None) -> dict[str, Any]
         calibration_valid=bool((machine.get("calibration") or {}).get("valid", False)),
     )
     trials = TrialManager(config, db, registry, actuator)
-    waste = WasteDetector(config, db)
+    lifecycle = LifecycleManager(db)
+    lifecycle.synchronize_learning(
+        calibration_valid=bool((machine.get("calibration") or {}).get("valid", False))
+    )
+    lifecycle.synchronize_control(
+        calibration_valid=bool((machine.get("calibration") or {}).get("valid", False)),
+        hardware_writable=bool(report.control_capable and actuator_available),
+        thermal_provider_healthy=bool(report.thermald.get("active")),
+        core_telemetry_valid=False,
+    )
+    noise = NoiseTracker(config, db)
+    unexpected_power = UnexpectedPowerDetector(config, db)
+    drift = DriftDetector(
+        db,
+        minimum_recent_windows=int(config.get("drift.minimum_recent_windows", 8)),
+        absolute_threshold_w=float(config.get("drift.absolute_threshold_w", 0.30)),
+        relative_threshold=float(config.get("drift.relative_threshold", 0.08)),
+        noise_multiplier=float(config.get("drift.noise_multiplier", 2.0)),
+        cooldown_seconds=float(config.get("drift.cooldown_seconds", 21600.0)),
+    )
+    scheduler = CandidateScheduler(config, db, registry)
 
     return {
         "config": config,
@@ -175,7 +210,11 @@ def prepare_stack(root: Path, config_path: Path | None = None) -> dict[str, Any]
         "calibration": calibration,
         "controller": controller,
         "trials": trials,
-        "waste": waste,
+        "lifecycle": lifecycle,
+        "noise": noise,
+        "unexpected_power": unexpected_power,
+        "drift": drift,
+        "scheduler": scheduler,
     }
 
 
@@ -191,6 +230,7 @@ class PowerLabService:
         self._last_prune_ts = 0.0
         self._last_hardware_refresh_ts = time.time()
         self._last_hwp_reconcile_ts = 0.0
+        self._last_scheduler_check_ts = 0.0
         self._machine_mtime = self._mtime(self.root / "config" / "machine.toml")
         self._thermal_mtime = self._mtime(self.root / "config" / "thermal.toml")
         self._recover_interrupted_trial()
@@ -230,12 +270,10 @@ class PowerLabService:
             "service restart safety recovery",
         )
         if recovered.get("state") == "FAILED":
-            self.db.add_incident(
-                "waste",
+            self.stack["lifecycle"].set_control(
+                EMERGENCY,
+                "interrupted trial could not restore baseline",
                 {
-                    "start_ts": time.time(),
-                    "severity": "high",
-                    "reason": "interrupted trial could not restore baseline",
                     "trial_id": active["trial_id"],
                     "last_error": recovered.get("last_error"),
                 },
@@ -304,14 +342,10 @@ class PowerLabService:
         if current_errors != previous_errors:
             self.db.set_meta("hardware_runtime_errors", current_errors)
             if current_errors:
-                self.db.add_incident(
-                    "waste",
-                    {
-                        "start_ts": ts,
-                        "severity": "high",
-                        "reason": "runtime hardware/control ownership degraded",
-                        "errors": current_errors,
-                    },
+                self.stack["lifecycle"].set_control(
+                    "DEGRADED",
+                    "runtime hardware/control ownership degraded",
+                    {"errors": current_errors},
                 )
         self.stack["fingerprint"] = _refresh_fingerprint_state(
             db=self.db,
@@ -338,6 +372,28 @@ class PowerLabService:
             self._sync_machine(load_machine(self.root))
             self._machine_mtime = self._mtime(self.root / "config" / "machine.toml")
         return epoch
+
+    def _sync_evidence_epoch(self, battery_epoch: int) -> str:
+        calibration_version = int(
+            (self.stack["machine"].get("calibration") or {}).get("version") or 0
+        )
+        semantics_version = int(self.config.get("evidence.semantics_version", 1))
+        payload = {
+            "hard_control_fingerprint": self.stack["fingerprint"],
+            "battery_epoch": battery_epoch,
+            "calibration_version": calibration_version,
+            "evidence_semantics_version": semantics_version,
+            "compatibility_tags": self.db.active_compatibility_tags("global"),
+        }
+        epoch_id = self.db.ensure_evidence_epoch(
+            hard_identity_hash=str(self.stack["fingerprint"]),
+            battery_epoch=battery_epoch,
+            calibration_version=calibration_version,
+            evidence_semantics_version=semantics_version,
+            payload=payload,
+        )
+        self.stack["evidence_epoch"] = epoch_id
+        return epoch_id
 
     def _rollup(self, bucket: float, end_ts: float) -> dict[str, Any] | None:
         rows = self.db.samples_between(bucket, end_ts)
@@ -366,9 +422,15 @@ class PowerLabService:
             "brightness_bucket": brightness_bucket(_median(brightness)),
             "demand_region": (next(iter(demand_regions)) if len(demand_regions) == 1 else "MIXED"),
             "media_playing": bool(last.get("media_playing")),
+            "user_active": bool(last.get("user_active")),
             "remote_bucket": remote_bucket(last.get("remote_hint")),
             "thermal_start": first.get("thermal_state"),
             "system_fingerprint": self.stack["fingerprint"],
+            "current_envelope": last.get("current_envelope"),
+            "trial_id": next(
+                (row.get("trial_id") for row in rows if row.get("trial_id")),
+                None,
+            ),
             "valid_seconds": valid_duration(
                 rows,
                 float(self.config.get("collector.max_gap_seconds", 45.0)),
@@ -379,10 +441,129 @@ class PowerLabService:
             **summary,
         }
         self.db.add_rollup(rollup)
-        incident = self.stack["waste"].detect(rollup)
+        evidence_epoch = self.db.active_evidence_epoch()
+        if evidence_epoch:
+            self.stack["noise"].observe_rollup(
+                rollup,
+                evidence_epoch_id=str(evidence_epoch["epoch_id"]),
+            )
+            drift_event = self.stack["drift"].detect(
+                rollup,
+                evidence_epoch_id=str(evidence_epoch["epoch_id"]),
+            )
+            if drift_event:
+                event_id = self.db.add_unexpected_power_event(drift_event)
+                self.stack["lifecycle"].start_investigation(
+                    event_id=event_id,
+                    payload={
+                        "trigger": "SUSTAINED_DRIFT",
+                        "event": drift_event,
+                    },
+                )
+                self.stack["collector"].trigger_diagnostic_burst()
+        incident = self.stack["unexpected_power"].detect(rollup)
         if incident:
-            self.db.add_incident("waste", incident)
+            event_id = self.db.add_unexpected_power_event(incident)
+            self.stack["lifecycle"].start_investigation(
+                event_id=event_id,
+                payload={
+                    "trigger": "UNEXPECTED_POWER",
+                    "event": incident,
+                },
+            )
+            self.stack["collector"].trigger_diagnostic_burst()
         return rollup
+
+    def _configure_telemetry_mode(self) -> None:
+        if self.db.active_trial() or self.db.active_calibration():
+            self.stack["collector"].set_runtime_mode("TRIAL")
+        elif self.stack["lifecycle"].learning_state() == STABLE:
+            self.stack["collector"].set_runtime_mode("STABLE")
+        else:
+            self.stack["collector"].set_runtime_mode("NORMAL")
+        if self.db.active_investigation():
+            self.stack["collector"].trigger_diagnostic_burst()
+
+    def _maybe_start_autonomous_trial(
+        self,
+        sample: dict[str, Any],
+        controller_decision: Any,
+        *,
+        had_active_trial: bool,
+    ) -> dict[str, Any] | None:
+        if had_active_trial or self.db.active_trial() or self.db.active_calibration():
+            return None
+        if int(self.config.get("automation.level", 0)) < 3:
+            return None
+        if self.stack["lifecycle"].control_state() != CONTROL_ALLOWED:
+            return None
+        if bool(getattr(controller_decision, "read_only", True)):
+            return None
+        if getattr(controller_decision, "action", None) != "NO_CHANGE":
+            return None
+        baseline = getattr(controller_decision, "applied_envelope", None)
+        desired = getattr(controller_decision, "desired_envelope", None)
+        if not baseline or baseline != desired:
+            return None
+
+        now = float(sample["ts"])
+        check_seconds = float(self.config.get("scheduler.check_seconds", 60.0))
+        if now - self._last_scheduler_check_ts < check_seconds:
+            return None
+        self._last_scheduler_check_ts = now
+
+        result = self.stack["scheduler"].candidates(
+            baseline_name=str(baseline),
+        )
+        candidates = result.get("candidates") or []
+        if not result.get("eligible") or not candidates:
+            return None
+
+        trial_sample = {**sample, "current_envelope": baseline}
+        try:
+            trial = self.stack["trials"].start(candidates[0]["proposal"], trial_sample)
+        except TrialError as exc:
+            self.db.set_meta(
+                "last_autonomous_trial_error",
+                {
+                    "ts": now,
+                    "baseline": baseline,
+                    "candidate": candidates[0].get("candidate_key"),
+                    "error": str(exc),
+                },
+            )
+            return None
+        self.db.set_meta(
+            "last_autonomous_trial_start",
+            {
+                "ts": now,
+                "trial_id": trial.get("trial_id"),
+                "baseline": baseline,
+                "candidate": candidates[0].get("candidate_key"),
+            },
+        )
+        return trial
+
+    def _maybe_auto_promote(self, trial: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not trial or trial.get("state") != "VERIFIED_WINNER":
+            return trial
+        if int(self.config.get("automation.level", 0)) < 4:
+            return trial
+        if not bool(self.config.get("automation.auto_promote", False)):
+            return trial
+        try:
+            self.stack["trials"].promote(str(trial["trial_id"]))
+        except TrialError as exc:
+            self.db.set_meta(
+                "last_auto_promotion_error",
+                {
+                    "ts": time.time(),
+                    "trial_id": trial["trial_id"],
+                    "error": str(exc),
+                },
+            )
+            return trial
+        return self.db.get_trial(str(trial["trial_id"]))
 
     def _maybe_rollup(self, sample: dict[str, Any]) -> None:
         seconds = float(self.config.get("collector.rollup_seconds", 60.0))
@@ -417,19 +598,17 @@ class PowerLabService:
 
     def step(self) -> dict[str, Any]:
         self._refresh_runtime_files()
+        self._configure_telemetry_mode()
         sample = self.stack["collector"].sample()
         self._refresh_hardware_contract(float(sample["ts"]))
         self._reconcile_hwp(float(sample["ts"]), "periodic runtime reconcile")
         epoch = self._battery_epoch(sample)
+        evidence_epoch = self._sync_evidence_epoch(epoch)
         demand = self.stack["demand"].observe(sample)
         thermal = self.stack["thermal"].observe(sample)
 
         trial_before = self.db.active_trial()
-        trial_arm = (
-            trial_before.get("current_arm")
-            if trial_before and trial_before.get("state") == "MEASURING"
-            else None
-        )
+        trial_arm = trial_before.get("current_arm") if trial_before else None
         sample.update(
             {
                 "battery_epoch": epoch,
@@ -444,7 +623,23 @@ class PowerLabService:
                 "thermal_override": thermal["state"] in {"THERMAL_PRESSURE", "THROTTLING"},
                 "trial_id": trial_before.get("trial_id") if trial_before else None,
                 "trial_arm": trial_arm,
+                "evidence_epoch": evidence_epoch,
             }
+        )
+        self.stack["lifecycle"].synchronize_learning(
+            calibration_valid=bool(
+                (self.stack["machine"].get("calibration") or {}).get("valid", False)
+            )
+        )
+        self.stack["lifecycle"].synchronize_control(
+            calibration_valid=bool(
+                (self.stack["machine"].get("calibration") or {}).get("valid", False)
+            ),
+            hardware_writable=bool(self.stack["controller"].hardware_writable),
+            thermal_provider_healthy=bool(sample.get("thermald_active")),
+            core_telemetry_valid=self.stack["trials"]._core_telemetry_valid(sample),
+            rollback_integrity_ok=bool(self.stack["controller"].hardware_writable),
+            thermal_emergency=thermal["state"] in {"THERMAL_PRESSURE", "THROTTLING"},
         )
         self.db.add_sample(sample)
         self.db.add_demand_window(demand)
@@ -459,19 +654,27 @@ class PowerLabService:
                 self.db.get_meta("last_media_decode_incident_ts", 0.0) or 0.0
             )
             if sample["ts"] - last_media_incident >= 900:
-                self.db.add_incident(
-                    "waste",
-                    {
-                        "start_ts": sample["ts"],
-                        "severity": "medium",
-                        "reason": "suspected media software decode / media CPU regression",
-                        "battery_power_w": sample.get("battery_power_w"),
-                        "rapl_power_60s_w": sample.get("rapl_power_60s_w"),
-                        "cpu_usage": sample.get("cpu_usage"),
-                        "gpu": sample.get("gpu"),
-                        "top_processes": sample.get("processes") or [],
+                event = {
+                    "start_ts": sample["ts"],
+                    "severity": "medium",
+                    "status": "OPEN",
+                    "classification": "UNEXPECTED_POWER",
+                    "reason": "suspected media software decode / media CPU regression",
+                    "battery_power_w": sample.get("battery_power_w"),
+                    "rapl_power_60s_w": sample.get("rapl_power_60s_w"),
+                    "cpu_usage": sample.get("cpu_usage"),
+                    "gpu": sample.get("gpu"),
+                    "top_processes": sample.get("processes") or [],
+                }
+                event_id = self.db.add_unexpected_power_event(event)
+                self.stack["lifecycle"].start_investigation(
+                    event_id=event_id,
+                    payload={
+                        "trigger": "SUSPECTED_MEDIA_DECODE_REGRESSION",
+                        "event": event,
                     },
                 )
+                self.stack["collector"].trigger_diagnostic_burst()
                 self.db.set_meta("last_media_decode_incident_ts", sample["ts"])
 
         active_cal = self.db.active_calibration()
@@ -488,7 +691,15 @@ class PowerLabService:
             )
 
         trial_after = self.stack["trials"].tick(sample)
+        trial_after = self._maybe_auto_promote(trial_after)
         decision = self.stack["controller"].step(sample, demand, thermal)
+        autonomous_trial = self._maybe_start_autonomous_trial(
+            sample,
+            decision,
+            had_active_trial=trial_before is not None,
+        )
+        if autonomous_trial is not None:
+            trial_after = autonomous_trial
 
         if sample["ts"] - self._last_prune_ts > 3600:
             retention = int(self.config.get("storage.raw_retention_days", 30))
@@ -502,6 +713,7 @@ class PowerLabService:
             "thermal": thermal,
             "trial": trial_after,
             "controller": decision.as_dict(),
+            "lifecycle": self.stack["lifecycle"].status(),
         }
 
     def run(self, *, iterations: int | None = None) -> None:
@@ -533,6 +745,7 @@ def service_status(root: Path, config_path: Path | None = None) -> dict[str, Any
             "database": stack["db"].health(),
             "current_envelope": stack["controller"].current_envelope(),
             "override": stack["controller"].override(),
+            "lifecycle": stack["lifecycle"].status(),
         }
     finally:
         stack["db"].close()

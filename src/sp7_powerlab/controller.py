@@ -133,6 +133,15 @@ class BatteryLifeController:
         sample: dict[str, Any],
         desired: str,
     ) -> str | None:
+        control_state = self.db.latest_runtime_state("control")
+        if control_state:
+            state = str(control_state.get("state") or "")
+            emergency_thermal_safe = state == "EMERGENCY" and desired == "THERMAL_SAFE"
+            if state != "CONTROL_ALLOWED" and not emergency_thermal_safe:
+                return (
+                    f"control safety state {state}: "
+                    f"{control_state.get('reason') or 'control disabled'}"
+                )
         required = {
             "battery_power_w": sample.get("battery_power_w"),
             "package_temp_c": sample.get("package_temp_c"),
@@ -236,12 +245,11 @@ class BatteryLifeController:
                 failure_reason += f"; rollback integrity failure: {recovery_error}"
                 self.hardware_writable = False
                 self.db.set_meta("current_envelope", None)
-                self.db.add_incident(
-                    "waste",
+                self.db.add_runtime_state(
+                    "control",
+                    "EMERGENCY",
+                    "HWP apply failed and exact rollback could not be verified",
                     {
-                        "start_ts": now,
-                        "severity": "high",
-                        "reason": "HWP apply failed and exact rollback could not be verified",
                         "error": str(exc),
                         "rollback_error": recovery_error,
                     },

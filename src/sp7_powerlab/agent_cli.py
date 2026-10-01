@@ -101,8 +101,8 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sp7-powerlab-agent",
         description=(
-            "Narrow PowerLab agent surface: read telemetry/knowledge and submit "
-            "structured decisions. No human approval or direct HWP commands."
+            "Convenience PowerLab agent surface for telemetry/knowledge and structured "
+            "decisions. It is not a capability sandbox and exposes no direct HWP command."
         ),
     )
     sub = p.add_subparsers(dest="command", required=True)

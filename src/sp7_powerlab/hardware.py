@@ -303,6 +303,25 @@ def system_fingerprint(report: HardwareReport) -> dict[str, Any]:
         if shutil.which(binary):
             _, output = _command([binary, "--version"])
             versions[binary] = output or None
+    if shutil.which("glxinfo"):
+        code, output = _command(["glxinfo", "-B"])
+        if code == 0:
+            mesa_line = next(
+                (
+                    line.strip()
+                    for line in output.splitlines()
+                    if "Mesa" in line
+                    and (
+                        "OpenGL version string" in line
+                        or "OpenGL core profile version string" in line
+                    )
+                ),
+                None,
+            )
+            versions["mesa"] = mesa_line
+    versions["desktop"] = (
+        os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("DESKTOP_SESSION") or None
+    )
     versions["thermald"] = report.thermald.get("version")
     return {
         "product": report.product,

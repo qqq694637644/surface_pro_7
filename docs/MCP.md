@@ -1,11 +1,12 @@
 # MCP contract
 
-## Capability boundary
+## Optional structured interface
 
-PowerLab 不允许把任意 Bash、Python/code execution、主 `sp7-powerlab` CLI 或
-`/run/sp7-powerlab/helper.sock` 暴露给 LLM。
+`sp7-powerlab-agent` 是常用高层 workflow 的便利入口，不是 GPT-5.6 唯一允许使用的
+capability，也不是安全沙箱。个人使用场景可以由用户向 Agent 提供 Bash/workspace/MCP 等
+通用用户态能力。
 
-LLM/MCP 只应得到一个显式白名单工具面，后端只能调用：
+便利入口包括：
 
 ~~~bash
 sp7-powerlab-agent observe
@@ -13,11 +14,14 @@ sp7-powerlab-agent hourly
 sp7-powerlab-agent submit-decision runtime/llm-decision.json
 ~~~
 
-`scripts/mcp-hourly.sh` 也只调用这个 agent executable。agent 不接受 alternate config，
+`scripts/mcp-hourly.sh` 可以调用这个 agent executable。agent 不接受 alternate config，
 `hourly` 不接受任意 output path，`submit-decision` 只允许读取项目 `runtime/` 下的 JSON。
 
-如果一个 MCP 能以 PowerLab 用户身份执行任意命令，那么它可以直接调用人类 CLI 或
-连接同 UID 的 helper socket；此时不存在可信的“人工批准”隔离。不要这样部署。
+Automation Level 是 PowerLab daemon / Scheduler 的默认治理策略，不应被描述为对同 UID
+Bash Agent 技术上不可绕过的权限隔离。
+
+真正的硬边界仍是 root side：PowerLab 不主动提供 unrestricted root shell；root helper
+只接受有限、校验后的 HWP inspect/snapshot/apply/restore 操作。
 
 ## Decision contract
 
@@ -76,10 +80,10 @@ LLM JSON 不能表达 shell command、任意 sysfs path、thermald hard trip、k
 ID 和全部 validation/settling/通过门槛都只由本地代码与 config 生成，proposal 无权
 覆盖裁判标准。
 
-## Human approval
+## Level 2 default workflow
 
-Level 2 时，`submit-decision` 只把合法 proposal 保存到 `proposals/`，不会开始
-trial。用户审核文件后，在 LLM 不可访问的交互环境运行：
+Level 2 时，`submit-decision` 默认只把合法 proposal 保存到 `proposals/`，不会开始
+trial。常规工作流由用户审核后运行：
 
 ~~~bash
 sp7-powerlab trial start proposals/<reviewed-proposal>.json
@@ -91,7 +95,7 @@ sp7-powerlab trial start proposals/<reviewed-proposal>.json
 sp7-powerlab trial promote trial-xxxx
 ~~~
 
-PROPOSE_WASTE_FIX 和 PROPOSE_MANUAL_RECALIBRATION 只会保存成人工审核文件。
+PROPOSE_POWER_FIX 和 PROPOSE_MANUAL_RECALIBRATION 只会保存成人工审核文件。
 
 自动 trial 需要 automation level >= 3；auto promotion 还要求 level >= 4、
 auto_promote=true，而且 trial 已经是 VERIFIED_WINNER。

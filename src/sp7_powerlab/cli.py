@@ -10,13 +10,23 @@ from typing import Any
 
 from . import __version__
 from .analytics import battery_usage_summary
+from .attribution import AttributionEngine
 from .calibration import CalibrationManager
 from .config import load_config, load_machine, load_thermal_config
 from .demand import DemandObserver
 from .envelopes import EnvelopeRegistry
 from .hardware import inspect_hardware
 from .helper import RootHelperServer
+from .lifecycle import LifecycleManager
 from .llm import build_knowledge_pack
+from .longterm import (
+    StableReadiness,
+    UsageCoverage,
+    assess_net_benefit,
+    compare_meter_runs,
+)
+from .measurement import assess_measurement_trust, characterize_battery_gauge
+from .scheduler import CandidateScheduler
 from .service import PowerLabService, build_actuator, prepare_stack, service_status
 from .storage import Database, LegacyDatabaseError
 from .telemetry import TelemetryCollector
@@ -243,6 +253,446 @@ def cmd_incidents(args: argparse.Namespace) -> int:
                 )
             }
         )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_status(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        epoch = db.active_evidence_epoch()
+        coverage_days = int(config.get("stable.coverage_days", 30))
+        coverage = UsageCoverage(db).summarize(
+            since_ts=time.time() - coverage_days * 86400.0,
+            evidence_epoch_id=(epoch or {}).get("epoch_id"),
+        )
+        target = float(config.get("stable.target_trusted_fraction", 0.90))
+        emit(
+            {
+                **manager.status(),
+                "usage_coverage": coverage,
+                "stable_target_trusted_fraction": target,
+                "stable_coverage_ready": (
+                    isinstance(coverage.get("trusted_fraction"), (int, float))
+                    and float(coverage["trusted_fraction"]) >= target
+                ),
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_freeze(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        readiness = StableReadiness(config, db).assess()
+        if not readiness["ready"] and not args.force:
+            emit({"frozen": False, "readiness": readiness})
+            return 2
+        manager.freeze(args.reason)
+        emit({"frozen": True, "forced": bool(args.force), **manager.status()})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_reopen(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        manager.reopen(args.reason)
+        emit(manager.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_coverage(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        epoch = db.active_evidence_epoch()
+        days = int(args.days or config.get("stable.coverage_days", 30))
+        result = UsageCoverage(db).summarize(
+            since_ts=time.time() - days * 86400.0,
+            evidence_epoch_id=(epoch or {}).get("epoch_id"),
+        )
+        target = float(config.get("stable.target_trusted_fraction", 0.90))
+        emit(
+            {
+                "days": days,
+                "target_trusted_fraction": target,
+                "ready_for_stable_by_coverage": (
+                    isinstance(result.get("trusted_fraction"), (int, float))
+                    and float(result["trusted_fraction"]) >= target
+                ),
+                **result,
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_readiness(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        emit(StableReadiness(config, db).assess())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_optimize(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        manager.begin_optimization(args.reason)
+        emit(manager.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_validate(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        manager.begin_validation(args.reason)
+        emit(manager.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_safety_status(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        emit(
+            {
+                "control_safety_state": manager.control_state(),
+                "history": [
+                    dict(row)
+                    for row in db.conn.execute(
+                        "SELECT * FROM control_safety_history ORDER BY ts DESC LIMIT 20"
+                    )
+                ],
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_investigation_list(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        emit({"investigations": db.recent_investigations(args.limit)})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_investigation_inspect(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        item = db.investigation(args.investigation_id)
+        if not item:
+            raise SystemExit(f"investigation not found: {args.investigation_id}")
+        event = db.unexpected_power_event(str(item["event_id"])) if item.get("event_id") else None
+        emit({**item, "event": event})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_investigation_attribute(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        emit(AttributionEngine(db).attribute(args.investigation_id))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_investigation_close(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        attribution = AttributionEngine(db)
+        classification = attribution.validate_classification(args.classification)
+        payload = {
+            "reason": args.reason,
+            "local_evidence": args.evidence or [],
+            "verification_plan": args.verification or [],
+        }
+        manager = LifecycleManager(db)
+        manager.finish_investigation(
+            args.investigation_id,
+            classification=classification,
+            payload=payload,
+        )
+        emit(
+            {
+                "investigation": db.investigation(args.investigation_id),
+                "lifecycle": manager.status(),
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_unexpected_power_list(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        emit({"events": db.recent_unexpected_power_events(args.limit)})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_unexpected_power_inspect(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        event = db.unexpected_power_event(args.event_id)
+        if not event:
+            raise SystemExit(f"unexpected-power event not found: {args.event_id}")
+        emit(event)
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_evidence_status(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        epoch = db.active_evidence_epoch()
+        emit(
+            {
+                "active_evidence_epoch": epoch,
+                "compatibility_tags": db.active_compatibility_tags(),
+                "recent_decisions": db.evidence_decisions(limit=args.limit),
+                "arm_measurements": db.conn.execute(
+                    "SELECT COUNT(*) FROM arm_measurements"
+                ).fetchone()[0],
+                "crossover_episodes": db.conn.execute(
+                    "SELECT COUNT(*) FROM crossover_episodes"
+                ).fetchone()[0],
+                "frozen_references": db.conn.execute(
+                    "SELECT COUNT(*) FROM reference_baselines WHERE frozen=1"
+                ).fetchone()[0],
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_evidence_noise(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        rows = [
+            dict(row)
+            for row in db.conn.execute(
+                """SELECT updated_ts,evidence_epoch_id,strata_key,window_seconds,
+                median_power_w,mad_power_w,noise_floor_w,sample_count
+                FROM recent_noise_distributions
+                ORDER BY updated_ts DESC LIMIT ?""",
+                (args.limit,),
+            )
+        ]
+        emit({"noise": rows})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_evidence_gauge(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        since = time.time() - float(args.hours) * 3600.0
+        rows = db.recent_samples(since)
+        discharge_power = [
+            float(row["battery_power_w"])
+            for row in rows
+            if row.get("battery_status") == "Discharging"
+            and isinstance(row.get("battery_power_w"), (int, float))
+            and not row.get("resume_grace")
+        ]
+        expected_power = sum(discharge_power) / len(discharge_power) if discharge_power else None
+        emit(
+            {
+                "hours": float(args.hours),
+                "expected_power_w": expected_power,
+                **characterize_battery_gauge(
+                    rows,
+                    expected_power_w=expected_power,
+                    energy_quantum_multiplier=float(
+                        config.get("evidence.gauge_quantum_multiplier", 8.0)
+                    ),
+                ),
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_evidence_trust(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        since = time.time() - float(args.hours) * 3600.0
+        rows = db.recent_samples(since)
+        result = assess_measurement_trust(
+            rows,
+            min_samples=int(config.get("evidence.measurement_min_samples", 30)),
+            min_observation_seconds=float(
+                config.get("evidence.measurement_min_observation_seconds", 900.0)
+            ),
+            configured_min_arm_seconds=float(config.get("experiments.min_block_seconds", 300.0)),
+            energy_quantum_multiplier=float(config.get("evidence.gauge_quantum_multiplier", 8.0)),
+            max_gap_seconds=float(config.get("collector.max_gap_seconds", 45.0)),
+        )
+        record = {
+            **result,
+            "assessed_ts": time.time(),
+            "history_hours": float(args.hours),
+        }
+        db.set_meta("measurement_trust", record)
+        emit(record)
+    finally:
+        db.close()
+    return 0
+
+
+def _read_meter_jsonl(path: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    source = Path(path).expanduser()
+    for line_number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"{source}:{line_number}: invalid JSON: {exc}") from exc
+        if not isinstance(value, dict):
+            raise SystemExit(f"{source}:{line_number}: expected JSON object")
+        rows.append(value)
+    return rows
+
+
+def cmd_overhead_compare(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        reference_rows = _read_meter_jsonl(args.reference)
+        candidate_rows = _read_meter_jsonl(args.candidate)
+        result = compare_meter_runs(
+            reference_rows,
+            candidate_rows,
+            usable_battery_wh=args.usable_battery_wh,
+            max_gap_seconds=float(args.max_gap_seconds),
+        )
+        run_id = db.start_monitoring_overhead_run(
+            mode=args.mode,
+            payload={
+                "reference": str(Path(args.reference).expanduser()),
+                "candidate": str(Path(args.candidate).expanduser()),
+                "usable_battery_wh": args.usable_battery_wh,
+                "mode": args.mode,
+            },
+        )
+        db.finish_monitoring_overhead_run(run_id, result)
+        emit({"run_id": run_id, **result})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_overhead_history(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        emit({"runs": db.monitoring_overhead_runs(args.limit)})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_overhead_summary(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        emit(
+            assess_net_benefit(
+                db.monitoring_overhead_runs(args.limit),
+                practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
+            )
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def _scheduler_stack(args: argparse.Namespace):
+    config, db, registry = _registry(args)
+    registry.load()
+    return config, db, registry, CandidateScheduler(config, db, registry)
+
+
+def cmd_scheduler_status(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        emit(scheduler.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_scheduler_candidates(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        emit(
+            scheduler.candidates(
+                baseline_name=args.baseline,
+                ux_regression=bool(args.ux_regression),
+            )
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_scheduler_propose(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        emit(
+            scheduler.propose_next(
+                baseline_name=args.baseline,
+                ux_regression=bool(args.ux_regression),
+            )
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_scheduler_pause(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        scheduler.pause(args.reason)
+        emit(scheduler.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_scheduler_resume(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        scheduler.resume()
+        emit(scheduler.status())
     finally:
         db.close()
     return 0
@@ -550,6 +1000,130 @@ def parser() -> argparse.ArgumentParser:
     incidents.add_argument("--hours", type=float, default=24.0)
     incidents.add_argument("--limit", type=int, default=50)
     incidents.set_defaults(func=cmd_incidents)
+
+    lifecycle = sub.add_parser("lifecycle")
+    lifecycle_sub = lifecycle.add_subparsers(dest="lifecycle_command", required=True)
+    lifecycle_status = lifecycle_sub.add_parser("status")
+    lifecycle_status.set_defaults(func=cmd_lifecycle_status)
+    lifecycle_freeze = lifecycle_sub.add_parser("freeze")
+    lifecycle_freeze.add_argument("--reason", default="manual freeze")
+    lifecycle_freeze.add_argument("--force", action="store_true")
+    lifecycle_freeze.set_defaults(func=cmd_lifecycle_freeze)
+    lifecycle_reopen = lifecycle_sub.add_parser("reopen")
+    lifecycle_reopen.add_argument("--reason", default="manual reopen")
+    lifecycle_reopen.set_defaults(func=cmd_lifecycle_reopen)
+    lifecycle_coverage = lifecycle_sub.add_parser("coverage")
+    lifecycle_coverage.add_argument("--days", type=int)
+    lifecycle_coverage.set_defaults(func=cmd_lifecycle_coverage)
+    lifecycle_readiness = lifecycle_sub.add_parser("readiness")
+    lifecycle_readiness.set_defaults(func=cmd_lifecycle_readiness)
+    lifecycle_optimize = lifecycle_sub.add_parser("optimize")
+    lifecycle_optimize.add_argument("--reason", default="manual optimization start")
+    lifecycle_optimize.set_defaults(func=cmd_lifecycle_optimize)
+    lifecycle_validate = lifecycle_sub.add_parser("validate")
+    lifecycle_validate.add_argument("--reason", default="manual validation start")
+    lifecycle_validate.set_defaults(func=cmd_lifecycle_validate)
+
+    safety = sub.add_parser("safety")
+    safety_sub = safety.add_subparsers(dest="safety_command", required=True)
+    safety_status = safety_sub.add_parser("status")
+    safety_status.set_defaults(func=cmd_safety_status)
+
+    investigation = sub.add_parser("investigation")
+    investigation_sub = investigation.add_subparsers(
+        dest="investigation_command",
+        required=True,
+    )
+    investigation_list = investigation_sub.add_parser("list")
+    investigation_list.add_argument("--limit", type=int, default=50)
+    investigation_list.set_defaults(func=cmd_investigation_list)
+    investigation_inspect = investigation_sub.add_parser("inspect")
+    investigation_inspect.add_argument("investigation_id")
+    investigation_inspect.set_defaults(func=cmd_investigation_inspect)
+    investigation_attribute = investigation_sub.add_parser("attribute")
+    investigation_attribute.add_argument("investigation_id")
+    investigation_attribute.set_defaults(func=cmd_investigation_attribute)
+    investigation_close = investigation_sub.add_parser("close")
+    investigation_close.add_argument("investigation_id")
+    investigation_close.add_argument(
+        "classification",
+        choices=(
+            "EXPECTED_WORKLOAD_CHANGE",
+            "INSUFFICIENT_EVIDENCE",
+            "SUSPECTED_REGRESSION",
+            "ACTIONABLE_WASTE",
+            "CONFIRMED_CONFIG_REGRESSION",
+        ),
+    )
+    investigation_close.add_argument("--reason", default="")
+    investigation_close.add_argument("--evidence", action="append")
+    investigation_close.add_argument("--verification", action="append")
+    investigation_close.set_defaults(func=cmd_investigation_close)
+
+    unexpected_power = sub.add_parser("unexpected-power")
+    unexpected_power_sub = unexpected_power.add_subparsers(
+        dest="unexpected_power_command",
+        required=True,
+    )
+    unexpected_power_list = unexpected_power_sub.add_parser("list")
+    unexpected_power_list.add_argument("--limit", type=int, default=50)
+    unexpected_power_list.set_defaults(func=cmd_unexpected_power_list)
+    unexpected_power_inspect = unexpected_power_sub.add_parser("inspect")
+    unexpected_power_inspect.add_argument("event_id")
+    unexpected_power_inspect.set_defaults(func=cmd_unexpected_power_inspect)
+
+    evidence = sub.add_parser("evidence")
+    evidence_sub = evidence.add_subparsers(dest="evidence_command", required=True)
+    evidence_status = evidence_sub.add_parser("status")
+    evidence_status.add_argument("--limit", type=int, default=20)
+    evidence_status.set_defaults(func=cmd_evidence_status)
+    evidence_noise = evidence_sub.add_parser("noise")
+    evidence_noise.add_argument("--limit", type=int, default=50)
+    evidence_noise.set_defaults(func=cmd_evidence_noise)
+    evidence_gauge = evidence_sub.add_parser("gauge")
+    evidence_gauge.add_argument("--hours", type=float, default=6.0)
+    evidence_gauge.set_defaults(func=cmd_evidence_gauge)
+    evidence_trust = evidence_sub.add_parser("trust")
+    evidence_trust.add_argument("--hours", type=float, default=6.0)
+    evidence_trust.set_defaults(func=cmd_evidence_trust)
+
+    overhead = sub.add_parser("overhead")
+    overhead_sub = overhead.add_subparsers(dest="overhead_command", required=True)
+    overhead_compare = overhead_sub.add_parser("compare")
+    overhead_compare.add_argument("reference")
+    overhead_compare.add_argument("candidate")
+    overhead_compare.add_argument("--usable-battery-wh", type=float)
+    overhead_compare.add_argument("--max-gap-seconds", type=float, default=90.0)
+    overhead_compare.add_argument(
+        "--mode",
+        choices=("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB"),
+        default="MONITORING_OVERHEAD",
+    )
+    overhead_compare.set_defaults(func=cmd_overhead_compare)
+    overhead_history = overhead_sub.add_parser("history")
+    overhead_history.add_argument("--limit", type=int, default=20)
+    overhead_history.set_defaults(func=cmd_overhead_history)
+    overhead_summary = overhead_sub.add_parser("summary")
+    overhead_summary.add_argument("--limit", type=int, default=50)
+    overhead_summary.set_defaults(func=cmd_overhead_summary)
+
+    scheduler = sub.add_parser("scheduler")
+    scheduler_sub = scheduler.add_subparsers(dest="scheduler_command", required=True)
+    scheduler_status = scheduler_sub.add_parser("status")
+    scheduler_status.set_defaults(func=cmd_scheduler_status)
+    scheduler_candidates = scheduler_sub.add_parser("candidates")
+    scheduler_candidates.add_argument("baseline")
+    scheduler_candidates.add_argument("--ux-regression", action="store_true")
+    scheduler_candidates.set_defaults(func=cmd_scheduler_candidates)
+    scheduler_propose = scheduler_sub.add_parser("propose")
+    scheduler_propose.add_argument("baseline")
+    scheduler_propose.add_argument("--ux-regression", action="store_true")
+    scheduler_propose.set_defaults(func=cmd_scheduler_propose)
+    scheduler_pause = scheduler_sub.add_parser("pause")
+    scheduler_pause.add_argument("--reason", default="manual pause")
+    scheduler_pause.set_defaults(func=cmd_scheduler_pause)
+    scheduler_resume = scheduler_sub.add_parser("resume")
+    scheduler_resume.set_defaults(func=cmd_scheduler_resume)
 
     envelope = sub.add_parser("envelope")
     env_sub = envelope.add_subparsers(dest="envelope_command", required=True)

@@ -1,4 +1,4 @@
-from sp7_powerlab.evaluation import compare_candidate, summarize_block
+from sp7_powerlab.evaluation import compare_arm_constraints, summarize_block
 
 
 def row(ts, power, *, psi=0.1, thermal=0.1, playing=False):
@@ -39,8 +39,8 @@ def test_candidate_wins_only_when_power_drops_without_regressions():
     candidate = [
         {"avg_power_w": 5.1, "avg_cpu_psi": 0.3, "avg_io_psi": 0.2, "max_thermal_pressure": 0.22}
     ]
-    result = compare_candidate(baseline, candidate)
-    assert result["verdict"] == "CANDIDATE_WINNER"
+    result = compare_arm_constraints(baseline, candidate)
+    assert result["constraint_status"] == "PASS"
     assert result["power_delta_w"] < 0
 
 
@@ -51,6 +51,6 @@ def test_thermal_regression_rejects_even_if_power_is_lower():
     candidate = [
         {"avg_power_w": 4.8, "avg_cpu_psi": 0.2, "avg_io_psi": 0.2, "max_thermal_pressure": 0.5}
     ]
-    result = compare_candidate(baseline, candidate)
-    assert result["verdict"] == "REJECT"
+    result = compare_arm_constraints(baseline, candidate)
+    assert result["constraint_status"] == "VIOLATION"
     assert "thermal_regression" in result["reasons"]

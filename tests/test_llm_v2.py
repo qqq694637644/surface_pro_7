@@ -78,7 +78,10 @@ def test_pack_says_battery_power_is_primary_reward(project_root: Path):
         db.conn.commit()
         pack = build_knowledge_pack(config, db, registry)
         assert pack["rules"]["battery_power_is_primary_reward"] is True
-        assert pack["rules"]["prefer_waste_elimination_before_performance_restriction"] is True
+        assert (
+            pack["rules"]["prefer_unexpected_power_investigation_before_performance_restriction"]
+            is True
+        )
     finally:
         db.close()
 

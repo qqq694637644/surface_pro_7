@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Config
+from .evidence import hard_strata_key, robust_distribution
 from .storage import Database
 
 
@@ -19,9 +20,46 @@ def remote_bucket(remote_hint: float | None) -> int:
 
 
 @dataclass
-class WasteDetector:
+class UnexpectedPowerDetector:
     config: Config
     db: Database
+
+    def _baseline(self, rollup: dict[str, Any]) -> dict[str, Any] | None:
+        active_epoch = self.db.active_evidence_epoch()
+        strata = hard_strata_key(rollup)
+        if active_epoch:
+            frozen = self.db.reference_baseline(str(active_epoch["epoch_id"]), strata)
+            if frozen:
+                return {
+                    "source": "frozen_reference",
+                    "median_power_w": frozen.get("median_power_w"),
+                    "p90_power_w": frozen.get("p75_power_w"),
+                    "noise_floor_w": frozen.get("mad_power_w"),
+                    "sample_count": frozen.get("sample_count"),
+                }
+        min_baselines = int(self.config.get("unexpected_power.min_baselines", 8))
+        now = float(rollup["bucket_ts"])
+        window_seconds = max(
+            60.0,
+            float(self.config.get("unexpected_power.window_minutes", 5)) * 60.0,
+        )
+        current_brightness = int(rollup.get("brightness_bucket") or -1)
+        candidates = [
+            item
+            for item in self.db.recent_rollups(now - 30 * 86400, limit=5000)
+            if float(item.get("bucket_ts") or 0.0) < now - window_seconds
+            and hard_strata_key(item) == strata
+            and isinstance(item.get("avg_power_w"), (int, float))
+            and (
+                current_brightness < 0
+                or int(item.get("brightness_bucket") or -1) < 0
+                or abs(int(item.get("brightness_bucket") or -1) - current_brightness) <= 10
+            )
+        ]
+        if len(candidates) < min_baselines:
+            return None
+        stats = robust_distribution([float(item["avg_power_w"]) for item in candidates])
+        return {"source": "recent_compatible_history", **stats}
 
     def detect(self, rollup: dict[str, Any]) -> dict[str, Any] | None:
         if rollup.get("avg_power_w") is None:
@@ -30,51 +68,42 @@ class WasteDetector:
             return None
         if rollup.get("thermal_start") in {"THERMAL_PRESSURE", "THROTTLING"}:
             return None
-
-        min_baselines = int(self.config.get("controller.waste_min_baselines", 8))
-        baselines = self.db.comparable_rollups(
-            battery_epoch=int(rollup.get("battery_epoch") or 0),
-            brightness_bucket=int(rollup.get("brightness_bucket") or -1),
-            demand_region=str(rollup.get("demand_region") or "unknown"),
-            media_playing=bool(rollup.get("media_playing")),
-            remote_bucket=int(rollup.get("remote_bucket") or 0),
-            system_fingerprint=rollup.get("system_fingerprint"),
-            since_ts=float(rollup["bucket_ts"]) - 30 * 86400,
-            limit=200,
-        )
-        all_comparable = [
-            item
-            for item in baselines
-            if item.get("bucket_ts") != rollup.get("bucket_ts")
-            and isinstance(item.get("avg_power_w"), (int, float))
-        ]
-        current_ts = float(rollup["bucket_ts"])
-        window_seconds = max(
-            60.0,
-            float(self.config.get("controller.waste_window_minutes", 5)) * 60.0,
-        )
-        baseline_cutoff = current_ts - window_seconds
-        baselines = [
-            item for item in all_comparable if float(item.get("bucket_ts") or 0.0) < baseline_cutoff
-        ]
-        if len(baselines) < min_baselines:
+        if rollup.get("trial_id"):
             return None
 
-        powers = sorted(float(item["avg_power_w"]) for item in baselines)
-        p90 = powers[min(len(powers) - 1, int((len(powers) - 1) * 0.90))]
-        relative = float(self.config.get("controller.waste_relative_threshold", 0.20))
-        absolute = float(self.config.get("controller.waste_absolute_threshold_w", 0.8))
-        threshold = max(p90 * (1.0 + relative), p90 + absolute)
+        baseline = self._baseline(rollup)
+        if not baseline:
+            return None
+        center = baseline.get("median_power_w")
+        if not isinstance(center, (int, float)):
+            return None
+        relative = float(self.config.get("unexpected_power.relative_threshold", 0.20))
+        absolute = float(self.config.get("unexpected_power.absolute_threshold_w", 0.8))
+        noise = float(baseline.get("noise_floor_w") or 0.0)
+        threshold = max(
+            float(center) * (1.0 + relative),
+            float(center) + absolute,
+            float(center) + 2.0 * noise,
+        )
         current = float(rollup["avg_power_w"])
         if current <= threshold:
             return None
 
+        current_ts = float(rollup["bucket_ts"])
+        window_seconds = max(
+            60.0,
+            float(self.config.get("unexpected_power.window_minutes", 5)) * 60.0,
+        )
+        strata = hard_strata_key(rollup)
         recent = [
             item
-            for item in all_comparable
+            for item in self.db.recent_rollups(current_ts - window_seconds, limit=100)
             if float(item.get("bucket_ts") or 0.0) >= current_ts - window_seconds
-        ] + [rollup]
-        recent = sorted(recent, key=lambda item: float(item["bucket_ts"]))
+            and hard_strata_key(item) == strata
+            and isinstance(item.get("avg_power_w"), (int, float))
+        ]
+        if not any(item.get("bucket_ts") == rollup.get("bucket_ts") for item in recent):
+            recent.append(rollup)
         valid_seconds = sum(float(item.get("valid_seconds") or 0.0) for item in recent)
         high_seconds = sum(
             float(item.get("valid_seconds") or 0.0)
@@ -92,9 +121,14 @@ class WasteDetector:
             "end_ts": float(rollup["bucket_ts"])
             + float(self.config.get("collector.rollup_seconds", 60.0)),
             "severity": severity,
-            "reason": "low-demand power above personal baseline",
+            "status": "OPEN",
+            "classification": "UNEXPECTED_POWER",
+            "reason": "power above frozen/recent compatible personal reference",
             "current_power_w": current,
-            "baseline_p90_w": p90,
+            "baseline_source": baseline.get("source"),
+            "baseline_median_w": center,
+            "baseline_p90_w": baseline.get("p90_power_w"),
+            "noise_floor_w": noise,
             "threshold_w": threshold,
             "window_seconds": window_seconds,
             "window_valid_seconds": valid_seconds,
@@ -102,6 +136,7 @@ class WasteDetector:
             "demand_region": rollup.get("demand_region"),
             "brightness_bucket": rollup.get("brightness_bucket"),
             "battery_epoch": rollup.get("battery_epoch"),
+            "evidence_epoch": (self.db.active_evidence_epoch() or {}).get("epoch_id"),
             "system_fingerprint": rollup.get("system_fingerprint"),
             "avg_rapl_w": rollup.get("avg_rapl_w"),
             "max_thermal_pressure": rollup.get("max_thermal_pressure"),

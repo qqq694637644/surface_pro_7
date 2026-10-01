@@ -3,6 +3,8 @@ from __future__ import annotations
 import statistics
 from typing import Any
 
+from .measurement import measurement_energy_summary
+
 
 def percentile(values: list[float], p: float) -> float | None:
     if not values:
@@ -53,6 +55,8 @@ def summarize_block(
     rows: list[dict[str, Any]],
     *,
     max_gap_seconds: float = 45.0,
+    max_consistency_ratio: float = 0.35,
+    max_consistency_abs_wh: float = 0.05,
 ) -> dict[str, Any]:
     valid_rows = [
         row
@@ -81,6 +85,12 @@ def summarize_block(
         if isinstance(row.get("brightness_pct"), (int, float))
     ]
     duration = valid_duration(valid_rows, max_gap_seconds)
+    energy = measurement_energy_summary(
+        rows,
+        max_gap_seconds=max_gap_seconds,
+        max_consistency_ratio=max_consistency_ratio,
+        max_consistency_abs_wh=max_consistency_abs_wh,
+    )
     return {
         "sample_count": len(valid_rows),
         "valid_seconds": duration,
@@ -128,6 +138,7 @@ def summarize_block(
         "demand_regions": sorted(
             {str(row.get("demand_region")) for row in valid_rows if row.get("demand_region")}
         ),
+        **energy,
     }
 
 
@@ -158,7 +169,7 @@ def block_is_comparable(
     return not reasons, reasons
 
 
-def compare_candidate(
+def compare_arm_constraints(
     baseline_blocks: list[dict[str, Any]],
     candidate_blocks: list[dict[str, Any]],
     *,
@@ -170,7 +181,7 @@ def compare_candidate(
     max_sustained_compute_delta: float = 0.10,
 ) -> dict[str, Any]:
     if not baseline_blocks or not candidate_blocks:
-        return {"verdict": "INSUFFICIENT_DATA", "reasons": ["missing_blocks"]}
+        return {"constraint_status": "INSUFFICIENT_DATA", "reasons": ["missing_blocks"]}
 
     def means(key: str, blocks: list[dict[str, Any]]) -> float | None:
         values = [float(block[key]) for block in blocks if isinstance(block.get(key), (int, float))]
@@ -179,7 +190,7 @@ def compare_candidate(
     base_power = means("avg_power_w", baseline_blocks)
     cand_power = means("avg_power_w", candidate_blocks)
     if base_power is None or cand_power is None:
-        return {"verdict": "INSUFFICIENT_DATA", "reasons": ["missing_power"]}
+        return {"constraint_status": "INSUFFICIENT_DATA", "reasons": ["missing_power"]}
 
     cpu_base = means("avg_cpu_psi", baseline_blocks)
     cpu_cand = means("avg_cpu_psi", candidate_blocks)
@@ -221,7 +232,7 @@ def compare_candidate(
         reasons.append("demand_backlog_regression")
 
     return {
-        "verdict": "CANDIDATE_WINNER" if not reasons else "REJECT",
+        "constraint_status": "PASS" if not reasons else "VIOLATION",
         "reasons": reasons,
         "baseline_avg_power_w": base_power,
         "candidate_avg_power_w": cand_power,

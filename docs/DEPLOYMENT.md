@@ -8,7 +8,8 @@ bash scripts/install-user-services.sh
 
 安装用户级 sp7-powerlab.service、sp7-powerlab-hourly.service 和 timer。
 
-主 service 负责 telemetry、demand、thermal、controller、trial tick 和 waste detection。
+主 service 负责 telemetry、demand、thermal、controller、trial tick、UnexpectedPower
+detection，以及在 automation level 3+ 下受 gate 约束的 Candidate Scheduler。
 
 ## Root helper
 
@@ -43,11 +44,12 @@ doctor 会报告已知冲突。
 
 - Level 0：只读。
 - Level 1：只切 verified envelope。
-- Level 2：LLM proposal + 人工批准。
-- Level 3：低风险自动 trial。
-- Level 4：满足条件时允许 auto-promotion。
+- Level 2：Scheduler 可以提出 candidate；默认由用户审核后执行 trial / promotion。
+- Level 3：全部 safety/evidence/budget gate 通过后，daemon 可自动开始低风险 trial。
+- Level 4：满足条件且 `auto_promote=true` 时允许 auto-promotion。
 
 个人设备建议长期停留在 1–2，等真机数据充分后再提高。
 
-Level 2 的 MCP 必须只暴露 \`sp7-powerlab-agent\` 白名单能力；不得暴露任意 shell、
-主 CLI 或 helper socket。
+个人使用时可以由用户向 GPT-5.6 提供 Bash/workspace/MCP 等通用用户态能力。
+`sp7-powerlab-agent` 只是便利入口，不是权限沙箱。无论 Agent 具有什么用户态能力，
+root helper 仍只暴露有限 HWP 操作，不提供 unrestricted root shell。

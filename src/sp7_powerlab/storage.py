@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 ACTIVE_TRIAL_STATES = {
     "PROPOSED",
@@ -136,15 +136,6 @@ DDL = [
         before_json TEXT,
         after_json TEXT
     )""",
-    """CREATE TABLE IF NOT EXISTS waste_incidents (
-        incident_id TEXT PRIMARY KEY,
-        start_ts REAL NOT NULL,
-        end_ts REAL,
-        severity TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        resolved_ts REAL
-    )""",
     """CREATE TABLE IF NOT EXISTS thermal_incidents (
         incident_id TEXT PRIMARY KEY,
         start_ts REAL NOT NULL,
@@ -190,22 +181,6 @@ DDL = [
         updated_ts REAL NOT NULL,
         result_json TEXT,
         last_error TEXT
-    )""",
-    """CREATE TABLE IF NOT EXISTS trial_blocks (
-        block_id TEXT PRIMARY KEY,
-        trial_id TEXT NOT NULL,
-        arm TEXT NOT NULL,
-        start_ts REAL NOT NULL,
-        end_ts REAL NOT NULL,
-        valid_seconds REAL NOT NULL,
-        avg_power_w REAL,
-        median_power_w REAL,
-        avg_cpu_psi REAL,
-        avg_io_psi REAL,
-        max_thermal_pressure REAL,
-        brightness_bucket INTEGER,
-        demand_region TEXT,
-        payload_json TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS trial_results (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -281,6 +256,170 @@ DDL = [
         reason TEXT NOT NULL,
         payload_json TEXT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS evidence_epochs (
+        epoch_id TEXT PRIMARY KEY,
+        start_ts REAL NOT NULL,
+        end_ts REAL,
+        active INTEGER NOT NULL,
+        hard_identity_hash TEXT NOT NULL,
+        battery_epoch INTEGER,
+        calibration_version INTEGER,
+        evidence_semantics_version INTEGER NOT NULL,
+        invalidation_reason TEXT,
+        payload_json TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_epochs_active ON evidence_epochs(active)",
+    """CREATE TABLE IF NOT EXISTS compatibility_tags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        scope TEXT NOT NULL,
+        tag_key TEXT NOT NULL,
+        tag_value TEXT,
+        active INTEGER NOT NULL,
+        payload_json TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_compatibility_tags_active ON compatibility_tags(active,scope,tag_key)",
+    """CREATE TABLE IF NOT EXISTS reference_baselines (
+        reference_id TEXT PRIMARY KEY,
+        created_ts REAL NOT NULL,
+        evidence_epoch_id TEXT NOT NULL,
+        strata_key TEXT NOT NULL,
+        envelope TEXT,
+        median_power_w REAL,
+        mad_power_w REAL,
+        p25_power_w REAL,
+        p75_power_w REAL,
+        sample_count INTEGER NOT NULL,
+        frozen INTEGER NOT NULL,
+        payload_json TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_reference_baselines_key ON reference_baselines(evidence_epoch_id,strata_key,created_ts)",
+    """CREATE TABLE IF NOT EXISTS recent_noise_distributions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        updated_ts REAL NOT NULL,
+        evidence_epoch_id TEXT NOT NULL,
+        strata_key TEXT NOT NULL,
+        window_seconds REAL NOT NULL,
+        median_power_w REAL,
+        mad_power_w REAL,
+        p25_power_w REAL,
+        p75_power_w REAL,
+        p10_power_w REAL,
+        p90_power_w REAL,
+        noise_floor_w REAL,
+        sample_count INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        UNIQUE(evidence_epoch_id,strata_key,window_seconds)
+    )""",
+    """CREATE TABLE IF NOT EXISTS arm_measurements (
+        arm_id TEXT PRIMARY KEY,
+        trial_id TEXT NOT NULL,
+        arm TEXT NOT NULL,
+        role TEXT NOT NULL,
+        start_ts REAL NOT NULL,
+        end_ts REAL NOT NULL,
+        valid_seconds REAL NOT NULL,
+        avg_power_w REAL,
+        integrated_energy_wh REAL,
+        battery_energy_delta_wh REAL,
+        consistency_error_wh REAL,
+        consistency_error_ratio REAL,
+        data_quality TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_arm_measurements_trial ON arm_measurements(trial_id,start_ts)",
+    """CREATE TABLE IF NOT EXISTS crossover_episodes (
+        episode_id TEXT PRIMARY KEY,
+        trial_id TEXT NOT NULL,
+        candidate_key TEXT,
+        stage TEXT NOT NULL,
+        evidence_epoch_id TEXT,
+        paired_effect_w REAL,
+        paired_effect_wh REAL,
+        valid INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_ts REAL NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_crossover_trial ON crossover_episodes(trial_id,created_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_crossover_candidate ON crossover_episodes(candidate_key,evidence_epoch_id,created_ts)",
+    """CREATE TABLE IF NOT EXISTS evidence_decisions (
+        decision_id TEXT PRIMARY KEY,
+        trial_id TEXT,
+        candidate_key TEXT,
+        evidence_epoch_id TEXT,
+        verdict TEXT NOT NULL,
+        minimum_useful_effect_w REAL,
+        median_effect_w REAL,
+        direction_consistency REAL,
+        evidence_count INTEGER NOT NULL,
+        created_ts REAL NOT NULL,
+        payload_json TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_decisions_trial ON evidence_decisions(trial_id,created_ts)",
+    """CREATE TABLE IF NOT EXISTS candidate_frontier (
+        candidate_key TEXT PRIMARY KEY,
+        evidence_epoch_id TEXT,
+        baseline_envelope TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated_ts REAL NOT NULL,
+        payload_json TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_candidate_frontier_epoch ON candidate_frontier(evidence_epoch_id,baseline_envelope,status)",
+    """CREATE TABLE IF NOT EXISTS control_safety_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        state TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS learning_lifecycle_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        state TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS investigations (
+        investigation_id TEXT PRIMARY KEY,
+        start_ts REAL NOT NULL,
+        end_ts REAL,
+        status TEXT NOT NULL,
+        event_id TEXT,
+        classification TEXT,
+        payload_json TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS unexpected_power_events (
+        event_id TEXT PRIMARY KEY,
+        start_ts REAL NOT NULL,
+        end_ts REAL,
+        severity TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS monitoring_overhead_runs (
+        run_id TEXT PRIMARY KEY,
+        start_ts REAL NOT NULL,
+        end_ts REAL,
+        mode TEXT NOT NULL,
+        result_json TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS minimal_meter_runs (
+        run_id TEXT PRIMARY KEY,
+        start_ts REAL NOT NULL,
+        end_ts REAL,
+        payload_json TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS minimal_meter_samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        ts REAL NOT NULL,
+        battery_status TEXT,
+        battery_power_w REAL,
+        battery_energy_wh REAL,
+        payload_json TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_minimal_meter_samples_run ON minimal_meter_samples(run_id,ts)",
 ]
 
 
@@ -343,7 +482,7 @@ class Database:
                 version = int(_loads(row[0]))
                 if version != SCHEMA_VERSION:
                     raise LegacyDatabaseError(
-                        f"database schema {version} is not supported by v2 schema {SCHEMA_VERSION}; "
+                        f"database schema {version} is not supported by PowerLab schema {SCHEMA_VERSION}; "
                         "reset runtime explicitly"
                     )
 
@@ -602,43 +741,32 @@ class Database:
         return [_loads(row[0]) for row in self.conn.execute(sql, args)]
 
     def add_incident(self, kind: str, value: dict[str, Any]) -> str:
+        if kind != "thermal":
+            raise ValueError(f"unsupported incident kind: {kind}")
         incident_id = value.get("incident_id") or f"{kind[:1]}-{uuid.uuid4().hex[:12]}"
         now = float(value.get("start_ts") or time.time())
         with self.conn:
-            if kind == "waste":
-                self.conn.execute(
-                    """INSERT OR REPLACE INTO waste_incidents(
-                        incident_id,start_ts,end_ts,severity,reason,payload_json,resolved_ts
-                    ) VALUES(?,?,?,?,?,?,?)""",
-                    (
-                        incident_id,
-                        now,
-                        value.get("end_ts"),
-                        value.get("severity", "medium"),
-                        value.get("reason", "unspecified"),
-                        _json({**value, "incident_id": incident_id}),
-                        value.get("resolved_ts"),
-                    ),
-                )
-            else:
-                self.conn.execute(
-                    """INSERT OR REPLACE INTO thermal_incidents(
-                        incident_id,start_ts,end_ts,state,payload_json,resolved_ts
-                    ) VALUES(?,?,?,?,?,?)""",
-                    (
-                        incident_id,
-                        now,
-                        value.get("end_ts"),
-                        value.get("state", "THERMAL_PRESSURE"),
-                        _json({**value, "incident_id": incident_id}),
-                        value.get("resolved_ts"),
-                    ),
-                )
+            self.conn.execute(
+                """INSERT OR REPLACE INTO thermal_incidents(
+                    incident_id,start_ts,end_ts,state,payload_json,resolved_ts
+                ) VALUES(?,?,?,?,?,?)""",
+                (
+                    incident_id,
+                    now,
+                    value.get("end_ts"),
+                    value.get("state", "THERMAL_PRESSURE"),
+                    _json({**value, "incident_id": incident_id}),
+                    value.get("resolved_ts"),
+                ),
+            )
         return incident_id
 
     def recent_incidents(self, since_ts: float, limit: int = 50) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
-        for table, kind in (("waste_incidents", "waste"), ("thermal_incidents", "thermal")):
+        for table, kind in (
+            ("unexpected_power_events", "unexpected_power"),
+            ("thermal_incidents", "thermal"),
+        ):
             for row in self.conn.execute(
                 f"SELECT payload_json FROM {table} WHERE start_ts>=? ORDER BY start_ts DESC LIMIT ?",
                 (since_ts, limit),
@@ -803,51 +931,6 @@ class Database:
             )
         ]
 
-    def add_trial_block(self, block: dict[str, Any]) -> None:
-        with self.conn:
-            self.conn.execute(
-                """INSERT OR REPLACE INTO trial_blocks(
-                    block_id,trial_id,arm,start_ts,end_ts,valid_seconds,avg_power_w,
-                    median_power_w,avg_cpu_psi,avg_io_psi,max_thermal_pressure,
-                    brightness_bucket,demand_region,payload_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    block["block_id"],
-                    block["trial_id"],
-                    block["arm"],
-                    block["start_ts"],
-                    block["end_ts"],
-                    block["valid_seconds"],
-                    block.get("avg_power_w"),
-                    block.get("median_power_w"),
-                    block.get("avg_cpu_psi"),
-                    block.get("avg_io_psi"),
-                    block.get("max_thermal_pressure"),
-                    block.get("brightness_bucket"),
-                    block.get("demand_region"),
-                    _json(block),
-                ),
-            )
-
-    def trial_blocks(self, trial_id: str) -> list[dict[str, Any]]:
-        return [
-            _loads(row[0])
-            for row in self.conn.execute(
-                "SELECT payload_json FROM trial_blocks WHERE trial_id=? ORDER BY start_ts",
-                (trial_id,),
-            )
-        ]
-
-    def delete_trial_blocks(self, trial_id: str, arms: set[str]) -> None:
-        if not arms:
-            return
-        placeholders = ",".join("?" for _ in arms)
-        with self.conn:
-            self.conn.execute(
-                f"DELETE FROM trial_blocks WHERE trial_id=? AND arm IN ({placeholders})",
-                (trial_id, *sorted(arms)),
-            )
-
     def add_trial_result(
         self, trial_id: str, stage: str, verdict: str, result: dict[str, Any]
     ) -> None:
@@ -893,6 +976,637 @@ class Database:
         for row in self.conn.execute("SELECT * FROM rejections ORDER BY ts DESC LIMIT ?", (limit,)):
             item = dict(row)
             item["payload"] = _loads(item.pop("payload_json"))
+            result.append(item)
+        return result
+
+    def ensure_evidence_epoch(
+        self,
+        *,
+        hard_identity_hash: str,
+        battery_epoch: int | None,
+        calibration_version: int,
+        evidence_semantics_version: int,
+        payload: dict[str, Any],
+    ) -> str:
+        row = self.conn.execute(
+            "SELECT * FROM evidence_epochs WHERE active=1 ORDER BY start_ts DESC LIMIT 1"
+        ).fetchone()
+        if (
+            row
+            and row["hard_identity_hash"] == hard_identity_hash
+            and row["battery_epoch"] == battery_epoch
+            and row["calibration_version"] == calibration_version
+            and row["evidence_semantics_version"] == evidence_semantics_version
+        ):
+            return str(row["epoch_id"])
+
+        now = time.time()
+        epoch_id = f"ee-{uuid.uuid4().hex[:12]}"
+        reason = "initial evidence epoch"
+        if row:
+            reason = "hard evidence identity changed"
+        with self.conn:
+            self.conn.execute(
+                """UPDATE evidence_epochs
+                SET active=0,end_ts=?,invalidation_reason=?
+                WHERE active=1""",
+                (now, reason),
+            )
+            self.conn.execute(
+                """INSERT INTO evidence_epochs(
+                    epoch_id,start_ts,active,hard_identity_hash,battery_epoch,
+                    calibration_version,evidence_semantics_version,payload_json
+                ) VALUES(?,?,1,?,?,?,?,?)""",
+                (
+                    epoch_id,
+                    now,
+                    hard_identity_hash,
+                    battery_epoch,
+                    calibration_version,
+                    evidence_semantics_version,
+                    _json(payload),
+                ),
+            )
+        return epoch_id
+
+    def active_evidence_epoch(self) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM evidence_epochs WHERE active=1 ORDER BY start_ts DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
+    def set_compatibility_tags(self, scope: str, tags: dict[str, Any]) -> None:
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE compatibility_tags SET active=0 WHERE scope=? AND active=1",
+                (scope,),
+            )
+            for key, value in sorted(tags.items()):
+                payload = {
+                    "scope": scope,
+                    "key": key,
+                    "value": value,
+                }
+                self.conn.execute(
+                    """INSERT INTO compatibility_tags(
+                        ts,scope,tag_key,tag_value,active,payload_json
+                    ) VALUES(?,?,?,?,1,?)""",
+                    (now, scope, key, None if value is None else str(value), _json(payload)),
+                )
+
+    def active_compatibility_tags(self, scope: str | None = None) -> dict[str, str | None]:
+        if scope is None:
+            rows = self.conn.execute(
+                """SELECT scope,tag_key,tag_value FROM compatibility_tags
+                WHERE active=1 ORDER BY scope,tag_key"""
+            )
+            return {f"{row['scope']}:{row['tag_key']}": row["tag_value"] for row in rows}
+        rows = self.conn.execute(
+            """SELECT tag_key,tag_value FROM compatibility_tags
+            WHERE active=1 AND scope=? ORDER BY tag_key""",
+            (scope,),
+        )
+        return {str(row["tag_key"]): row["tag_value"] for row in rows}
+
+    def upsert_reference_baseline(self, value: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO reference_baselines(
+                    reference_id,created_ts,evidence_epoch_id,strata_key,envelope,
+                    median_power_w,mad_power_w,p25_power_w,p75_power_w,sample_count,
+                    frozen,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    value["reference_id"],
+                    float(value.get("created_ts") or time.time()),
+                    value["evidence_epoch_id"],
+                    value["strata_key"],
+                    value.get("envelope"),
+                    value.get("median_power_w"),
+                    value.get("mad_power_w"),
+                    value.get("p25_power_w"),
+                    value.get("p75_power_w"),
+                    int(value.get("sample_count") or 0),
+                    int(bool(value.get("frozen", True))),
+                    _json(value),
+                ),
+            )
+
+    def reference_baseline(
+        self,
+        evidence_epoch_id: str,
+        strata_key: str,
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """SELECT payload_json FROM reference_baselines
+            WHERE evidence_epoch_id=? AND strata_key=? AND frozen=1
+            ORDER BY created_ts DESC LIMIT 1""",
+            (evidence_epoch_id, strata_key),
+        ).fetchone()
+        return _loads(row[0]) if row else None
+
+    def upsert_noise_distribution(self, value: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO recent_noise_distributions(
+                    updated_ts,evidence_epoch_id,strata_key,window_seconds,median_power_w,
+                    mad_power_w,p25_power_w,p75_power_w,p10_power_w,p90_power_w,
+                    noise_floor_w,sample_count,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(evidence_epoch_id,strata_key,window_seconds) DO UPDATE SET
+                    updated_ts=excluded.updated_ts,
+                    median_power_w=excluded.median_power_w,
+                    mad_power_w=excluded.mad_power_w,
+                    p25_power_w=excluded.p25_power_w,
+                    p75_power_w=excluded.p75_power_w,
+                    p10_power_w=excluded.p10_power_w,
+                    p90_power_w=excluded.p90_power_w,
+                    noise_floor_w=excluded.noise_floor_w,
+                    sample_count=excluded.sample_count,
+                    payload_json=excluded.payload_json""",
+                (
+                    float(value.get("updated_ts") or time.time()),
+                    value["evidence_epoch_id"],
+                    value["strata_key"],
+                    float(value["window_seconds"]),
+                    value.get("median_power_w"),
+                    value.get("mad_power_w"),
+                    value.get("p25_power_w"),
+                    value.get("p75_power_w"),
+                    value.get("p10_power_w"),
+                    value.get("p90_power_w"),
+                    value.get("noise_floor_w"),
+                    int(value.get("sample_count") or 0),
+                    _json(value),
+                ),
+            )
+
+    def noise_distribution(
+        self,
+        evidence_epoch_id: str,
+        strata_key: str,
+        *,
+        window_seconds: float | None = None,
+    ) -> dict[str, Any] | None:
+        sql = """SELECT payload_json FROM recent_noise_distributions
+            WHERE evidence_epoch_id=? AND strata_key=?"""
+        args: list[Any] = [evidence_epoch_id, strata_key]
+        if window_seconds is not None:
+            sql += " AND window_seconds=?"
+            args.append(float(window_seconds))
+        sql += " ORDER BY window_seconds DESC,updated_ts DESC LIMIT 1"
+        row = self.conn.execute(sql, args).fetchone()
+        return _loads(row[0]) if row else None
+
+    def add_arm_measurement(self, value: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO arm_measurements(
+                    arm_id,trial_id,arm,role,start_ts,end_ts,valid_seconds,avg_power_w,
+                    integrated_energy_wh,battery_energy_delta_wh,consistency_error_wh,
+                    consistency_error_ratio,data_quality,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    value["arm_id"],
+                    value["trial_id"],
+                    value["arm"],
+                    value["role"],
+                    value["start_ts"],
+                    value["end_ts"],
+                    value["valid_seconds"],
+                    value.get("avg_power_w"),
+                    value.get("integrated_energy_wh"),
+                    value.get("battery_energy_delta_wh"),
+                    value.get("consistency_error_wh"),
+                    value.get("consistency_error_ratio"),
+                    value.get("data_quality", "UNKNOWN"),
+                    _json(value),
+                ),
+            )
+
+    def arm_measurements(self, trial_id: str) -> list[dict[str, Any]]:
+        return [
+            _loads(row[0])
+            for row in self.conn.execute(
+                """SELECT payload_json FROM arm_measurements
+                WHERE trial_id=? ORDER BY start_ts""",
+                (trial_id,),
+            )
+        ]
+
+    def delete_arm_measurements(self, trial_id: str, arms: set[str]) -> None:
+        if not arms:
+            return
+        placeholders = ",".join("?" for _ in arms)
+        with self.conn:
+            self.conn.execute(
+                f"DELETE FROM arm_measurements WHERE trial_id=? AND arm IN ({placeholders})",
+                (trial_id, *sorted(arms)),
+            )
+
+    def add_crossover_episode(self, value: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO crossover_episodes(
+                    episode_id,trial_id,candidate_key,stage,evidence_epoch_id,
+                    paired_effect_w,paired_effect_wh,valid,payload_json,created_ts
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    value["episode_id"],
+                    value["trial_id"],
+                    value.get("candidate_key"),
+                    value["stage"],
+                    value.get("evidence_epoch_id"),
+                    value.get("paired_effect_w"),
+                    value.get("paired_effect_wh"),
+                    int(bool(value.get("valid", True))),
+                    _json(value),
+                    float(value.get("created_ts") or time.time()),
+                ),
+            )
+
+    def crossover_episodes(self, trial_id: str) -> list[dict[str, Any]]:
+        return [
+            _loads(row[0])
+            for row in self.conn.execute(
+                """SELECT payload_json FROM crossover_episodes
+                WHERE trial_id=? ORDER BY created_ts""",
+                (trial_id,),
+            )
+        ]
+
+    def candidate_crossover_episodes(
+        self,
+        candidate_key: str,
+        *,
+        evidence_epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = """SELECT payload_json FROM crossover_episodes
+            WHERE candidate_key=?"""
+        args: list[Any] = [candidate_key]
+        if evidence_epoch_id is not None:
+            sql += " AND evidence_epoch_id=?"
+            args.append(evidence_epoch_id)
+        sql += " ORDER BY created_ts"
+        return [_loads(row[0]) for row in self.conn.execute(sql, args)]
+
+    def add_evidence_decision(self, value: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO evidence_decisions(
+                    decision_id,trial_id,candidate_key,evidence_epoch_id,verdict,
+                    minimum_useful_effect_w,median_effect_w,direction_consistency,
+                    evidence_count,created_ts,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    value["decision_id"],
+                    value.get("trial_id"),
+                    value.get("candidate_key"),
+                    value.get("evidence_epoch_id"),
+                    value["verdict"],
+                    value.get("minimum_useful_effect_w"),
+                    value.get("median_effect_w"),
+                    value.get("direction_consistency"),
+                    int(value.get("evidence_count") or 0),
+                    float(value.get("created_ts") or time.time()),
+                    _json(value),
+                ),
+            )
+
+    def evidence_decisions(
+        self,
+        *,
+        trial_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        if trial_id:
+            rows = self.conn.execute(
+                """SELECT payload_json FROM evidence_decisions
+                WHERE trial_id=? ORDER BY created_ts DESC LIMIT ?""",
+                (trial_id, limit),
+            )
+        else:
+            rows = self.conn.execute(
+                """SELECT payload_json FROM evidence_decisions
+                ORDER BY created_ts DESC LIMIT ?""",
+                (limit,),
+            )
+        return [_loads(row[0]) for row in rows]
+
+    def upsert_candidate_frontier(self, value: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO candidate_frontier(
+                    candidate_key,evidence_epoch_id,baseline_envelope,status,updated_ts,payload_json
+                ) VALUES(?,?,?,?,?,?)
+                ON CONFLICT(candidate_key) DO UPDATE SET
+                    evidence_epoch_id=excluded.evidence_epoch_id,
+                    baseline_envelope=excluded.baseline_envelope,
+                    status=excluded.status,
+                    updated_ts=excluded.updated_ts,
+                    payload_json=excluded.payload_json""",
+                (
+                    value["candidate_key"],
+                    value.get("evidence_epoch_id"),
+                    value["baseline_envelope"],
+                    value["status"],
+                    float(value.get("updated_ts") or time.time()),
+                    _json(value),
+                ),
+            )
+
+    def candidate_frontier(
+        self,
+        *,
+        evidence_epoch_id: str | None = None,
+        baseline_envelope: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT payload_json FROM candidate_frontier WHERE 1=1"
+        args: list[Any] = []
+        if evidence_epoch_id is not None:
+            sql += " AND evidence_epoch_id=?"
+            args.append(evidence_epoch_id)
+        if baseline_envelope is not None:
+            sql += " AND baseline_envelope=?"
+            args.append(baseline_envelope)
+        sql += " ORDER BY updated_ts DESC"
+        return [_loads(row[0]) for row in self.conn.execute(sql, args)]
+
+    def candidate_frontier_entry(self, candidate_key: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT payload_json FROM candidate_frontier WHERE candidate_key=?",
+            (candidate_key,),
+        ).fetchone()
+        return _loads(row[0]) if row else None
+
+    def add_runtime_state(
+        self,
+        kind: str,
+        state: str,
+        reason: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        table = {
+            "control": "control_safety_history",
+            "learning": "learning_lifecycle_history",
+        }.get(kind)
+        if not table:
+            raise ValueError(f"unknown runtime state kind: {kind}")
+        with self.conn:
+            self.conn.execute(
+                f"INSERT INTO {table}(ts,state,reason,payload_json) VALUES(?,?,?,?)",
+                (time.time(), state, reason, _json(payload or {})),
+            )
+
+    def latest_runtime_state(self, kind: str) -> dict[str, Any] | None:
+        table = {
+            "control": "control_safety_history",
+            "learning": "learning_lifecycle_history",
+        }.get(kind)
+        if not table:
+            raise ValueError(f"unknown runtime state kind: {kind}")
+        row = self.conn.execute(f"SELECT * FROM {table} ORDER BY ts DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
+    def add_unexpected_power_event(self, value: dict[str, Any]) -> str:
+        event_id = value.get("event_id") or f"up-{uuid.uuid4().hex[:12]}"
+        with self.conn:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO unexpected_power_events(
+                    event_id,start_ts,end_ts,severity,status,reason,payload_json
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    event_id,
+                    float(value.get("start_ts") or time.time()),
+                    value.get("end_ts"),
+                    value.get("severity", "medium"),
+                    value.get("status", "OPEN"),
+                    value.get("reason", "unexpected power"),
+                    _json({**value, "event_id": event_id}),
+                ),
+            )
+        return str(event_id)
+
+    def recent_unexpected_power_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        return [
+            _loads(row[0])
+            for row in self.conn.execute(
+                """SELECT payload_json FROM unexpected_power_events
+                ORDER BY start_ts DESC LIMIT ?""",
+                (limit,),
+            )
+        ]
+
+    def unexpected_power_event(self, event_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT payload_json FROM unexpected_power_events WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        return _loads(row[0]) if row else None
+
+    def close_unexpected_power_event(
+        self,
+        event_id: str,
+        *,
+        classification: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        current = self.unexpected_power_event(event_id) or {}
+        merged = {
+            **current,
+            **(payload or {}),
+            "event_id": event_id,
+            "status": "CLOSED",
+            "classification": classification,
+            "resolved_ts": time.time(),
+        }
+        with self.conn:
+            self.conn.execute(
+                """UPDATE unexpected_power_events
+                SET end_ts=COALESCE(end_ts,?),status='CLOSED',payload_json=?
+                WHERE event_id=?""",
+                (time.time(), _json(merged), event_id),
+            )
+
+    def start_investigation(
+        self,
+        *,
+        event_id: str | None,
+        payload: dict[str, Any],
+    ) -> str:
+        existing = self.conn.execute(
+            """SELECT investigation_id FROM investigations
+            WHERE status='INVESTIGATING' ORDER BY start_ts DESC LIMIT 1"""
+        ).fetchone()
+        if existing:
+            return str(existing[0])
+        investigation_id = f"inv-{uuid.uuid4().hex[:12]}"
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO investigations(
+                    investigation_id,start_ts,status,event_id,payload_json
+                ) VALUES(?,?,'INVESTIGATING',?,?)""",
+                (investigation_id, time.time(), event_id, _json(payload)),
+            )
+        return investigation_id
+
+    def finish_investigation(
+        self,
+        investigation_id: str,
+        *,
+        classification: str,
+        payload: dict[str, Any],
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """UPDATE investigations
+                SET end_ts=?,status='CLOSED',classification=?,payload_json=?
+                WHERE investigation_id=?""",
+                (time.time(), classification, _json(payload), investigation_id),
+            )
+
+    def investigation(self, investigation_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM investigations WHERE investigation_id=?",
+            (investigation_id,),
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
+    def active_investigation(self) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """SELECT * FROM investigations
+            WHERE status='INVESTIGATING' ORDER BY start_ts DESC LIMIT 1"""
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
+    def recent_investigations(self, limit: int = 50) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for row in self.conn.execute(
+            "SELECT * FROM investigations ORDER BY start_ts DESC LIMIT ?",
+            (limit,),
+        ):
+            item = dict(row)
+            item["payload"] = _loads(item.pop("payload_json"), {})
+            result.append(item)
+        return result
+
+    def start_minimal_meter_run(self, payload: dict[str, Any] | None = None) -> str:
+        run_id = f"meter-{uuid.uuid4().hex[:12]}"
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO minimal_meter_runs(run_id,start_ts,payload_json)
+                VALUES(?,?,?)""",
+                (run_id, time.time(), _json(payload or {})),
+            )
+        return run_id
+
+    def add_minimal_meter_sample(self, run_id: str, sample: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO minimal_meter_samples(
+                    run_id,ts,battery_status,battery_power_w,battery_energy_wh,payload_json
+                ) VALUES(?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    sample["ts"],
+                    sample.get("battery_status"),
+                    sample.get("battery_power_w"),
+                    sample.get("battery_energy_wh"),
+                    _json(sample),
+                ),
+            )
+
+    def finish_minimal_meter_run(self, run_id: str, payload: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """UPDATE minimal_meter_runs SET end_ts=?,payload_json=? WHERE run_id=?""",
+                (time.time(), _json(payload), run_id),
+            )
+
+    def minimal_meter_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM minimal_meter_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        item["samples"] = [
+            _loads(sample[0])
+            for sample in self.conn.execute(
+                """SELECT payload_json FROM minimal_meter_samples
+                WHERE run_id=? ORDER BY ts""",
+                (run_id,),
+            )
+        ]
+        return item
+
+    def recent_minimal_meter_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for row in self.conn.execute(
+            "SELECT * FROM minimal_meter_runs ORDER BY start_ts DESC LIMIT ?",
+            (limit,),
+        ):
+            item = dict(row)
+            item["payload"] = _loads(item.pop("payload_json"), {})
+            result.append(item)
+        return result
+
+    def start_monitoring_overhead_run(
+        self,
+        *,
+        mode: str,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
+        run_id = f"overhead-{uuid.uuid4().hex[:12]}"
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO monitoring_overhead_runs(
+                    run_id,start_ts,mode,result_json
+                ) VALUES(?,?,?,?)""",
+                (run_id, time.time(), mode, _json(payload or {})),
+            )
+        return run_id
+
+    def finish_monitoring_overhead_run(
+        self,
+        run_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """UPDATE monitoring_overhead_runs
+                SET end_ts=?,result_json=? WHERE run_id=?""",
+                (time.time(), _json(result), run_id),
+            )
+
+    def monitoring_overhead_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for row in self.conn.execute(
+            """SELECT * FROM monitoring_overhead_runs
+            ORDER BY start_ts DESC LIMIT ?""",
+            (limit,),
+        ):
+            item = dict(row)
+            item["result"] = _loads(item.pop("result_json"), {})
             result.append(item)
         return result
 

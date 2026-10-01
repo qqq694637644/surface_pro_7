@@ -9,6 +9,8 @@ from .analytics import battery_usage_summary
 from .config import Config, load_machine
 from .envelopes import EnvelopeRegistry
 from .experiments import TrialManager
+from .lifecycle import LifecycleManager
+from .longterm import UsageCoverage, assess_net_benefit
 from .storage import Database
 
 ALLOWED_ACTIONS = {
@@ -16,7 +18,7 @@ ALLOWED_ACTIONS = {
     "NEED_MORE_DATA",
     "INVESTIGATE_POWER_SPIKE",
     "INVESTIGATE_THERMAL_EVENT",
-    "PROPOSE_WASTE_FIX",
+    "PROPOSE_POWER_FIX",
     "PROPOSE_ENVELOPE_TRIAL",
     "ROLLBACK_TRIAL",
     "PROMOTE_ENVELOPE",
@@ -68,6 +70,27 @@ def build_knowledge_pack(
         envelopes[envelope] = envelopes.get(envelope, 0) + 1
 
     machine = load_machine(config.root)
+    lifecycle = LifecycleManager(db)
+    evidence_epoch = db.active_evidence_epoch()
+    coverage_days = int(config.get("stable.coverage_days", 30))
+    usage_coverage = UsageCoverage(db).summarize(
+        since_ts=now - coverage_days * 86400.0,
+        evidence_epoch_id=(evidence_epoch or {}).get("epoch_id"),
+    )
+    monitoring_runs = db.monitoring_overhead_runs(50)
+    net_benefit = assess_net_benefit(
+        monitoring_runs,
+        practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
+    )
+    noise_rows = [
+        dict(row)
+        for row in db.conn.execute(
+            """SELECT updated_ts,evidence_epoch_id,strata_key,window_seconds,
+            median_power_w,mad_power_w,noise_floor_w,sample_count
+            FROM recent_noise_distributions
+            ORDER BY updated_ts DESC LIMIT 50"""
+        )
+    ]
     pack = {
         "generated_ts": now,
         "objective": (
@@ -80,7 +103,7 @@ def build_knowledge_pack(
             "trial_success_requires_measurement": True,
             "negative_user_feedback_rejects_candidate": True,
             "thermal_safety_can_preempt_any_trial": True,
-            "prefer_waste_elimination_before_performance_restriction": True,
+            "prefer_unexpected_power_investigation_before_performance_restriction": True,
         },
         "battery": {
             "epoch": db.active_battery_epoch(),
@@ -108,6 +131,25 @@ def build_knowledge_pack(
             "envelopes": registry.list(),
         },
         "incidents": incidents,
+        "lifecycle": {
+            **lifecycle.status(),
+            "usage_coverage_days": coverage_days,
+            "usage_coverage": usage_coverage,
+            "target_trusted_fraction": float(config.get("stable.target_trusted_fraction", 0.90)),
+        },
+        "evidence": {
+            "active_epoch": evidence_epoch,
+            "compatibility_tags": db.active_compatibility_tags(),
+            "recent_decisions": db.evidence_decisions(limit=20),
+            "recent_noise": noise_rows,
+            "frozen_reference_count": db.conn.execute(
+                "SELECT COUNT(*) FROM reference_baselines WHERE frozen=1"
+            ).fetchone()[0],
+        },
+        "investigations": db.recent_investigations(20),
+        "unexpected_power_events": db.recent_unexpected_power_events(20),
+        "monitoring_overhead_runs": monitoring_runs[:20],
+        "net_benefit": net_benefit,
         "trials": db.recent_trials(int(config.get("llm.max_trials", 20))),
         "feedback": db.recent_feedback(50),
         "rejections": db.recent_rejections(50),
@@ -193,7 +235,7 @@ def apply_decision(
     }:
         result["status"] = "recorded"
 
-    elif action in {"PROPOSE_WASTE_FIX", "PROPOSE_MANUAL_RECALIBRATION"}:
+    elif action in {"PROPOSE_POWER_FIX", "PROPOSE_MANUAL_RECALIBRATION"}:
         path = _save_manual_proposal(config.root, action, payload)
         result.update({"status": "manual_review_required", "proposal_file": path})
 

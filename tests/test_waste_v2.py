@@ -2,7 +2,7 @@ from pathlib import Path
 
 from sp7_powerlab.config import load_config
 from sp7_powerlab.storage import Database
-from sp7_powerlab.waste import WasteDetector
+from sp7_powerlab.waste import UnexpectedPowerDetector
 
 
 def rollup(ts, power):
@@ -28,7 +28,7 @@ def rollup(ts, power):
     }
 
 
-def test_low_demand_high_power_creates_waste_incident(project_root: Path):
+def test_low_demand_high_power_creates_unexpected_power_event(project_root: Path):
     config = load_config(project_root)
     db = Database(project_root / "runtime/db.sqlite3")
     try:
@@ -38,7 +38,7 @@ def test_low_demand_high_power_creates_waste_incident(project_root: Path):
             db.add_rollup(rollup(700 + i * 60, 6.5))
         current = rollup(940, 6.5)
         db.add_rollup(current)
-        incident = WasteDetector(config, db).detect(current)
+        incident = UnexpectedPowerDetector(config, db).detect(current)
         assert incident is not None
         assert incident["current_power_w"] == 6.5
         assert incident["baseline_p90_w"] < 5.2
@@ -56,6 +56,6 @@ def test_normal_power_does_not_create_waste(project_root: Path):
             db.add_rollup(rollup(700 + i * 60, 5.2))
         current = rollup(940, 5.2)
         db.add_rollup(current)
-        assert WasteDetector(config, db).detect(current) is None
+        assert UnexpectedPowerDetector(config, db).detect(current) is None
     finally:
         db.close()
