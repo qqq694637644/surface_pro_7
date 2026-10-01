@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "SP7 PowerLab v2 LLM Decision",
+  "title": "SP7 PowerLab LLM Decision",
   "type": "object",
   "required": ["action", "reason"],
   "properties": {
@@ -10,7 +10,7 @@
         "NEED_MORE_DATA",
         "INVESTIGATE_POWER_SPIKE",
         "INVESTIGATE_THERMAL_EVENT",
-        "PROPOSE_WASTE_FIX",
+        "PROPOSE_POWER_FIX",
         "PROPOSE_ENVELOPE_TRIAL",
         "ROLLBACK_TRIAL",
         "PROMOTE_ENVELOPE",

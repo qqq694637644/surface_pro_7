@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "SP7 PowerLab v2 Envelope Trial",
+  "title": "SP7 PowerLab Envelope Trial",
   "type": "object",
   "required": ["kind", "baseline_envelope"],
   "properties": {

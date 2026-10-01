@@ -7,9 +7,10 @@ from pathlib import Path
 import pytest
 
 from sp7_powerlab import agent_cli, cli
+from sp7_powerlab.llm import ALLOWED_ACTIONS
 
 
-def test_agent_cli_exposes_only_narrow_llm_surface():
+def test_agent_cli_structured_surface_excludes_privileged_commands():
     help_text = agent_cli.parser().format_help()
     assert "observe" in help_text
     assert "hourly" in help_text
@@ -36,14 +37,20 @@ def test_human_cli_has_no_llm_approve_flag():
 def test_packaged_trial_schema_matches_repository_contract():
     root = Path(__file__).resolve().parents[1]
     repository = json.loads(
-        (root / "schemas/envelope-trial-v2.schema.json").read_text(encoding="utf-8")
+        (root / "schemas/envelope-trial.schema.json").read_text(encoding="utf-8")
     )
     packaged = json.loads(
         files("sp7_powerlab.schemas")
-        .joinpath("envelope-trial-v2.schema.json")
+        .joinpath("envelope-trial.schema.json")
         .read_text(encoding="utf-8")
     )
     assert packaged == repository
+
+
+def test_llm_decision_schema_matches_runtime_actions():
+    root = Path(__file__).resolve().parents[1]
+    schema = json.loads((root / "schemas/llm-decision.schema.json").read_text(encoding="utf-8"))
+    assert set(schema["properties"]["action"]["enum"]) == ALLOWED_ACTIONS
 
 
 def test_root_helper_has_no_sys_admin_capability():

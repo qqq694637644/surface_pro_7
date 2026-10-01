@@ -22,4 +22,4 @@ systemctl --user daemon-reload
 systemctl --user enable --now sp7-powerlab.service
 systemctl --user enable --now sp7-powerlab-hourly.timer
 
-echo "PowerLab v2 user services installed."
+echo "PowerLab user services installed."

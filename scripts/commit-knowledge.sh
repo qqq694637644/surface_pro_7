@@ -13,11 +13,11 @@ sp7-powerlab knowledge-export >/dev/null
 
 git add -- config/machine.toml config/envelopes.toml history/continuous proposals
 if git diff --cached --quiet; then
-  echo "No PowerLab v2 knowledge changes to commit."
+  echo "No PowerLab knowledge changes to commit."
   exit 0
 fi
 
-git commit -m "Update SP7 PowerLab v2 knowledge $(date -Iseconds)"
+git commit -m "Update SP7 PowerLab knowledge $(date -Iseconds)"
 
 if [[ "$PUSH" == true ]]; then
   git push

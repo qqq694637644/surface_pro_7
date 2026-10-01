@@ -13,7 +13,7 @@ from .envelopes import EnvelopeRegistry, snapshot_matches_envelope
 from .evaluation import compare_arm_constraints, summarize_block
 from .evidence import EvidenceEngine, build_crossover_episode, hard_strata_key
 from .storage import Database
-from .waste import brightness_bucket, remote_bucket
+from .unexpected_power import brightness_bucket, remote_bucket
 
 NEGATIVE_FEEDBACK = {"sluggish", "bad", "unstable"}
 
@@ -87,7 +87,7 @@ class TrialManager:
         try:
             raw = (
                 files("sp7_powerlab.schemas")
-                .joinpath("envelope-trial-v2.schema.json")
+                .joinpath("envelope-trial.schema.json")
                 .read_text(encoding="utf-8")
             )
             schema = json.loads(raw)
@@ -133,7 +133,7 @@ class TrialManager:
         if errors:
             return errors
         if proposal.get("kind", "envelope") != "envelope":
-            errors.append("only envelope trials are executable in v2.0")
+            errors.append("only envelope trials are executable")
         baseline = proposal.get("baseline_envelope")
         baseline_env = self.registry.get(baseline) if isinstance(baseline, str) else None
         if not isinstance(baseline, str) or not baseline_env:

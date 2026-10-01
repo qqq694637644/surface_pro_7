@@ -1,84 +1,331 @@
 # Operations
 
-## 日常状态
+日常运维的第一条命令：
 
 ~~~bash
-sp7-powerlab service status
-sp7-powerlab observe now
-sp7-powerlab observe power --hours 24
-sp7-powerlab incidents --hours 24
+sp7-powerlab agent-context
 ~~~
 
-## Waste incident
+如果你是 AI，先读根目录 AGENTS.md。
 
-PowerLab 优先查“低 demand + 明显高于个人历史 baseline 的 BAT W”。
+## 1. 状态总览
 
-incident 会附带 top processes、RAPL、brightness、network、GPU hint 和 system fingerprint。
+~~~bash
+sp7-powerlab agent-context
+sp7-powerlab service status
+~~~
 
-正确顺序是先找浪费原因，不是先降低 max_perf_pct。
+按需继续：
 
-## Media decode
+~~~bash
+sp7-powerlab lifecycle status
+sp7-powerlab safety status
+sp7-powerlab evidence status
+sp7-powerlab scheduler status
+~~~
 
-媒体播放同时出现高 CPU、高 RAPL、GPU decode activity 不明显时，会记录 suspected media software decode waste incident。
+不要从文档推断实时状态。
 
-这是诊断 hint，不是自动控制信号。
+## 2. 日常 power / thermal
 
-## Thermal incident
+~~~bash
+sp7-powerlab observe now
+sp7-powerlab observe power --hours 24
+sp7-powerlab observe thermal --hours 24
+~~~
 
-THERMAL_PRESSURE / THROTTLING 会让 trial 自动 rollback，controller 优先 THERMAL_SAFE，thermald 继续作为独立安全层。
+关注：
 
-## Suspend/resume
+- battery_status
+- BAT W
+- battery %
+- package temperature
+- thermal state
+- current envelope
+- demand region
+- resume grace
 
-超过 collector gap 后 RAPL/temp rolling window 重建，进入 resume grace，grace 内不自动控制，也不把 suspend 计入有效实验时长。
+短时间高 W 不自动等于问题。
 
-## Service restart
+## 3. UnexpectedPower
 
-主 service 启动时不会继续一个跨重启的旧实验。任何未完成 trial 都会先尝试恢复 exact baseline snapshot 并标记为 rolled back；如果 helper/HWP 已不可用导致恢复失败，则 trial 进入 FAILED，controller 保持不可写状态直到硬件/ownership 条件重新通过。
+检查：
 
-运行期间每 5 分钟重新检查硬件契约、thermald/ownership 冲突和 helper 可用性；calibration 或 thermal 配置文件变化也会同步到 observer/controller，并使受影响的 VERIFIED envelope 进入 revalidation。
+~~~bash
+sp7-powerlab unexpected-power list
+~~~
 
-## Manual override
+看具体事件：
 
-只接受 verified envelope：
+~~~bash
+sp7-powerlab unexpected-power inspect <event-id>
+~~~
+
+如果有 investigation：
+
+~~~bash
+sp7-powerlab investigation list
+sp7-powerlab investigation inspect <investigation-id>
+sp7-powerlab investigation attribute <investigation-id>
+~~~
+
+正确顺序：
+
+UnexpectedPower -> Investigation -> Attribution -> verification
+
+不是：
+
+UnexpectedPower -> 降 CPU
+
+## 4. 关闭 investigation
+
+只有有证据时分类。
+
+示例：
+
+~~~bash
+sp7-powerlab investigation close <id> EXPECTED_WORKLOAD_CHANGE \
+  --reason "user requested file transfer"
+
+sp7-powerlab investigation close <id> CONFIRMED_CONFIG_REGRESSION \
+  --reason "verified envelope regression reproduced"
+~~~
+
+CONFIRMED_CONFIG_REGRESSION 会让 learning reopen。
+
+普通 EXPECTED_WORKLOAD_CHANGE 不应该唤醒 Scheduler。
+
+## 5. Measurement Trust
+
+~~~bash
+sp7-powerlab evidence gauge --hours 6
+sp7-powerlab evidence trust --hours 6
+~~~
+
+如果 Measurement Trust BLOCKED：
+
+- 不解释微小 W 差异；
+- 不手工绕开 Scheduler gate；
+- 先增加有效 Discharging 数据或修 telemetry。
+
+## 6. Evidence / Noise
+
+~~~bash
+sp7-powerlab evidence status
+sp7-powerlab evidence noise
+~~~
+
+重点看：
+
+- active hard evidence epoch
+- frozen reference
+- recent noise
+- MUE
+- recent decisions
+
+如果旧 epoch 与当前环境不兼容，不要把历史 winner 直接当当前 winner。
+
+## 7. Scheduler
+
+~~~bash
+sp7-powerlab scheduler status
+sp7-powerlab scheduler candidates INTERACTIVE_EFFICIENT
+~~~
+
+常见 blocker：
+
+- measurement_trust_not_ready
+- learning_lifecycle_does_not_allow_exploration
+- control_safety_state_does_not_allow_trials
+- investigation_active
+- insufficient_noise_baseline
+- weekly_trial_budget_exhausted
+- daily_candidate_exposure_budget_exhausted
+- thermal_event_cooldown_active
+- negative_feedback_cooldown_active
+- battery_below_exploration_threshold
+- minimum_arm_duration_exceeds_daily_candidate_budget
+- cpu_headroom_below_minimum_useful_effect
+
+这些 blocker 是正常停止机制。
+
+## 8. Trial
+
+查看：
+
+~~~bash
+sp7-powerlab trial status
+~~~
+
+手动启动：
+
+~~~bash
+sp7-powerlab trial start proposals/example.json
+~~~
+
+必要时回滚：
+
+~~~bash
+sp7-powerlab trial rollback --trial-id trial-xxxx \
+  --reason "manual rollback"
+~~~
+
+Promotion：
+
+~~~bash
+sp7-powerlab trial promote trial-xxxx
+~~~
+
+只有 VERIFIED_WINNER 能 promotion。
+
+## 9. 用户体验反馈
+
+~~~bash
+sp7-powerlab feedback good --envelope INTERACTIVE_EFFICIENT
+
+sp7-powerlab feedback sluggish \
+  --trial-id trial-xxxx \
+  --notes "remote interaction feels slower"
+~~~
+
+负面反馈是重要 outcome。
+
+不要因为 BAT 更低而忽略卡顿。
+
+## 10. Envelope
+
+~~~bash
+sp7-powerlab envelope list
+sp7-powerlab envelope inspect INTERACTIVE_EFFICIENT
+~~~
+
+Manual override：
 
 ~~~bash
 sp7-powerlab envelope override INTERACTIVE_EFFICIENT
 sp7-powerlab envelope clear-override
 ~~~
 
-## Feedback
+普通控制只接受 verified envelope。
+
+## 11. Thermal
+
+THERMAL_PRESSURE / THROTTLING 时：
+
+- active trial 应回滚；
+- Controller 优先 THERMAL_SAFE；
+- validated thermal safety provider 保持独立；
+- 先检查 workload 是否异常；
+- 持续高本地负载优先考虑远程执行，而不是放宽热安全。
+
+## 12. Suspend / Resume
+
+Resume 后：
+
+- 不信任 suspend gap 内的 BAT integration；
+- experiment-local rolling state 重建；
+- resume grace 内不自动控制；
+- HWP actual state 重新 reconcile。
+
+如果 resume 后当前 envelope 和真实 HWP 不一致，应以真实 HWP snapshot/reconcile 为准。
+
+## 13. Service restart
+
+重启时不继续跨重启 active trial。
+
+未完成 trial：
+
+- 尝试恢复 baseline snapshot；
+- 标记 rolled back/failed；
+- rollback integrity 不可信时 Control 进入 EMERGENCY/READ_ONLY。
+
+## 14. Drift
+
+慢性 drift 看 FrozenReferenceBaseline 对 recent distribution。
+
+不要让 adaptive recent baseline 吞掉长期退化。
+
+出现 sustained drift：
+
+- 打开 investigation；
+- diagnostic burst；
+- 不直接开始参数搜索。
+
+## 15. STABLE
+
+检查：
 
 ~~~bash
-sp7-powerlab feedback good --envelope INTERACTIVE_EFFICIENT
-sp7-powerlab feedback sluggish --trial-id trial-xxxx --notes "..."
+sp7-powerlab lifecycle readiness
+sp7-powerlab lifecycle coverage
 ~~~
 
-负面 trial feedback 会立即回滚。
+STABLE 下：
 
-如果负面反馈发生在 revalidation 之后、promotion 之前，该 VERIFIED_WINNER
-也会被改成 REJECTED，不能继续 promotion。
+- core telemetry 保留；
+- expensive attribution 降频；
+- Scheduler 睡眠；
+- 无主动 trial；
+- 异常时 diagnostic burst。
 
-## Trial promotion
+如果真实数据不再支持当前配置，才 reopen：
 
 ~~~bash
-sp7-powerlab trial status --trial-id trial-xxxx
-sp7-powerlab trial promote trial-xxxx
+sp7-powerlab lifecycle reopen --reason "confirmed regression"
 ~~~
 
-只有 VERIFIED_WINNER 能 promotion；Level 0/1 不允许。
+## 16. Net Benefit
 
-## Runtime reset
-
-只在 v1→v2 或明确丢弃本地 DB 时：
+历史：
 
 ~~~bash
-sp7-powerlab reset-runtime --yes
+sp7-powerlab overhead history
 ~~~
 
-## Git knowledge
+结论：
 
 ~~~bash
+sp7-powerlab overhead summary
+~~~
+
+可能结果：
+
+- KEEP_FULL_POWERLAB
+- KEEP_DYNAMIC_REDUCE_MONITORING
+- FIXED_GOOD_ENVELOPE
+- NEED_MORE_DATA
+
+Full PowerLab 没有 practical net gain 时，应简化。
+
+## 17. Git / Knowledge
+
+高频 SQLite 不提交 Git。
+
+代码、配置、文档和 durable knowledge 可以提交。
+
+如果需要长期知识快照：
+
+~~~bash
+sp7-powerlab knowledge-export
 bash scripts/commit-knowledge.sh
 ~~~
 
-默认不会自动 push。
+默认不自动 push。
+
+## 18. 常见排查入口
+
+代码/文件不知道在哪：
+
+docs/PROJECT_MAP.md
+
+不知道项目做到哪：
+
+docs/PROJECT_STATUS.md
+
+不知道设计为什么这样：
+
+PLAN2.md
+
+AI 调教纪律：
+
+docs/LLM_BEHAVIOR.md

@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Surface Pro 7 PowerLab v2 hourly analysis pack
+Description=Run Surface Pro 7 PowerLab hourly analysis pack
 
 [Timer]
 OnBootSec=15min

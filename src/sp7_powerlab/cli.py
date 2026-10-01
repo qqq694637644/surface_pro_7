@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .agent_context import build_agent_context, build_agent_context_without_runtime
 from .analytics import battery_usage_summary
 from .attribution import AttributionEngine
 from .calibration import CalibrationManager
@@ -80,7 +82,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             database = db.health()
         finally:
             db.close()
-    except LegacyDatabaseError as exc:
+    except (LegacyDatabaseError, sqlite3.DatabaseError) as exc:
         database = {"error": str(exc), "legacy_database": True}
     actuator, available, mode = build_actuator(config)
     _ = actuator
@@ -94,6 +96,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "automation_level": int(config.get("automation.level", 0)),
         }
     )
+    return 0
+
+
+def cmd_agent_context(args: argparse.Namespace) -> int:
+    config = config_from_args(args)
+    try:
+        db = Database(config.path("storage.database"))
+    except LegacyDatabaseError as exc:
+        emit(build_agent_context_without_runtime(config, error=str(exc)))
+        return 0
+    registry = EnvelopeRegistry(ROOT, db)
+    try:
+        emit(build_agent_context(config, db, registry))
+    finally:
+        db.close()
     return 0
 
 
@@ -910,7 +927,7 @@ def cmd_knowledge_export(args: argparse.Namespace) -> int:
         pack = build_knowledge_pack(config, db, registry)
         directory = ROOT / "history" / "continuous"
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "knowledge-v2.json"
+        path = directory / "knowledge.json"
         path.write_text(
             json.dumps(pack, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
             encoding="utf-8",
@@ -955,7 +972,7 @@ def cmd_root_helper(args: argparse.Namespace) -> int:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sp7-powerlab",
-        description="Surface Pro 7 battery-life optimization lab v2",
+        description="Surface Pro 7 battery-life optimization lab",
     )
     p.add_argument("--version", action="version", version=__version__)
     p.add_argument("--config")
@@ -963,6 +980,9 @@ def parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor")
     doctor.set_defaults(func=cmd_doctor)
+
+    agent_context = sub.add_parser("agent-context")
+    agent_context.set_defaults(func=cmd_agent_context)
 
     reset = sub.add_parser("reset-runtime")
     reset.add_argument("--yes", action="store_true")

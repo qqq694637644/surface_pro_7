@@ -7,7 +7,7 @@ from sp7_powerlab.envelopes import EnvelopeRegistry
 from sp7_powerlab.evidence import hard_strata_key
 from sp7_powerlab.experiments import TrialManager
 from sp7_powerlab.storage import Database
-from sp7_powerlab.waste import brightness_bucket
+from sp7_powerlab.unexpected_power import brightness_bucket
 
 
 class FakeActuator:

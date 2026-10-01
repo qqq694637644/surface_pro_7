@@ -2,7 +2,7 @@ from pathlib import Path
 
 from sp7_powerlab.config import load_config
 from sp7_powerlab.storage import Database
-from sp7_powerlab.waste import UnexpectedPowerDetector
+from sp7_powerlab.unexpected_power import UnexpectedPowerDetector
 
 
 def rollup(ts, power):

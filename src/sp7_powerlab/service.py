@@ -34,7 +34,7 @@ from .scheduler import CandidateScheduler
 from .storage import Database
 from .telemetry import TelemetryCollector
 from .thermal import ThermalObserver
-from .waste import UnexpectedPowerDetector, brightness_bucket, remote_bucket
+from .unexpected_power import UnexpectedPowerDetector, brightness_bucket, remote_bucket
 
 
 def fingerprint_hash(value: dict[str, Any]) -> str:

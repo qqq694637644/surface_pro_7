@@ -153,7 +153,7 @@ class CandidateScheduler:
         if not isinstance(measurement_trust, dict) or measurement_trust.get("status") != "READY":
             reasons.append("measurement_trust_not_ready")
 
-        baseline = self.registry.get(baseline_name)
+        baseline = self.db.envelope(baseline_name)
         if not baseline or baseline.get("status") != "VERIFIED":
             reasons.append("baseline_not_verified")
 
@@ -209,6 +209,34 @@ class CandidateScheduler:
             reasons.append("cpu_headroom_below_minimum_useful_effect")
 
         return not reasons, reasons, details
+
+    def eligibility(
+        self,
+        *,
+        baseline_name: str,
+        ux_regression: bool = False,
+        rollup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        rollup = rollup or self._latest_rollup()
+        eligible, reasons, details = self._eligibility(
+            baseline_name=baseline_name,
+            rollup=rollup,
+        )
+        baseline = self.db.envelope(baseline_name)
+        potential_neighbor_count = 0
+        if baseline:
+            potential_neighbor_count = len(
+                self._candidate_changes(
+                    baseline,
+                    ux_regression=ux_regression,
+                )
+            )
+        return {
+            "eligible": eligible,
+            "reasons": reasons,
+            "details": details,
+            "potential_neighbor_count": potential_neighbor_count,
+        }
 
     def _candidate_changes(
         self,
@@ -268,7 +296,7 @@ class CandidateScheduler:
                 "candidates": [],
             }
 
-        baseline = self.registry.get(baseline_name)
+        baseline = self.db.envelope(baseline_name)
         assert baseline is not None
         epoch_id = str((self.db.active_evidence_epoch() or {})["epoch_id"])
         existing = {

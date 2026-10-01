@@ -470,7 +470,7 @@ class Database:
             legacy_markers = {"contexts", "profiles", "sessions", "task_runs"}
             if tables & legacy_markers:
                 raise LegacyDatabaseError(
-                    "v1 database detected. PowerLab v2 does not migrate v1 runtime data; "
+                    "v1 database detected. PowerLab does not migrate legacy runtime data; "
                     "run 'sp7-powerlab reset-runtime --yes' after backing it up if desired."
                 )
 

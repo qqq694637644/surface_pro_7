@@ -1,15 +1,115 @@
-# AI loop v2
+# AI Loop
 
-LLM 不做实时 controller。
+PowerLab Agent 是慢速研究/调查/工程层，不是实时 DVFS controller。
 
-## 每小时输入
+AI 启动入口：
 
-knowledge pack 包含 BAT W / drain、demand、thermal、verified envelope、control actions、
-UnexpectedPower/thermal events、investigations、EvidenceDecision、noise/reference evidence、
-用户反馈、rejection memory、usage coverage、net-benefit assessment、system fingerprint
-和 calibration version。
+1. 读 AGENTS.md。
+2. 读 docs/PROJECT_STATUS.md。
+3. 运行 sp7-powerlab agent-context。
+4. 只加载当前问题需要的额外材料。
 
-## 允许动作
+## 1. 两种上下文
+
+### agent-context
+
+用于快速建立当前事实。
+
+内容包括：
+
+- Git/schema
+- hardware contract
+- Control Safety
+- Learning Lifecycle
+- battery/calibration
+- Measurement Trust
+- Evidence/reference/noise
+- active trial/investigation
+- Scheduler gate
+- coverage
+- Net Benefit
+- next stage
+
+它应该是大多数 Agent turn 的第一入口。
+
+### knowledge pack
+
+用于需要更长历史时。
+
+~~~bash
+sp7-powerlab-agent hourly
+~~~
+
+包含：
+
+- recent BAT/rollups
+- thermal/demand
+- control actions
+- evidence decisions
+- investigations
+- UnexpectedPower
+- trials
+- feedback
+- rejection memory
+- coverage
+- net benefit
+- versions
+
+不要每次都把整个历史 pack 塞给模型。
+
+## 2. Agent cadence
+
+推荐：
+
+### Event-driven
+
+当出现：
+
+- UnexpectedPower
+- sustained drift
+- thermal incident
+- user complaint
+- failed trial
+- system/software compatibility change
+
+触发调查。
+
+### Slow periodic review
+
+用于：
+
+- 检查长期 drift
+- 总结 evidence
+- 判断是否该进入 STABLE
+- 判断复杂度是否值得保留
+
+### User-driven
+
+用户主动要求：
+
+- 研究
+- 解释
+- 试验
+- 改代码/配置
+- 做系统 review
+
+固定 hourly 可以作为一种 slow-review transport，但不是设计要求，也不意味着每小时都必须修改系统。
+
+## 3. 决策优先级
+
+Agent 应优先：
+
+1. 判断测量是否可信。
+2. 调查 UnexpectedPower。
+3. 查软件/驱动/硬解/device regression。
+4. 使用已有 verified envelope。
+5. 最后才做 HWP candidate tuning。
+
+不要把“可以调参数”当成“应该调参数”。
+
+## 4. Structured actions
+
+可选结构化 decision contract：
 
 - NO_CHANGE
 - NEED_MORE_DATA
@@ -21,31 +121,54 @@ UnexpectedPower/thermal events、investigations、EvidenceDecision、noise/refer
 - PROMOTE_ENVELOPE
 - PROPOSE_MANUAL_RECALIBRATION
 
-## 优先级
+这些 action 是便利协议。
 
-LLM 必须优先：
+拥有 Bash 的 Agent 不被限制只能使用它们。
 
-1. 调查 UnexpectedPower，并区分 expected workload、regression 与 confirmed actionable waste。
-2. 查软件/驱动/硬解回归。
-3. 再考虑 HWP envelope tuning。
-4. 最后才考虑会牺牲 UX 的方案。
+但 active trial 的 deterministic Evidence contract 仍不能被临时绕过。
 
-LLM proposal 不是 reward。PowerLab 先用 A1/B1/A2 完成第一次 crossover；第一次达到
-provisional win 后，必须重新采 A3，再用 A3/B2 做独立 revalidation。B2 必须独立超过
-minimum useful effect，且跨 trial 累积证据只能发生在同一 hard evidence epoch。
-PSI/体验、thermal、media continuity、data quality 与用户负面反馈仍可否决候选。
+## 5. 典型长期闭环
 
-稳定运行时最常见动作应该是 NO_CHANGE。
+~~~
+agent-context
+  |
+  +--> normal/STABLE
+  |      |
+  |      +--> NO_CHANGE
+  |
+  +--> Measurement Trust blocked
+  |      |
+  |      +--> gather/repair measurement
+  |
+  +--> UnexpectedPower
+  |      |
+  |      +--> investigate -> verify hypothesis
+  |
+  +--> optimization open
+         |
+         +--> inspect Scheduler candidate
+                |
+                +--> trial
+                       |
+                       +--> deterministic Evidence
+                              |
+                              +--> keep/reject/equivalent
+~~~
 
-## Governance boundary
+## 6. Agent 不应该制造永久忙碌
 
-GPT-5.6 可以拥有用户提供的 Bash/workspace/MCP 等通用用户态能力。
-Automation Level 约束的是 PowerLab daemon / Scheduler 的默认自动行为，而不是把同 UID
-Agent 伪装成技术上不可绕过的权限沙箱。
+长期目标是收敛。
 
-Level 2 默认仍采用“proposal → 用户审核 → trial/promotion”的治理方式；Level 3 才允许
-本地 Scheduler 在全部 safety/evidence/budget gate 通过后自动开始低风险 trial；
-Level 4 且 `auto_promote=true` 时才允许 daemon 自动 promotion。
+如果：
 
-真正不能由 Agent 临时覆盖的是确定性 runtime contract：validated thermal safety、
-transactional HWP/read-back/rollback，以及 active trial 的 Evidence 判分标准。
+- measurement noise 吃掉 candidate effect；
+- 搜索邻域已经耗尽；
+- dynamic controller 没净收益；
+- monitoring overhead 太高；
+- fixed-good 已经足够；
+
+Agent 应建议停止、冻结或删除复杂度。
+
+正常成熟状态是：
+
+NO_CHANGE

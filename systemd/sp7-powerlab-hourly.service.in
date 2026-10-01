@@ -1,8 +1,8 @@
 [Unit]
-Description=Surface Pro 7 PowerLab v2 hourly knowledge pack
+Description=Surface Pro 7 PowerLab hourly knowledge pack
 
 [Service]
 Type=oneshot
 WorkingDirectory=@ROOT@
 Environment=SP7_POWERLAB_ROOT=@ROOT@
-ExecStart=@POWERLAB_BIN@ hourly --output @ROOT@/runtime/hourly-pack-v2.json
+ExecStart=@POWERLAB_BIN@ hourly --output @ROOT@/runtime/hourly-pack.json

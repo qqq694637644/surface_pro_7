@@ -6,10 +6,12 @@
 bash scripts/install-user-services.sh
 ~~~
 
-安装用户级 sp7-powerlab.service、sp7-powerlab-hourly.service 和 timer。
+安装用户级 sp7-powerlab.service，以及可选的 slow-review hourly service/timer。
 
 主 service 负责 telemetry、demand、thermal、controller、trial tick、UnexpectedPower
 detection，以及在 automation level 3+ 下受 gate 约束的 Candidate Scheduler。
+
+hourly service 只是 Agent slow-review 的一种 transport，不是“每小时必须修改系统”的设计要求。
 
 ## Root helper
 
@@ -48,7 +50,8 @@ doctor 会报告已知冲突。
 - Level 3：全部 safety/evidence/budget gate 通过后，daemon 可自动开始低风险 trial。
 - Level 4：满足条件且 `auto_promote=true` 时允许 auto-promotion。
 
-个人设备建议长期停留在 1–2，等真机数据充分后再提高。
+个人设备建议先停留在 0–2，等 Measurement Trust、rollback、thermal preemption、
+independent revalidation 和 stop rules 都经过真机验证后再提高。
 
 个人使用时可以由用户向 GPT-5.6 提供 Bash/workspace/MCP 等通用用户态能力。
 `sp7-powerlab-agent` 只是便利入口，不是权限沙箱。无论 Agent 具有什么用户态能力，
