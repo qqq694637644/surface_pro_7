@@ -436,6 +436,84 @@ def test_passively_waiting_trial_rolls_back_without_restoring_old_snapshot(proje
         db.close()
 
 
+def test_trial_is_invalidated_when_hard_evidence_epoch_changes_while_waiting(
+    project_root,
+):
+    db, _registry, actuator, manager = make_manager(project_root)
+    try:
+        trial = manager.start(proposal(), base_sample(100))
+        original_epoch = trial["target"]["evidence_epoch_id"]
+        new_epoch = db.ensure_evidence_epoch(
+            hard_identity_hash="hard-new",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=1,
+            payload={},
+        )
+        assert new_epoch != original_epoch
+
+        rolled = manager.tick(base_sample(110))
+
+        assert rolled["state"] == "ROLLED_BACK"
+        assert "hard evidence epoch changed" in rolled["result"]["reason"]
+        assert actuator.restores == 0
+    finally:
+        db.close()
+
+
+def test_trial_restores_baseline_when_hard_evidence_epoch_changes_mid_arm(
+    project_root,
+):
+    db, _registry, actuator, manager = make_manager(project_root)
+    try:
+        trial = manager.start(proposal(), base_sample(100))
+        manager.tick(base_sample(100))
+        assert db.get_trial(trial["trial_id"])["current_arm"] == "A1"
+
+        db.ensure_evidence_epoch(
+            hard_identity_hash="hard-new",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=1,
+            payload={},
+        )
+        rolled = manager.tick(base_sample(110))
+
+        assert rolled["state"] == "ROLLED_BACK"
+        assert "hard evidence epoch changed" in rolled["result"]["reason"]
+        assert actuator.restores == 1
+        assert db.get_meta("current_envelope") == "INTERACTIVE_EFFICIENT"
+    finally:
+        db.close()
+
+
+def test_epoch_change_restores_hardware_but_does_not_reassert_invalid_baseline(
+    project_root,
+):
+    db, registry, actuator, manager = make_manager(project_root)
+    try:
+        trial = manager.start(proposal(), base_sample(100))
+        manager.tick(base_sample(100))
+        assert db.get_trial(trial["trial_id"])["current_arm"] == "A1"
+
+        registry.set_status("INTERACTIVE_EFFICIENT", "NEEDS_REVALIDATION")
+        db.ensure_evidence_epoch(
+            hard_identity_hash="hard-new",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=1,
+            payload={},
+        )
+        rolled = manager.tick(base_sample(110))
+
+        assert rolled["state"] == "ROLLED_BACK"
+        assert actuator.restores == 1
+        assert actuator.state["max_perf_pct"] == 60
+        assert db.get_meta("current_envelope") is None
+    finally:
+        db.close()
+
+
 def test_candidate_caused_regressions_are_kept_as_outcomes(project_root):
     db, _registry, _actuator, manager = make_manager(project_root)
     try:
@@ -707,6 +785,8 @@ def test_promoted_trial_negative_feedback_restores_previous_verified_revision(
             {"max_perf_pct": 50},
         )
         snapshot = actuator.snapshot()
+        active_epoch = db.active_evidence_epoch()
+        assert active_epoch is not None
         trial_id = "trial-promoted-feedback"
         db.create_trial(
             {
@@ -715,7 +795,7 @@ def test_promoted_trial_negative_feedback_restores_previous_verified_revision(
                 "kind": "envelope",
                 "baseline_envelope": "INTERACTIVE_EFFICIENT",
                 "candidate": candidate,
-                "target": {},
+                "target": {"evidence_epoch_id": active_epoch["epoch_id"]},
                 "validation": {},
                 "snapshot": snapshot,
                 "current_arm": None,
@@ -743,5 +823,57 @@ def test_promoted_trial_negative_feedback_restores_previous_verified_revision(
         assert restored["max_perf_pct"] == 60
         assert restored["revision"] >= 3
         assert actuator.state["max_perf_pct"] == 60
+    finally:
+        db.close()
+
+
+def test_verified_winner_cannot_be_promoted_after_hard_evidence_epoch_changes(
+    project_root,
+):
+    db, _registry, _actuator, manager = make_manager(project_root)
+    try:
+        trial = manager.start(proposal(), base_sample(100))
+        db.update_trial(
+            trial["trial_id"],
+            state="VERIFIED_WINNER",
+            result={"verdict": "WIN"},
+        )
+        db.ensure_evidence_epoch(
+            hard_identity_hash="hard-new",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=1,
+            payload={},
+        )
+
+        with pytest.raises(TrialError, match="evidence epoch is no longer current"):
+            manager.promote(trial["trial_id"])
+    finally:
+        db.close()
+
+
+def test_verified_winner_cannot_be_promoted_after_measurement_trust_is_invalidated(
+    project_root,
+):
+    db, _registry, _actuator, manager = make_manager(project_root)
+    try:
+        trial = manager.start(proposal(), base_sample(100))
+        db.update_trial(
+            trial["trial_id"],
+            state="VERIFIED_WINNER",
+            result={"verdict": "WIN"},
+        )
+        trust = db.get_meta("measurement_trust")
+        db.set_meta(
+            "measurement_trust",
+            {
+                **trust,
+                "status": "BLOCKED",
+                "reasons": ["test_invalidation"],
+            },
+        )
+
+        with pytest.raises(TrialError, match="Measurement Trust READY"):
+            manager.promote(trial["trial_id"])
     finally:
         db.close()

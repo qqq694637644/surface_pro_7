@@ -424,6 +424,14 @@ arm 切换后重置 experiment-local rolling buffers。
 
 旧 hard epoch evidence 不直接用于当前 promotion。
 
+Active trial 必须固定其启动时的 hard evidence epoch。hard epoch 一旦在 trial
+期间变化，整次 trial 必须 rollback/终止；旧 arm 不得暂停后在新 epoch 中继续，
+也不得在 evaluation 时重新标记成新 epoch evidence。
+
+已经完成但尚未 promotion 的 winner 同样受此约束：只有 trial 的固定 hard
+evidence epoch 仍是 current epoch，且当前 Measurement Trust 仍与该 epoch 匹配，
+才允许 promotion；否则必须重新验证。
+
 ### 5.2 Compatibility Tags
 
 频繁软件变化只局部影响相关 evidence，例如：

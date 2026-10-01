@@ -17,7 +17,7 @@ sp7-powerlab agent-context
 当前 runtime：
 
 - SQLite schema v5
-- evidence semantics v2
+- evidence semantics v3
 - 旧 runtime schema fail-fast，不维护兼容迁移
 - AI 入口：AGENTS.md + sp7-powerlab agent-context
 - 设计合同：PLAN2.md

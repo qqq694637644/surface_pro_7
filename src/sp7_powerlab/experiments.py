@@ -257,6 +257,7 @@ class TrialManager:
             candidate = self.registry.candidate_from_change(baseline, dict(proposal["changes"]))
         validation = self._validation_for_proposal(proposal, current_sample)
         target = {
+            "evidence_epoch_id": str(evidence_epoch["epoch_id"]),
             "battery_epoch": current_sample.get("battery_epoch"),
             "brightness_bucket": brightness_bucket(current_sample.get("brightness_pct")),
             "brightness_pct": current_sample.get("brightness_pct"),
@@ -441,9 +442,12 @@ class TrialManager:
         candidate_key = str(trial.get("candidate", {}).get("content_hash") or "")
         if not candidate_key:
             return
-        epoch = self.db.active_evidence_epoch()
+        target = trial.get("target") or {}
+        trial_epoch_id = str(target.get("evidence_epoch_id") or "")
+        if not trial_epoch_id:
+            trial_epoch_id = str((self.db.active_evidence_epoch() or {}).get("epoch_id") or "")
         previous = self.db.candidate_frontier_entry(candidate_key) or {}
-        if previous.get("evidence_epoch_id") != (epoch or {}).get("epoch_id"):
+        if str(previous.get("evidence_epoch_id") or "") != trial_epoch_id:
             previous = {}
         attempts = int(previous.get("attempts") or 0)
         if status == "TESTING":
@@ -451,7 +455,7 @@ class TrialManager:
         self.db.upsert_candidate_frontier(
             {
                 "candidate_key": candidate_key,
-                "evidence_epoch_id": (epoch or {}).get("epoch_id"),
+                "evidence_epoch_id": trial_epoch_id or None,
                 "baseline_envelope": str(trial.get("baseline_envelope") or ""),
                 "status": status,
                 "attempts": attempts,
@@ -551,7 +555,12 @@ class TrialManager:
             before=before,
             after=result.get("after"),
         )
-        self.db.set_meta("current_envelope", trial.get("baseline_envelope"))
+        baseline_name = str(trial.get("baseline_envelope") or "")
+        baseline = self.db.envelope(baseline_name) if baseline_name else None
+        self.db.set_meta(
+            "current_envelope",
+            baseline_name if baseline and baseline.get("status") == "VERIFIED" else None,
+        )
         return True
 
     def _begin_arm(self, trial: dict[str, Any], arm: str, ts: float, *, settle: bool) -> None:
@@ -694,14 +703,17 @@ class TrialManager:
         hard_reasons = [
             reason for reason in (result.get("reasons") or []) if reason != "power_saving_too_small"
         ]
+        trial_epoch_id = str((trial.get("target") or {}).get("evidence_epoch_id") or "")
         evidence_epoch = self.db.active_evidence_epoch() or {}
+        if not trial_epoch_id or str(evidence_epoch.get("epoch_id") or "") != trial_epoch_id:
+            raise TrialError("hard evidence epoch changed before trial evaluation")
         candidate_key = str(trial["candidate"].get("content_hash") or "")
         episode = build_crossover_episode(
             trial_id=trial["trial_id"],
             candidate_key=candidate_key,
             stage=stage,
             arm_measurements=measurements,
-            evidence_epoch_id=evidence_epoch.get("epoch_id"),
+            evidence_epoch_id=trial_epoch_id,
             constraint_reasons=hard_reasons,
         )
         self.db.add_crossover_episode(episode)
@@ -878,6 +890,21 @@ class TrialManager:
         if not trial:
             return None
 
+        target = trial.get("target") or {}
+        trial_epoch = str(target.get("evidence_epoch_id") or "")
+        active_epoch = self.db.active_evidence_epoch()
+        active_epoch_id = str((active_epoch or {}).get("epoch_id") or "")
+        sample_epoch_id = str(sample.get("evidence_epoch") or "")
+        if (
+            not trial_epoch
+            or active_epoch_id != trial_epoch
+            or (sample_epoch_id and sample_epoch_id != trial_epoch)
+        ):
+            return self.rollback(
+                trial["trial_id"],
+                "hard evidence epoch changed during trial",
+            )
+
         passive_wait = trial["state"] in {
             "WAITING_FOR_COMPARABLE_WINDOW",
             "REVALIDATING",
@@ -1027,6 +1054,17 @@ class TrialManager:
             raise TrialError("only VERIFIED_WINNER trials can be promoted")
         if int(self.config.get("automation.level", 0)) < 2:
             raise TrialError("automation level must be >= 2 to promote a trial")
+        trial_epoch_id = str((trial.get("target") or {}).get("evidence_epoch_id") or "")
+        active_epoch = self.db.active_evidence_epoch()
+        if not trial_epoch_id or str((active_epoch or {}).get("epoch_id") or "") != trial_epoch_id:
+            raise TrialError(
+                "trial evidence epoch is no longer current; revalidation is required before promotion"
+            )
+        measurement_trust = self.db.get_meta("measurement_trust", {})
+        if not measurement_trust_matches_epoch(measurement_trust, active_epoch):
+            raise TrialError(
+                "current evidence epoch requires Measurement Trust READY before promotion"
+            )
         negative = [
             item
             for item in self.db.recent_feedback(200)
