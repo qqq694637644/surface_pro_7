@@ -25,7 +25,7 @@ from .longterm import (
     StableReadiness,
     UsageCoverage,
     assess_net_benefit,
-    compare_meter_runs,
+    compare_paired_meter_runs,
 )
 from .measurement import assess_measurement_trust, characterize_battery_gauge
 from .scheduler import CandidateScheduler
@@ -642,9 +642,7 @@ def cmd_evidence_trust(args: argparse.Namespace) -> int:
             configured_min_arm_seconds=float(config.get("experiments.min_block_seconds", 300.0)),
             energy_quantum_multiplier=float(config.get("evidence.gauge_quantum_multiplier", 8.0)),
             max_gap_seconds=float(config.get("collector.max_gap_seconds", 45.0)),
-            max_consistency_ratio=float(
-                config.get("evidence.max_energy_consistency_ratio", 0.35)
-            ),
+            max_consistency_ratio=float(config.get("evidence.max_energy_consistency_ratio", 0.35)),
             max_consistency_abs_wh=float(
                 config.get("evidence.max_energy_consistency_abs_wh", 0.05)
             ),
@@ -698,18 +696,40 @@ NET_BENEFIT_CAPTURE_MODES = {
 }
 
 
-def _meter_pair(db: Database, reference_id: str, candidate_id: str) -> tuple[dict[str, Any], dict[str, Any], str]:
-    reference = db.minimal_meter_run(reference_id)
-    candidate = db.minimal_meter_run(candidate_id)
-    if not reference:
-        raise SystemExit(f"unknown MinimalMeter reference run: {reference_id}")
-    if not candidate:
-        raise SystemExit(f"unknown MinimalMeter candidate run: {candidate_id}")
-    if reference.get("status") != "COMPLETE" or candidate.get("status") != "COMPLETE":
-        raise SystemExit("Net Benefit comparison requires two COMPLETE MinimalMeter runs")
-    if reference.get("capture_mode") != "FIXED_GOOD":
-        raise SystemExit("reference MinimalMeter run must use capture mode FIXED_GOOD")
-    candidate_mode = str(candidate.get("capture_mode") or "")
+def _meter_campaign(
+    db: Database,
+    reference_before_id: str,
+    candidate_first_id: str,
+    candidate_second_id: str,
+    reference_after_id: str,
+    *,
+    max_interblock_gap_seconds: float = 900.0,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], str]:
+    reference_before = db.minimal_meter_run(reference_before_id)
+    candidate_first = db.minimal_meter_run(candidate_first_id)
+    candidate_second = db.minimal_meter_run(candidate_second_id)
+    reference_after = db.minimal_meter_run(reference_after_id)
+    if not reference_before:
+        raise SystemExit(f"unknown MinimalMeter reference-before run: {reference_before_id}")
+    if not candidate_first:
+        raise SystemExit(f"unknown MinimalMeter first candidate run: {candidate_first_id}")
+    if not candidate_second:
+        raise SystemExit(f"unknown MinimalMeter second candidate run: {candidate_second_id}")
+    if not reference_after:
+        raise SystemExit(f"unknown MinimalMeter reference-after run: {reference_after_id}")
+    if len({reference_before_id, candidate_first_id, candidate_second_id, reference_after_id}) != 4:
+        raise SystemExit("Net Benefit A-B-B-A comparison requires four distinct MinimalMeter runs")
+    runs = (reference_before, candidate_first, candidate_second, reference_after)
+    if any(run.get("status") != "COMPLETE" for run in runs):
+        raise SystemExit("Net Benefit A-B-B-A comparison requires four COMPLETE MinimalMeter runs")
+    if (
+        reference_before.get("capture_mode") != "FIXED_GOOD"
+        or reference_after.get("capture_mode") != "FIXED_GOOD"
+    ):
+        raise SystemExit("Net Benefit A-B-B-A references must use capture mode FIXED_GOOD")
+    candidate_mode = str(candidate_first.get("capture_mode") or "")
+    if str(candidate_second.get("capture_mode") or "") != candidate_mode:
+        raise SystemExit("both Net Benefit candidate blocks must use the same capture mode")
     result_mode = NET_BENEFIT_CAPTURE_MODES.get(candidate_mode)
     if result_mode is None:
         raise SystemExit(
@@ -725,58 +745,136 @@ def _meter_pair(db: Database, reference_id: str, candidate_id: str) -> tuple[dic
         "calibration_version",
         "evidence_semantics_version",
     )
-    mismatched = [field for field in provenance_fields if reference.get(field) != candidate.get(field)]
+    mismatched = [
+        field for field in provenance_fields if len({str(run.get(field)) for run in runs}) != 1
+    ]
     if mismatched:
-        raise SystemExit(
-            "MinimalMeter provenance mismatch: " + ", ".join(sorted(mismatched))
+        raise SystemExit("MinimalMeter provenance mismatch: " + ", ".join(sorted(mismatched)))
+    if reference_before.get("envelope") != reference_after.get("envelope") or reference_before.get(
+        "envelope_content_hash"
+    ) != reference_after.get("envelope_content_hash"):
+        raise SystemExit("A-B-B-A fixed reference definition changed between reference blocks")
+    if candidate_mode == "MONITORING" and (
+        any(
+            reference_before.get("envelope") != run.get("envelope")
+            for run in (candidate_first, candidate_second)
         )
-    if candidate_mode == "MONITORING" and reference.get("envelope") != candidate.get("envelope"):
-        raise SystemExit("monitoring overhead comparison requires the same fixed verified envelope")
+        or any(
+            reference_before.get("envelope_content_hash") != run.get("envelope_content_hash")
+            for run in (candidate_first, candidate_second)
+        )
+    ):
+        raise SystemExit("MONITORING comparison requires the same fixed VERIFIED envelope")
+
+    for run in runs:
+        payload = run.get("payload") or {}
+        if int(payload.get("capture_contract_version") or 0) < 2:
+            raise SystemExit("Net Benefit comparison requires capture contract v2 provenance")
+    before_end = float(reference_before.get("end_ts") or 0.0)
+    first_start = float(candidate_first.get("start_ts") or 0.0)
+    first_end = float(candidate_first.get("end_ts") or 0.0)
+    second_start = float(candidate_second.get("start_ts") or 0.0)
+    second_end = float(candidate_second.get("end_ts") or 0.0)
+    after_start = float(reference_after.get("start_ts") or 0.0)
+    if not (before_end <= first_start and first_end <= second_start and second_end <= after_start):
+        raise SystemExit(
+            "Net Benefit A-B-B-A runs are not in reference-candidate-candidate-reference order"
+        )
+    interblock_gaps = (
+        first_start - before_end,
+        second_start - first_end,
+        after_start - second_end,
+    )
+    if any(gap > float(max_interblock_gap_seconds) for gap in interblock_gaps):
+        raise SystemExit("Net Benefit A-B-B-A inter-block gap exceeds the paired-campaign limit")
 
     active_epoch = db.active_evidence_epoch()
     if not active_epoch or str(active_epoch.get("epoch_id") or "") != str(
-        candidate.get("evidence_epoch_id") or ""
+        candidate_first.get("evidence_epoch_id") or ""
     ):
         raise SystemExit("MinimalMeter runs are not from the current evidence epoch")
-    return reference, candidate, result_mode
+    return reference_before, candidate_first, candidate_second, reference_after, result_mode
 
 
 def cmd_overhead_compare(args: argparse.Namespace) -> int:
     config, db = db_from_args(args)
     try:
-        reference, candidate, result_mode = _meter_pair(db, args.reference_run, args.candidate_run)
-        result = compare_meter_runs(
-            reference.get("samples") or [],
-            candidate.get("samples") or [],
+        reference_before, candidate_first, candidate_second, reference_after, result_mode = (
+            _meter_campaign(
+                db,
+                args.reference_before_run,
+                args.candidate_first_run,
+                args.candidate_second_run,
+                args.reference_after_run,
+                max_interblock_gap_seconds=float(
+                    config.get("net_benefit.max_interblock_gap_seconds", 900.0)
+                ),
+            )
+        )
+        trust = db.get_meta("measurement_trust", {})
+        minimum_block_seconds = max(
+            float(config.get("experiments.min_block_seconds", 300.0)),
+            float((trust or {}).get("recommended_min_arm_seconds") or 0.0),
+        )
+        result = compare_paired_meter_runs(
+            reference_before.get("samples") or [],
+            candidate_first.get("samples") or [],
+            candidate_second.get("samples") or [],
+            reference_after.get("samples") or [],
             usable_battery_wh=args.usable_battery_wh,
             max_gap_seconds=float(args.max_gap_seconds),
-            max_consistency_ratio=float(
-                config.get("evidence.max_energy_consistency_ratio", 0.35)
-            ),
+            max_consistency_ratio=float(config.get("evidence.max_energy_consistency_ratio", 0.35)),
             max_consistency_abs_wh=float(
                 config.get("evidence.max_energy_consistency_abs_wh", 0.05)
             ),
+            minimum_block_seconds=minimum_block_seconds,
+            max_brightness_delta_pct=float(
+                config.get("net_benefit.max_brightness_delta_pct", 10.0)
+            ),
+            max_active_fraction_delta=float(
+                config.get("net_benefit.max_active_fraction_delta", 0.15)
+            ),
+            max_media_fraction_delta=float(
+                config.get("net_benefit.max_media_fraction_delta", 0.10)
+            ),
+            max_remote_fraction_delta=float(
+                config.get("net_benefit.max_remote_fraction_delta", 0.10)
+            ),
+            max_network_mbps_delta=float(config.get("net_benefit.max_network_mbps_delta", 5.0)),
+            max_mean_temp_delta_c=float(config.get("net_benefit.max_mean_temp_delta_c", 5.0)),
+            max_reference_drift_w=float(config.get("net_benefit.max_reference_drift_w", 0.30)),
+            max_candidate_delta_spread_w=float(
+                config.get("net_benefit.max_candidate_delta_spread_w", 0.30)
+            ),
+            require_candidate_fixed_hwp=(candidate_first.get("capture_mode") == "MONITORING"),
         )
         result = {
             **result,
-            "reference_run_id": reference["run_id"],
-            "candidate_run_id": candidate["run_id"],
-            "campaign_id": candidate["campaign_id"],
-            "evidence_epoch_id": candidate["evidence_epoch_id"],
-            "battery_epoch": candidate["battery_epoch"],
-            "battery_identity_hash": candidate["battery_identity_hash"],
-            "hard_identity_hash": candidate["hard_identity_hash"],
-            "calibration_version": candidate["calibration_version"],
-            "evidence_semantics_version": candidate["evidence_semantics_version"],
+            "reference_before_run_id": reference_before["run_id"],
+            "candidate_first_run_id": candidate_first["run_id"],
+            "candidate_second_run_id": candidate_second["run_id"],
+            "reference_after_run_id": reference_after["run_id"],
+            "campaign_id": candidate_first["campaign_id"],
+            "evidence_epoch_id": candidate_first["evidence_epoch_id"],
+            "battery_epoch": candidate_first["battery_epoch"],
+            "battery_identity_hash": candidate_first["battery_identity_hash"],
+            "hard_identity_hash": candidate_first["hard_identity_hash"],
+            "calibration_version": candidate_first["calibration_version"],
+            "evidence_semantics_version": candidate_first["evidence_semantics_version"],
+            "fixed_baseline_envelope": reference_before["envelope"],
+            "fixed_baseline_content_hash": reference_before["envelope_content_hash"],
         }
         run_id = db.start_monitoring_overhead_run(
             mode=result_mode,
             payload={
-                "reference_run_id": reference["run_id"],
-                "candidate_run_id": candidate["run_id"],
+                "comparison_design": "A_B_B_A",
+                "reference_before_run_id": reference_before["run_id"],
+                "candidate_first_run_id": candidate_first["run_id"],
+                "candidate_second_run_id": candidate_second["run_id"],
+                "reference_after_run_id": reference_after["run_id"],
                 "usable_battery_wh": args.usable_battery_wh,
                 "mode": result_mode,
-                "campaign_id": candidate["campaign_id"],
+                "campaign_id": candidate_first["campaign_id"],
             },
         )
         db.finish_monitoring_overhead_run(run_id, result)
@@ -1098,10 +1196,17 @@ def cmd_knowledge_export(args: argparse.Namespace) -> int:
 
 
 def cmd_service_run(args: argparse.Namespace) -> int:
-    service = PowerLabService(
-        ROOT,
-        Path(args.config).expanduser() if args.config else None,
-    )
+    try:
+        service = PowerLabService(
+            ROOT,
+            Path(args.config).expanduser() if args.config else None,
+        )
+    except LegacyDatabaseError as exc:
+        print(f"PowerLab runtime schema is incompatible: {exc}", file=sys.stderr)
+        print(
+            "Run 'sp7-powerlab reset-runtime --yes' explicitly before restarting.", file=sys.stderr
+        )
+        return 78
     try:
         service.run(iterations=args.iterations)
     finally:
@@ -1272,8 +1377,10 @@ def parser() -> argparse.ArgumentParser:
     overhead = sub.add_parser("overhead")
     overhead_sub = overhead.add_subparsers(dest="overhead_command", required=True)
     overhead_compare = overhead_sub.add_parser("compare")
-    overhead_compare.add_argument("reference_run")
-    overhead_compare.add_argument("candidate_run")
+    overhead_compare.add_argument("reference_before_run")
+    overhead_compare.add_argument("candidate_first_run")
+    overhead_compare.add_argument("candidate_second_run")
+    overhead_compare.add_argument("reference_after_run")
     overhead_compare.add_argument("--usable-battery-wh", type=float)
     overhead_compare.add_argument("--max-gap-seconds", type=float, default=90.0)
     overhead_compare.set_defaults(func=cmd_overhead_compare)

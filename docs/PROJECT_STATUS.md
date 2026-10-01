@@ -16,8 +16,8 @@ sp7-powerlab agent-context
 
 当前 runtime：
 
-- SQLite schema v6
-- evidence semantics v4
+- SQLite schema v7
+- evidence semantics v5
 - 旧 runtime schema fail-fast，不维护兼容迁移
 - AI 入口：AGENTS.md + sp7-powerlab agent-context
 - 设计合同：PLAN2.md
@@ -87,7 +87,11 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - FrozenReferenceBaseline
 - RecentNoiseDistribution
 - reference/noise rollup 要求 clean Discharging、无 resume/gap 且 valid fraction 达标
+- kernel/linux-surface relevant change 进入 hard evidence epoch
+- browser/Mesa/media backend 使用 media compatibility generation 隔离 media reference/noise
 - hard strata + comparison constraints
+- evidence_scope_key 绑定 hard epoch + compatibility + baseline + reference/workload strata + candidate
+- CrossoverEpisode / EvidenceDecision / CandidateFrontier / retry budget 全部按 evidence scope 聚合
 - Minimum Useful Effect
 - ArmMeasurement
 - CrossoverEpisode
@@ -102,6 +106,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - B2 必须独立达到 MUE
 - state-based washout
 - service-restart rollback
+- 相同 HWP candidate content 不会跨 baseline/workload/compatibility 串 evidence
 
 仍需真机：
 
@@ -148,7 +153,9 @@ Investigation：
 - manual override
 - single-writer ownership
 - limited root helper
+- runtime hardware refresh 会重新 discovery/bind root helper；helper 晚启动不再永久锁死为 READ_ONLY
 - STABLE readiness / usage coverage
+- dirty/transitional rollup 保留在 usage 分母，但不计 trusted coverage
 
 仍需真机：
 
@@ -205,7 +212,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - finite retry
 - feedback/thermal cooldown
 - minimum-arm-duration stop rule
-- frontier memory
+- evidence-scope frontier history/retry memory
 
 当前没有：
 
@@ -264,6 +271,10 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - MinimalMeter end-to-end comparison
 - MinimalMeter capture-time provenance（epoch/battery/fingerprint/calibration/campaign/mode）
 - Net Benefit 使用 time-weighted integrated BAT power，并对 data quality fail-closed
+- capture mode 验证真实 service Automation Level / ControlSafety；FIXED/MONITORING 每点核对实际 HWP
+- brightness/active/media/remote/network/temperature 作为低成本 comparability veto
+- 正式 Net Benefit 使用 A1-B1-B2-A2 paired campaign，检查两个 candidate delta 的方向/spread
+- STABLE 只接受同 hard epoch/campaign/fixed baseline content hash 的三类完整 comparison
 - KEEP_FULL_POWERLAB
 - KEEP_DYNAMIC_REDUCE_MONITORING
 - FIXED_GOOD_ENVELOPE
@@ -275,6 +286,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - probe/DB write 成本
 - dynamic controller 实际净收益
 - full PowerLab 实际净收益
+- 真机 A1-B1-B2-A2 block 时长和 comparability 阈值是否合适
 
 ## 当前最重要的未完成里程碑
 
@@ -320,6 +332,9 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - continuous arbitrary EPP search
 - 持续本地满载作为优化主目标
 - 旧 runtime schema 兼容层
+
+breaking schema mismatch 的 daemon exit status 为 78，systemd 不对该状态无限 restart；需要人工执行
+`sp7-powerlab reset-runtime --yes`。
 
 如果真实 SP7 数据以后证明值得，可以重新评估。
 

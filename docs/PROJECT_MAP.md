@@ -217,6 +217,7 @@ Evidence Engine 和经验噪声模型。
 负责：
 
 - hard strata key
+- relevant compatibility generation / evidence_scope_key
 - FrozenReferenceBaseline
 - RecentNoiseDistribution
 - Minimum Useful Effect
@@ -287,6 +288,7 @@ Candidate Scheduler。
 - thermal cooldown
 - low battery gate
 - finite retry
+- CandidateFrontier 以 evidence_scope_key 为 identity，不以裸 candidate content hash 覆盖历史
 - stop rules
 
 默认优先向低能方向搜索；提高性能主要用于 UX rescue 或有证据支持的 race-to-idle 假设。
@@ -392,9 +394,28 @@ UnexpectedPower detector。
 - UsageCoverage
 - StableReadiness
 - DriftDetector
-- MinimalMeter run comparison
+- MinimalMeter A1-B1-B2-A2 paired comparison
+- brightness/active/media/remote/network/temperature comparability veto
+- fixed baseline content hash / campaign coherence gate
 - minutes gained per charge
 - Net Benefit assessment
+
+`UsageCoverage` 的 total valid time 包含真实但脏的 transitional usage；只有 `reference_eligible=true`
+且有 VERIFIED policy/FrozenReference 的窗口进入 trusted coverage。
+
+### src/sp7_powerlab/minimal_meter_cli.py
+
+Stage E 的低开销 capture 入口。
+
+负责在 capture-time 固定 provenance，并验证实际 runtime mode：
+
+- FIXED_GOOD：service 停止 + actual HWP 每点保持同一 VERIFIED envelope
+- MONITORING：live service + Automation Level 0 + fixed HWP
+- DYNAMIC_CONTROLLER：live CONTROL_ALLOWED service + Automation Level 1
+- FULL_POWERLAB：live CONTROL_ALLOWED service + Automation Level >= 2
+
+同时采集 brightness、active/media/remote fraction 所需信号、basic network、package temperature 和
+actual HWP snapshot。trial/calibration 或 hard context 变化会让 run INVALID。
 
 最终允许系统得出：
 
@@ -485,7 +506,7 @@ thermal model 参数。
 - arm_measurements
 - crossover_episodes
 - evidence_decisions
-- candidate_frontier
+- candidate_frontier（evidence_scope_key 主键；同 candidate content 可保留多个实验 scope）
 - trials
 - feedback
 - rejections

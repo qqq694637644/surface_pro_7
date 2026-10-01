@@ -139,6 +139,8 @@ UnexpectedPower / Drift -> Investigation -> Attribution -> verification
 - Candidate 造成的 thermal / PSI / media / UX 变差是 outcome，不能从实验数据中过滤掉。
 - Initial crossover 和 revalidation 必须独立。
 - 旧 hard evidence epoch 不能直接给当前 promotion 投票。
+- 相同 HWP candidate content 不代表同一个实验问题；baseline、workload/reference stratum 或 relevant
+  compatibility generation 不同，就必须是不同 `evidence_scope_key`，不能累加 WIN/LOSE/frontier。
 - 收益小于 noise / Minimum Useful Effect 时，应允许 PRACTICALLY_EQUIVALENT 并停止折腾。
 - 用户负面体验可以否决节能候选。
 

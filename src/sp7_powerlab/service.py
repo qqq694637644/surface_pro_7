@@ -59,9 +59,7 @@ def _refresh_fingerprint_state(
     fingerprint_payload = system_fingerprint(report)
     versions = fingerprint_payload.get("versions") or {}
     control_fingerprint = {
-        key: value
-        for key, value in fingerprint_payload.items()
-        if key not in {"versions", "kernel"}
+        key: value for key, value in fingerprint_payload.items() if key != "versions"
     }
     control_fingerprint["thermald_version"] = versions.get("thermald")
     control_fingerprint["thermal_config_hash"] = fingerprint_hash(thermal_config)
@@ -72,16 +70,20 @@ def _refresh_fingerprint_state(
     changed = db.set_system_fingerprint(fp_hash, fingerprint_payload)
     if changed:
         registry.mark_verified_needs_revalidation(
-            "BIOS/HWP/thermal-safety/calibration hard control fingerprint changed"
+            "kernel/BIOS/HWP/thermal-safety/calibration hard control fingerprint changed"
         )
 
     software_versions = {
         "kernel": fingerprint_payload.get("kernel"),
         **{key: value for key, value in versions.items() if key != "thermald"},
     }
+    media_keys = {"firefox", "chromium", "google-chrome", "playerctl", "mesa"}
+    media_versions = {key: software_versions.get(key) for key in sorted(media_keys)}
+    media_generation = f"media-{fingerprint_hash(media_versions)}"
+    db.set_meta("media_compatibility_generation", media_generation)
+    db.set_compatibility_tags("media", media_versions)
     previous_versions = db.get_meta("software_versions", {})
     if previous_versions and previous_versions != software_versions:
-        media_keys = {"firefox", "chromium", "google-chrome", "playerctl", "mesa"}
         media_changed = any(
             previous_versions.get(key) != software_versions.get(key) for key in media_keys
         )
@@ -328,14 +330,24 @@ class PowerLabService:
             )
             or None,
         )
-        actuator_available = False
-        if hasattr(self.stack["actuator"], "inspect"):
-            try:
-                actuator_available = bool(self.stack["actuator"].inspect().get("available", True))
-            except Exception:
-                actuator_available = False
-        self.stack["report"] = report
+        actuator, actuator_available, actuator_mode = build_actuator(self.config)
+        previous_actuator_mode = str(self.stack.get("actuator_mode") or "read-only")
+        self.stack["actuator"] = actuator
         self.stack["actuator_available"] = actuator_available
+        self.stack["actuator_mode"] = actuator_mode
+        self.stack["controller"].actuator = actuator
+        self.stack["trials"].actuator = actuator
+        if actuator_mode != previous_actuator_mode:
+            self.db.set_meta(
+                "actuator_rebind",
+                {
+                    "ts": ts,
+                    "previous_mode": previous_actuator_mode,
+                    "current_mode": actuator_mode,
+                    "available": actuator_available,
+                },
+            )
+        self.stack["report"] = report
         self.stack["controller"].hardware_writable = bool(
             report.control_capable and actuator_available
         )
@@ -469,6 +481,12 @@ class PowerLabService:
         evidence_epochs = {
             str(row.get("evidence_epoch")) if row.get("evidence_epoch") else None for row in rows
         }
+        compatibility_generations = {
+            str(row.get("compatibility_generation"))
+            if row.get("compatibility_generation")
+            else None
+            for row in rows
+        }
         battery_epochs = {row.get("battery_epoch") for row in rows}
         battery_statuses = {row.get("battery_status") for row in rows}
         mixed_dimensions: list[str] = []
@@ -479,6 +497,7 @@ class PowerLabService:
             ("user_active", active_states),
             ("remote", remote_buckets),
             ("evidence_epoch", evidence_epochs),
+            ("compatibility_generation", compatibility_generations),
         ):
             if len(values) != 1 or None in values:
                 mixed_dimensions.append(name)
@@ -537,6 +556,11 @@ class PowerLabService:
             "evidence_epoch_id": (
                 next(iter(evidence_epochs))
                 if len(evidence_epochs) == 1 and None not in evidence_epochs
+                else None
+            ),
+            "compatibility_generation": (
+                next(iter(compatibility_generations))
+                if len(compatibility_generations) == 1 and None not in compatibility_generations
                 else None
             ),
             "reference_eligible": not reference_ineligible_reasons,
@@ -741,6 +765,10 @@ class PowerLabService:
                 "trial_id": trial_before.get("trial_id") if trial_before else None,
                 "trial_arm": trial_arm,
                 "evidence_epoch": evidence_epoch,
+                "compatibility_generation": self.db.get_meta(
+                    "media_compatibility_generation",
+                    "media-missing",
+                ),
             }
         )
         self.stack["lifecycle"].synchronize_learning(
@@ -757,6 +785,16 @@ class PowerLabService:
             core_telemetry_valid=self.stack["trials"]._core_telemetry_valid(sample),
             rollback_integrity_ok=self.stack["controller"].rollback_integrity_ok(),
             thermal_emergency=thermal["state"] in {"THERMAL_PRESSURE", "THROTTLING"},
+        )
+        self.db.set_meta(
+            "service_heartbeat",
+            {
+                "ts": float(sample["ts"]),
+                "automation_level": int(self.config.get("automation.level", 0)),
+                "learning_state": self.stack["lifecycle"].learning_state(),
+                "control_state": self.stack["lifecycle"].control_state(),
+                "current_envelope": self.stack["controller"].current_envelope(),
+            },
         )
         self.db.add_sample(sample)
         self.db.add_demand_window(demand)

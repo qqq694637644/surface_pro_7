@@ -61,6 +61,12 @@ def test_root_helper_has_no_sys_admin_capability():
     assert "AmbientCapabilities=" in unit
 
 
+def test_user_service_does_not_restart_forever_on_breaking_schema_mismatch():
+    root = Path(__file__).resolve().parents[1]
+    unit = (root / "systemd/sp7-powerlab.service.in").read_text(encoding="utf-8")
+    assert "RestartPreventExitStatus=78" in unit
+
+
 def test_agent_decision_path_is_confined_to_runtime(project_root: Path):
     inside = agent_cli._runtime_decision_path(
         "runtime/llm-decision.json",

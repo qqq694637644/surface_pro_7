@@ -7,6 +7,7 @@ from sp7_powerlab.evidence import (
     EvidenceEngine,
     NoiseTracker,
     build_crossover_episode,
+    evidence_scope_key,
     hard_strata_key,
     reference_strata_key,
 )
@@ -270,6 +271,49 @@ def test_build_crossover_uses_fresh_revalidation_baseline():
     assert revalidation["baseline_arms"] == ["A3"]
 
 
+def test_evidence_scope_separates_same_candidate_across_baseline_workload_and_compatibility():
+    common = {
+        "evidence_epoch_id": "epoch-a",
+        "candidate_content_hash": "candidate-50pct",
+    }
+    interactive = evidence_scope_key(
+        **common,
+        compatibility_generation="nonmedia",
+        baseline_content_hash="baseline-60pct",
+        reference_strata="interactive-bright40",
+    )
+    remote = evidence_scope_key(
+        **common,
+        compatibility_generation="nonmedia",
+        baseline_content_hash="baseline-50pct",
+        reference_strata="remote-bright40",
+    )
+    media_v1 = evidence_scope_key(
+        **common,
+        compatibility_generation="media-v1",
+        baseline_content_hash="baseline-60pct",
+        reference_strata="media-bright40",
+    )
+    media_v2 = evidence_scope_key(
+        **common,
+        compatibility_generation="media-v2",
+        baseline_content_hash="baseline-60pct",
+        reference_strata="media-bright40",
+    )
+    assert len({interactive, remote, media_v1, media_v2}) == 4
+
+
+def test_media_reference_strata_isolated_by_compatibility_generation():
+    media = {**rollup(1.0, 5.0), "media_playing": True}
+    assert reference_strata_key(
+        {**media, "compatibility_generation": "media-a"}
+    ) != reference_strata_key({**media, "compatibility_generation": "media-b"})
+    nonmedia = {**rollup(1.0, 5.0), "media_playing": False}
+    assert reference_strata_key(
+        {**nonmedia, "compatibility_generation": "media-a"}
+    ) == reference_strata_key({**nonmedia, "compatibility_generation": "media-b"})
+
+
 def test_evidence_engine_contract_win_equivalent_inconclusive_and_lose(project_root: Path):
     config = load_config(project_root)
     db = Database(project_root / "runtime/decisions.sqlite3")
@@ -282,6 +326,7 @@ def test_evidence_engine_contract_win_equivalent_inconclusive_and_lose(project_r
                 {"episode_id": "e2", "valid": True, "paired_effect_w": -0.3},
             ],
             minimum_useful_effect_w=0.1,
+            evidence_scope_key="scope-win",
         )
         assert win["verdict"] == "WIN"
 
@@ -291,6 +336,7 @@ def test_evidence_engine_contract_win_equivalent_inconclusive_and_lose(project_r
                 {"episode_id": "e4", "valid": True, "paired_effect_w": 0.04},
             ],
             minimum_useful_effect_w=0.1,
+            evidence_scope_key="scope-equivalent",
         )
         assert equivalent["verdict"] == "PRACTICALLY_EQUIVALENT"
 
@@ -300,6 +346,7 @@ def test_evidence_engine_contract_win_equivalent_inconclusive_and_lose(project_r
                 {"episode_id": "e6", "valid": True, "paired_effect_w": 0.05},
             ],
             minimum_useful_effect_w=0.1,
+            evidence_scope_key="scope-inconclusive",
         )
         assert inconclusive["verdict"] == "INCONCLUSIVE"
 
@@ -314,6 +361,7 @@ def test_evidence_engine_contract_win_equivalent_inconclusive_and_lose(project_r
                 {"episode_id": "e8", "valid": True, "paired_effect_w": -0.5},
             ],
             minimum_useful_effect_w=0.1,
+            evidence_scope_key="scope-lose",
         )
         assert lose["verdict"] == "LOSE"
         assert "thermal_regression" in lose["reasons"]
@@ -328,6 +376,7 @@ def test_evidence_engine_contract_win_equivalent_inconclusive_and_lose(project_r
                 }
             ],
             minimum_useful_effect_w=0.1,
+            evidence_scope_key="scope-data-quality",
         )
         assert data_quality["verdict"] == "INCONCLUSIVE"
         assert "data_quality_failure" in data_quality["reasons"]
@@ -357,6 +406,7 @@ def test_medium_effect_requires_more_crossover_evidence_than_large_effect(projec
                 {"episode_id": "m2", "valid": True, "paired_effect_w": -0.16},
             ],
             minimum_useful_effect_w=0.1,
+            evidence_scope_key="scope-medium-two",
         )
         assert medium_two["verdict"] == "INCONCLUSIVE"
         assert medium_two["required_evidence_count"] == 3
@@ -369,6 +419,7 @@ def test_medium_effect_requires_more_crossover_evidence_than_large_effect(projec
                 {"episode_id": "m3", "valid": True, "paired_effect_w": -0.14},
             ],
             minimum_useful_effect_w=0.1,
+            evidence_scope_key="scope-medium-three",
         )
         assert medium_three["verdict"] == "WIN"
         assert medium_three["required_evidence_count"] == 3
@@ -379,6 +430,7 @@ def test_medium_effect_requires_more_crossover_evidence_than_large_effect(projec
                 {"episode_id": "l2", "valid": True, "paired_effect_w": -0.28},
             ],
             minimum_useful_effect_w=0.1,
+            evidence_scope_key="scope-large-two",
         )
         assert large_two["verdict"] == "WIN"
         assert large_two["required_evidence_count"] == 2

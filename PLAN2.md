@@ -431,6 +431,7 @@ arm 切换后重置 experiment-local rolling buffers。
 以下变化应创建新 hard epoch：
 
 - battery replacement / battery epoch
+- kernel / linux-surface / CPU power-driver relevant change
 - CPU power driver / HWP control semantics
 - 重要 BIOS/firmware power behavior
 - validated thermal safety provider 语义
@@ -450,14 +451,12 @@ evidence epoch 仍是 current epoch，且当前 Measurement Trust 仍与该 epoc
 
 ### 5.2 Compatibility Tags
 
-频繁软件变化只局部影响相关 evidence，例如：
+不是所有软件变化都需要 hard epoch。当前保守规则：
 
-- kernel/linux-surface
-- browser major
-- Mesa
-- desktop
-- media backend
-- workload family
+- kernel/linux-surface/CPU power-driver relevant change：hard epoch
+- browser major / Mesa / media backend：media compatibility generation
+- desktop 等低影响版本：记录为 advisory，除非真实数据证明需要隔离
+- workload family：进入 evidence scope / comparison constraints
 
 每类 evidence 可声明：
 
@@ -465,9 +464,32 @@ evidence epoch 仍是 current epoch，且当前 Measurement Trust 仍与该 epoc
 - advisory
 - irrelevant
 
-Firefox major upgrade 不应让 ECO_IDLE 历史整体失效。
+Firefox major upgrade 不应让 ECO_IDLE 历史整体失效，但旧 media reference/noise/trial evidence
+不能继续与新 media generation 混投。
 
-### 5.3 Historical Evidence
+### 5.3 Evidence Scope
+
+candidate 的 HWP content hash 只回答“参数内容是否相同”，不能单独作为因果 evidence identity。
+
+所有 crossover accumulation、EvidenceDecision、CandidateFrontier 和 retry budget 必须按：
+
+~~~
+evidence_scope_key = hash(
+    hard evidence epoch,
+    relevant compatibility generation,
+    baseline content hash,
+    reference/workload strata key,
+    candidate content hash
+)
+~~~
+
+聚合。
+
+因此相同 `max_perf_pct=50` 如果来自不同 baseline、不同 workload/reference stratum 或不同
+compatibility generation，必须是不同实验问题。允许保留相同 candidate content hash 作为“参数内容相同”
+的知识，但它们的 WIN/LOSE、attempts、frontier 状态不能互相覆盖或累加。
+
+### 5.4 Historical Evidence
 
 旧证据可以用于：
 
@@ -551,6 +573,10 @@ STABLE 下：
 
 > 最近代表性真实使用时间的大多数已经有可信 verified policy coverage。
 
+这里的 trusted coverage 必须来自 `reference_eligible=true` 的 clean rollup。Charging/resume/gap 等
+transitional rollup 的 valid seconds 仍属于真实 usage 分母，但只能计为 uncovered/untrusted，不能因为
+同一 stratum 已经存在 Frozen Reference 就被重新称为 trusted。
+
 还需要：
 
 - Measurement Trust READY
@@ -631,6 +657,7 @@ UX 正常：
 - negative-feedback cooldown
 - daily/weekly experiment budget
 - minimum arm duration 是否超预算
+- evidence scope 尚未被当前 baseline/workload/compatibility 组合尝试完
 
 ### 7.4 Candidate priority
 
@@ -897,7 +924,7 @@ MinimalMeter + dynamic controller
 MinimalMeter + full PowerLab
 ~~~
 
-Net Benefit 直接来自 end-to-end comparison。
+Net Benefit 直接来自 end-to-end paired comparison，而不是两个任意历史小时均值相减。
 
 MinimalMeter capture 的 provenance 必须在**采集开始时**固定并持久化，至少包括 run/campaign、
 capture mode、battery identity/epoch、hard evidence epoch/fingerprint、calibration version、evidence
@@ -908,9 +935,38 @@ Net Benefit 使用 gap-aware integrated BAT energy / valid discharge duration �
 power。reference 或 candidate 的 BAT consistency / provenance / data-quality gate 失败时，不产生可供
 STABLE 使用的 `candidate_minus_reference_w`。
 
+正式 comparison 使用：
+
+~~~
+A1 = FIXED_GOOD
+B1 = MONITORING / DYNAMIC_CONTROLLER / FULL_POWERLAB
+B2 = 同一个 candidate mode 的第二个独立 block
+A2 = FIXED_GOOD
+~~~
+
+即 A1-B1-B2-A2。四个 block 必须按时间顺序、相邻 block 间隔不超过配置上限、属于同一
+battery/hard/calibration/campaign context，
+并且 A1/A2 的 fixed baseline 名称和 content hash 完全相同。B1/B2 分别形成 paired delta，最终用
+两个 delta 的 median，并要求方向一致、spread 不超过配置上限。
+
+MinimalMeter 同时记录低成本 comparability covariates：brightness、active fraction、media fraction、
+remote fraction、basic network 和 package temperature。它们只用于 veto 明显不可比的 block，不用于
+建立高维统计模型。
+
+capture mode 不能只是用户标签。正式 capture 必须验证：
+
+- FIXED_GOOD：PowerLab service 停止，且每个 sample 的实际 HWP 都匹配同一个 VERIFIED envelope
+- MONITORING：service 正在运行、Automation Level 0，且每个 sample 的实际 HWP 仍匹配 fixed envelope
+- DYNAMIC_CONTROLLER：service 正在运行、Automation Level 1、ControlSafety=CONTROL_ALLOWED
+- FULL_POWERLAB：service 正在运行、Automation Level >= 2、ControlSafety=CONTROL_ALLOWED
+
+capture 中发生 trial/calibration、hard context 改变、fixed-mode HWP 改变或 service mode 失真时，整个
+run 标记 INVALID。
+
 用于 STABLE readiness 的 monitoring / dynamic / full 三种结果必须来自同一个 hard evidence
-epoch 和同一个显式 validation campaign，不能把不同周或不同系统条件下各自最新的一次结果拼成
-“完整比较”。
+epoch、同一个显式 validation campaign、同一个 fixed baseline content hash，并且每种结果本身都已经
+通过 A1-B1-B2-A2 comparability gate。不能把不同周、不同 fixed reference 或不同系统条件下各自最新的
+一次结果拼成“完整比较”。
 
 MonitoringOverhead 只用于解释，不从已经包含 monitoring 的结果中重复扣除。
 

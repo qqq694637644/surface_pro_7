@@ -50,6 +50,17 @@ def test_v5_database_fails_fast_after_evidence_integrity_schema_break(tmp_path: 
         Database(path)
 
 
+def test_v6_database_fails_fast_after_evidence_scope_schema_break(tmp_path: Path):
+    path = tmp_path / "powerlab.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value_json TEXT NOT NULL)")
+    conn.execute("INSERT INTO metadata(key,value_json) VALUES('schema_version','6')")
+    conn.commit()
+    conn.close()
+    with pytest.raises(LegacyDatabaseError, match="schema 6"):
+        Database(path)
+
+
 def test_v1_database_fails_fast(tmp_path: Path):
     path = tmp_path / "powerlab.sqlite3"
     conn = sqlite3.connect(path)
@@ -104,9 +115,10 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
             battery_identity_hash="battery-a",
             hard_identity_hash="hard-a",
             calibration_version=3,
-            evidence_semantics_version=4,
+            evidence_semantics_version=5,
             envelope="INTERACTIVE_EFFICIENT",
-            payload={"capture_contract_version": 1},
+            envelope_content_hash="env-hash",
+            payload={"capture_contract_version": 2, "start_marker": True},
         )
         db.add_minimal_meter_sample(
             run_id,
@@ -128,8 +140,49 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
         assert run["battery_identity_hash"] == "battery-a"
         assert run["hard_identity_hash"] == "hard-a"
         assert run["calibration_version"] == 3
-        assert run["evidence_semantics_version"] == 4
+        assert run["evidence_semantics_version"] == 5
         assert run["envelope"] == "INTERACTIVE_EFFICIENT"
+        assert run["envelope_content_hash"] == "env-hash"
+        assert run["payload"]["start_marker"] is True
+        assert run["payload"]["sample_count"] == 1
         assert len(run["samples"]) == 1
+    finally:
+        db.close()
+
+
+def test_candidate_frontier_keeps_same_content_hash_in_distinct_evidence_scopes(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite3")
+    try:
+        common = {
+            "candidate_key": "candidate-hash",
+            "evidence_epoch_id": "epoch-a",
+            "baseline_envelope": "INTERACTIVE_EFFICIENT",
+            "baseline_content_hash": "baseline-hash",
+            "compatibility_generation": "nonmedia",
+            "status": "INCONCLUSIVE",
+            "attempts": 1,
+            "updated_ts": 1.0,
+            "result": {},
+        }
+        db.upsert_candidate_frontier(
+            {
+                **common,
+                "evidence_scope_key": "scope-interactive",
+                "reference_strata_key": "interactive",
+            }
+        )
+        db.upsert_candidate_frontier(
+            {
+                **common,
+                "evidence_scope_key": "scope-remote",
+                "reference_strata_key": "remote",
+            }
+        )
+        rows = db.candidate_frontier(evidence_epoch_id="epoch-a")
+        assert {row["evidence_scope_key"] for row in rows} == {
+            "scope-interactive",
+            "scope-remote",
+        }
+        assert all(row["candidate_key"] == "candidate-hash" for row in rows)
     finally:
         db.close()

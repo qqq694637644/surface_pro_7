@@ -6,7 +6,12 @@ from typing import Any
 
 from .config import Config, load_machine
 from .envelopes import EnvelopeRegistry
-from .evidence import EvidenceEngine, reference_strata_key
+from .evidence import (
+    EvidenceEngine,
+    evidence_scope_key,
+    reference_strata_key,
+    relevant_compatibility_generation,
+)
 from .lifecycle import COARSE_OPTIMIZATION, CONTROL_ALLOWED, REOPENED, LifecycleManager
 from .measurement import measurement_trust_matches_epoch
 from .storage import Database
@@ -332,12 +337,15 @@ class CandidateScheduler:
         assert baseline is not None
         epoch_id = str((self.db.active_evidence_epoch() or {})["epoch_id"])
         existing = {
-            item["candidate_key"]: item
+            item["evidence_scope_key"]: item
             for item in self.db.candidate_frontier(
                 evidence_epoch_id=epoch_id,
                 baseline_envelope=baseline_name,
             )
         }
+        strata_key = str(details["strata_key"])
+        compatibility_generation = relevant_compatibility_generation(rollup or {})
+        baseline_content_hash = str(baseline.get("content_hash") or "")
 
         candidates: list[dict[str, Any]] = []
         allow_race_to_idle_probe = (
@@ -352,7 +360,14 @@ class CandidateScheduler:
         ):
             candidate = self.registry.candidate_from_change(baseline_name, changes)
             key = str(candidate["content_hash"])
-            prior = existing.get(key)
+            scope_key = evidence_scope_key(
+                evidence_epoch_id=epoch_id,
+                compatibility_generation=compatibility_generation,
+                baseline_content_hash=baseline_content_hash,
+                reference_strata=strata_key,
+                candidate_content_hash=key,
+            )
+            prior = existing.get(scope_key)
             attempts = int((prior or {}).get("attempts") or 0)
             max_attempts = int(self.config.get("scheduler.max_candidate_trials", 2))
             if prior:
@@ -371,7 +386,11 @@ class CandidateScheduler:
             candidates.append(
                 {
                     "candidate_key": key,
+                    "evidence_scope_key": scope_key,
                     "baseline_envelope": baseline_name,
+                    "baseline_content_hash": baseline_content_hash,
+                    "reference_strata_key": strata_key,
+                    "compatibility_generation": compatibility_generation,
                     "evidence_epoch_id": epoch_id,
                     "order": order,
                     "reason": reason,
@@ -384,6 +403,7 @@ class CandidateScheduler:
                         "kind": "envelope",
                         "baseline_envelope": baseline_name,
                         "changes": changes,
+                        "evidence_scope_key": scope_key,
                     },
                 }
             )
@@ -411,7 +431,7 @@ class CandidateScheduler:
         if not candidates:
             return {**result, "proposal": None}
         selected = candidates[0]
-        prior = self.db.candidate_frontier_entry(selected["candidate_key"]) or {}
+        prior = self.db.candidate_frontier_entry(selected["evidence_scope_key"]) or {}
         self.db.upsert_candidate_frontier(
             {
                 **selected,
@@ -430,7 +450,11 @@ class CandidateScheduler:
         self,
         *,
         candidate_key: str,
+        evidence_scope_key: str,
         baseline_envelope: str,
+        baseline_content_hash: str,
+        reference_strata_key: str,
+        compatibility_generation: str,
         status: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
@@ -438,8 +462,12 @@ class CandidateScheduler:
         self.db.upsert_candidate_frontier(
             {
                 "candidate_key": candidate_key,
+                "evidence_scope_key": evidence_scope_key,
                 "evidence_epoch_id": (epoch or {}).get("epoch_id"),
                 "baseline_envelope": baseline_envelope,
+                "baseline_content_hash": baseline_content_hash,
+                "reference_strata_key": reference_strata_key,
+                "compatibility_generation": compatibility_generation,
                 "status": status,
                 "updated_ts": time.time(),
                 "result": payload or {},

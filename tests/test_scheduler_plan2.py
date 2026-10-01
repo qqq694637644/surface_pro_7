@@ -324,12 +324,9 @@ def test_scheduler_retries_inconclusive_candidate_only_within_attempt_budget(pro
             rollup=item,
         )["candidates"][0]
         key = first["candidate_key"]
-        epoch = str((db.active_evidence_epoch() or {})["epoch_id"])
         db.upsert_candidate_frontier(
             {
-                "candidate_key": key,
-                "evidence_epoch_id": epoch,
-                "baseline_envelope": "INTERACTIVE_EFFICIENT",
+                **first,
                 "status": "INCONCLUSIVE",
                 "attempts": 1,
                 "updated_ts": 1.0,
@@ -348,9 +345,7 @@ def test_scheduler_retries_inconclusive_candidate_only_within_attempt_budget(pro
 
         db.upsert_candidate_frontier(
             {
-                "candidate_key": key,
-                "evidence_epoch_id": epoch,
-                "baseline_envelope": "INTERACTIVE_EFFICIENT",
+                **first,
                 "status": "INCONCLUSIVE",
                 "attempts": 2,
                 "updated_ts": 2.0,

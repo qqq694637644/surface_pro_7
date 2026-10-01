@@ -15,12 +15,14 @@ PowerLab 是一个只针对 **Microsoft Surface Pro 7 / Intel Core i5-1035G4 / L
 - Measurement Trust
 - Frozen Reference / Recent Noise
 - Evidence Engine
+- evidence scope isolation（epoch + compatibility + baseline + workload/reference strata + candidate）
 - A/B/A + independent revalidation
 - Control Safety / Learning Lifecycle / Investigation
 - UnexpectedPower + Attribution
 - finite Candidate Scheduler
 - tiered telemetry / Diagnostic Burst
 - Net Benefit / complexity deletion
+- A1-B1-B2-A2 paired Net Benefit + runtime-mode/covariate gates
 - Automation Level 0–4
 - AI runtime context
 

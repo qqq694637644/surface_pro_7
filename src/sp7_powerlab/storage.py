@@ -10,7 +10,7 @@ from typing import Any
 
 from .measurement import valid_discharge_interval_seconds
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 ACTIVE_TRIAL_STATES = {
     "PROPOSED",
@@ -340,6 +340,11 @@ DDL = [
         episode_id TEXT PRIMARY KEY,
         trial_id TEXT NOT NULL,
         candidate_key TEXT,
+        evidence_scope_key TEXT NOT NULL,
+        baseline_envelope TEXT NOT NULL,
+        baseline_content_hash TEXT NOT NULL,
+        reference_strata_key TEXT NOT NULL,
+        compatibility_generation TEXT NOT NULL,
         stage TEXT NOT NULL,
         evidence_epoch_id TEXT,
         paired_effect_w REAL,
@@ -349,11 +354,13 @@ DDL = [
         created_ts REAL NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_crossover_trial ON crossover_episodes(trial_id,created_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_crossover_scope ON crossover_episodes(evidence_scope_key,created_ts)",
     "CREATE INDEX IF NOT EXISTS idx_crossover_candidate ON crossover_episodes(candidate_key,evidence_epoch_id,created_ts)",
     """CREATE TABLE IF NOT EXISTS evidence_decisions (
         decision_id TEXT PRIMARY KEY,
         trial_id TEXT,
         candidate_key TEXT,
+        evidence_scope_key TEXT NOT NULL,
         evidence_epoch_id TEXT,
         verdict TEXT NOT NULL,
         minimum_useful_effect_w REAL,
@@ -365,14 +372,19 @@ DDL = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_evidence_decisions_trial ON evidence_decisions(trial_id,created_ts)",
     """CREATE TABLE IF NOT EXISTS candidate_frontier (
-        candidate_key TEXT PRIMARY KEY,
+        evidence_scope_key TEXT PRIMARY KEY,
+        candidate_key TEXT NOT NULL,
         evidence_epoch_id TEXT,
         baseline_envelope TEXT NOT NULL,
+        baseline_content_hash TEXT NOT NULL,
+        reference_strata_key TEXT NOT NULL,
+        compatibility_generation TEXT NOT NULL,
         status TEXT NOT NULL,
         updated_ts REAL NOT NULL,
         payload_json TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_candidate_frontier_epoch ON candidate_frontier(evidence_epoch_id,baseline_envelope,status)",
+    "CREATE INDEX IF NOT EXISTS idx_candidate_frontier_candidate ON candidate_frontier(candidate_key,evidence_epoch_id)",
     """CREATE TABLE IF NOT EXISTS control_safety_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts REAL NOT NULL,
@@ -426,6 +438,7 @@ DDL = [
         calibration_version INTEGER NOT NULL,
         evidence_semantics_version INTEGER NOT NULL,
         envelope TEXT,
+        envelope_content_hash TEXT NOT NULL,
         payload_json TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS minimal_meter_samples (
@@ -1237,13 +1250,19 @@ class Database:
         with self.conn:
             self.conn.execute(
                 """INSERT OR REPLACE INTO crossover_episodes(
-                    episode_id,trial_id,candidate_key,stage,evidence_epoch_id,
-                    paired_effect_w,paired_effect_wh,valid,payload_json,created_ts
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    episode_id,trial_id,candidate_key,evidence_scope_key,baseline_envelope,
+                    baseline_content_hash,reference_strata_key,compatibility_generation,
+                    stage,evidence_epoch_id,paired_effect_w,paired_effect_wh,valid,payload_json,created_ts
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     value["episode_id"],
                     value["trial_id"],
                     value.get("candidate_key"),
+                    value["evidence_scope_key"],
+                    value["baseline_envelope"],
+                    value["baseline_content_hash"],
+                    value["reference_strata_key"],
+                    value["compatibility_generation"],
                     value["stage"],
                     value.get("evidence_epoch_id"),
                     value.get("paired_effect_w"),
@@ -1264,18 +1283,13 @@ class Database:
             )
         ]
 
-    def candidate_crossover_episodes(
+    def evidence_scope_crossover_episodes(
         self,
-        candidate_key: str,
-        *,
-        evidence_epoch_id: str | None = None,
+        evidence_scope_key: str,
     ) -> list[dict[str, Any]]:
         sql = """SELECT payload_json FROM crossover_episodes
-            WHERE candidate_key=?"""
-        args: list[Any] = [candidate_key]
-        if evidence_epoch_id is not None:
-            sql += " AND evidence_epoch_id=?"
-            args.append(evidence_epoch_id)
+            WHERE evidence_scope_key=?"""
+        args: list[Any] = [evidence_scope_key]
         sql += " ORDER BY created_ts"
         return [_loads(row[0]) for row in self.conn.execute(sql, args)]
 
@@ -1283,14 +1297,15 @@ class Database:
         with self.conn:
             self.conn.execute(
                 """INSERT INTO evidence_decisions(
-                    decision_id,trial_id,candidate_key,evidence_epoch_id,verdict,
+                    decision_id,trial_id,candidate_key,evidence_scope_key,evidence_epoch_id,verdict,
                     minimum_useful_effect_w,median_effect_w,direction_consistency,
                     evidence_count,created_ts,payload_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     value["decision_id"],
                     value.get("trial_id"),
                     value.get("candidate_key"),
+                    value["evidence_scope_key"],
                     value.get("evidence_epoch_id"),
                     value["verdict"],
                     value.get("minimum_useful_effect_w"),
@@ -1340,18 +1355,28 @@ class Database:
         with self.conn:
             self.conn.execute(
                 """INSERT INTO candidate_frontier(
-                    candidate_key,evidence_epoch_id,baseline_envelope,status,updated_ts,payload_json
-                ) VALUES(?,?,?,?,?,?)
-                ON CONFLICT(candidate_key) DO UPDATE SET
+                    evidence_scope_key,candidate_key,evidence_epoch_id,baseline_envelope,
+                    baseline_content_hash,reference_strata_key,compatibility_generation,
+                    status,updated_ts,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(evidence_scope_key) DO UPDATE SET
+                    candidate_key=excluded.candidate_key,
                     evidence_epoch_id=excluded.evidence_epoch_id,
                     baseline_envelope=excluded.baseline_envelope,
+                    baseline_content_hash=excluded.baseline_content_hash,
+                    reference_strata_key=excluded.reference_strata_key,
+                    compatibility_generation=excluded.compatibility_generation,
                     status=excluded.status,
                     updated_ts=excluded.updated_ts,
                     payload_json=excluded.payload_json""",
                 (
+                    value["evidence_scope_key"],
                     value["candidate_key"],
                     value.get("evidence_epoch_id"),
                     value["baseline_envelope"],
+                    value["baseline_content_hash"],
+                    value["reference_strata_key"],
+                    value["compatibility_generation"],
                     value["status"],
                     float(value.get("updated_ts") or time.time()),
                     _json(value),
@@ -1375,10 +1400,10 @@ class Database:
         sql += " ORDER BY updated_ts DESC"
         return [_loads(row[0]) for row in self.conn.execute(sql, args)]
 
-    def candidate_frontier_entry(self, candidate_key: str) -> dict[str, Any] | None:
+    def candidate_frontier_entry(self, evidence_scope_key: str) -> dict[str, Any] | None:
         row = self.conn.execute(
-            "SELECT payload_json FROM candidate_frontier WHERE candidate_key=?",
-            (candidate_key,),
+            "SELECT payload_json FROM candidate_frontier WHERE evidence_scope_key=?",
+            (evidence_scope_key,),
         ).fetchone()
         return _loads(row[0]) if row else None
 
@@ -1557,6 +1582,7 @@ class Database:
         calibration_version: int,
         evidence_semantics_version: int,
         envelope: str | None,
+        envelope_content_hash: str,
         payload: dict[str, Any] | None = None,
     ) -> str:
         run_id = f"meter-{uuid.uuid4().hex[:12]}"
@@ -1565,8 +1591,8 @@ class Database:
                 """INSERT INTO minimal_meter_runs(
                     run_id,start_ts,status,capture_mode,campaign_id,evidence_epoch_id,
                     battery_epoch,battery_identity_hash,hard_identity_hash,calibration_version,
-                    evidence_semantics_version,envelope,payload_json
-                ) VALUES(?,?,'RUNNING',?,?,?,?,?,?,?,?,?,?)""",
+                    evidence_semantics_version,envelope,envelope_content_hash,payload_json
+                ) VALUES(?,?,'RUNNING',?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
                     time.time(),
@@ -1579,6 +1605,7 @@ class Database:
                     calibration_version,
                     evidence_semantics_version,
                     envelope,
+                    envelope_content_hash,
                     _json(payload or {}),
                 ),
             )
@@ -1609,11 +1636,18 @@ class Database:
     ) -> None:
         if status not in {"COMPLETE", "INVALID"}:
             raise ValueError(f"invalid minimal meter terminal status: {status}")
+        row = self.conn.execute(
+            "SELECT payload_json FROM minimal_meter_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        if not row:
+            raise KeyError(run_id)
+        merged_payload = {**_loads(row[0], {}), **payload}
         with self.conn:
             self.conn.execute(
                 """UPDATE minimal_meter_runs
                 SET end_ts=?,status=?,payload_json=? WHERE run_id=?""",
-                (time.time(), status, _json(payload), run_id),
+                (time.time(), status, _json(merged_payload), run_id),
             )
 
     def minimal_meter_run(self, run_id: str) -> dict[str, Any] | None:

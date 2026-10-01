@@ -6,6 +6,7 @@
   "properties": {
     "kind": {"const": "envelope"},
     "baseline_envelope": {"type": "string"},
+    "evidence_scope_key": {"type": "string", "pattern": "^[0-9a-f]{24}$"},
     "candidate_envelope": {"type": "string"},
     "changes": {
       "type": "object",

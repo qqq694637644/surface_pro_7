@@ -500,3 +500,102 @@ def test_hard_epoch_change_invalidates_trust_and_exits_stable(project_root: Path
         assert lifecycle.learning_state() == "BASELINE_OBSERVATION"
     finally:
         db.close()
+
+
+def test_kernel_is_hard_fingerprint_and_media_versions_get_compatibility_generation(
+    project_root: Path,
+    monkeypatch,
+):
+    db = Database(project_root / "runtime/fingerprint-compat.sqlite3")
+    registry = EnvelopeRegistry(project_root, db)
+    registry.load()
+    payload = {
+        "product_name": "Surface Pro 7",
+        "cpu_model": "Intel(R) Core(TM) i5-1035G4",
+        "kernel": "6.10.1-surface",
+        "versions": {
+            "thermald": "2.5",
+            "firefox": "130",
+            "mesa": "24.1",
+        },
+    }
+    monkeypatch.setattr(service_module, "system_fingerprint", lambda _report: dict(payload))
+    machine = {"calibration": {"version": 1}}
+    try:
+        first = service_module._refresh_fingerprint_state(
+            db=db,
+            registry=registry,
+            report=SimpleNamespace(),
+            machine=machine,
+            thermal_config={},
+        )
+        first_media = db.get_meta("media_compatibility_generation")
+
+        payload["versions"] = {**payload["versions"], "firefox": "131"}
+        browser_only = service_module._refresh_fingerprint_state(
+            db=db,
+            registry=registry,
+            report=SimpleNamespace(),
+            machine=machine,
+            thermal_config={},
+        )
+        assert browser_only == first
+        assert db.get_meta("media_compatibility_generation") != first_media
+
+        payload["kernel"] = "6.10.2-surface"
+        kernel_changed = service_module._refresh_fingerprint_state(
+            db=db,
+            registry=registry,
+            report=SimpleNamespace(),
+            machine=machine,
+            thermal_config={},
+        )
+        assert kernel_changed != first
+    finally:
+        db.close()
+
+
+def test_hardware_refresh_rebinds_actuator_when_helper_becomes_available(
+    project_root: Path,
+    monkeypatch,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/actuator-rebind.sqlite3")
+    service = object.__new__(PowerLabService)
+    service.config = config
+    service.db = db
+    service._last_hardware_refresh_ts = 0.0
+    new_actuator = SimpleNamespace(name="helper")
+    controller = SimpleNamespace(hardware_writable=False, actuator=None)
+    trials = SimpleNamespace(actuator=None)
+    service.stack = {
+        "machine": {"identity": {}, "calibration": {"version": 1}},
+        "actuator": SimpleNamespace(name="unavailable"),
+        "actuator_available": False,
+        "actuator_mode": "read-only",
+        "controller": controller,
+        "trials": trials,
+        "lifecycle": SimpleNamespace(set_control=lambda *_args, **_kwargs: None),
+        "registry": SimpleNamespace(),
+        "thermal_config": {},
+        "fingerprint": "old",
+    }
+    report = SimpleNamespace(control_capable=True, errors=[])
+    monkeypatch.setattr(service_module, "inspect_hardware", lambda **_kwargs: report)
+    monkeypatch.setattr(
+        service_module,
+        "build_actuator",
+        lambda _config: (new_actuator, True, "root-helper"),
+    )
+    monkeypatch.setattr(service_module, "_refresh_fingerprint_state", lambda **_kwargs: "new-fp")
+    try:
+        service._refresh_hardware_contract(400.0)
+        assert service.stack["actuator"] is new_actuator
+        assert service.stack["actuator_available"] is True
+        assert service.stack["actuator_mode"] == "root-helper"
+        assert controller.actuator is new_actuator
+        assert trials.actuator is new_actuator
+        assert controller.hardware_writable is True
+        assert db.get_meta("actuator_rebind")["previous_mode"] == "read-only"
+    finally:
+        db.close()

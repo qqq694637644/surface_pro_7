@@ -100,9 +100,7 @@ def test_measurement_trust_derives_go_no_go_and_recommended_arm_duration():
     assert result["status"] == "READY"
     assert abs(result["recommended_min_arm_seconds"] - 480.0) < 1e-9
     assert len(result["consistency_windows"]) >= 2
-    assert all(
-        item["consistency_status"] == "CONSISTENT" for item in result["consistency_windows"]
-    )
+    assert all(item["consistency_status"] == "CONSISTENT" for item in result["consistency_windows"])
 
     blocked = assess_measurement_trust(
         rows[:2],

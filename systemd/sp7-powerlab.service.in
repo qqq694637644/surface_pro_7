@@ -8,6 +8,7 @@ WorkingDirectory=@ROOT@
 ExecStart=@POWERLAB_BIN@ service run
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=78
 Environment=PYTHONUNBUFFERED=1
 Environment=SP7_POWERLAB_ROOT=@ROOT@
 

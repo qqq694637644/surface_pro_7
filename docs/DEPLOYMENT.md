@@ -30,6 +30,25 @@ bash scripts/install-root-helper.sh
 
 日常 Git checkout 的修改不会自动变成 root 代码。
 
+主 service 每次 hardware-contract refresh 都会重新 discovery/bind actuator。若 user service 启动时
+root helper 尚未就绪，PowerLab 会先保持 READ_ONLY；helper 稍后恢复后不需要重启 user service，
+下一次 refresh 会重新绑定。是否恢复 CONTROL_ALLOWED 仍由 calibration/thermal/telemetry/rollback
+integrity 等 gate 决定。
+
+## Breaking runtime schema
+
+项目不维护旧 SQLite runtime schema 迁移。schema mismatch 时 `sp7-powerlab service run` 使用 exit
+status 78，user systemd unit 的 `RestartPreventExitStatus=78` 会阻止 5 秒一次的 crash-loop。
+
+升级后若看到 schema mismatch，明确执行：
+
+~~~bash
+sp7-powerlab reset-runtime --yes
+systemctl --user restart sp7-powerlab.service
+~~~
+
+这是破坏式 reset；不要自动兜底删除 runtime。
+
 ## thermald
 
 thermald 是独立系统服务。PowerLab 不拥有 thermald hard trip 或 RAPL safety limit。

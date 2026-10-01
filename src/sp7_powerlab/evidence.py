@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import statistics
 import time
 import uuid
@@ -51,11 +53,40 @@ def hard_strata_key(value: dict[str, Any]) -> str:
     return f"bat={epoch}|env={envelope}|active={active}|media={media}|remote={remote}"
 
 
+def relevant_compatibility_generation(value: dict[str, Any]) -> str:
+    return (
+        str(value.get("compatibility_generation") or "missing")
+        if bool(value.get("media_playing"))
+        else "nonmedia"
+    )
+
+
 def reference_strata_key(value: dict[str, Any]) -> str:
     brightness = int(
         value.get("brightness_bucket") if value.get("brightness_bucket") is not None else -1
     )
-    return f"{hard_strata_key(value)}|brightness={brightness}"
+    compatibility = relevant_compatibility_generation(value)
+    return f"{hard_strata_key(value)}|brightness={brightness}|compat={compatibility}"
+
+
+def evidence_scope_key(
+    *,
+    evidence_epoch_id: str,
+    compatibility_generation: str,
+    baseline_content_hash: str,
+    reference_strata: str,
+    candidate_content_hash: str,
+) -> str:
+    payload = {
+        "evidence_epoch_id": evidence_epoch_id,
+        "compatibility_generation": compatibility_generation,
+        "baseline_content_hash": baseline_content_hash,
+        "reference_strata_key": reference_strata,
+        "candidate_content_hash": candidate_content_hash,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
 
 
 def robust_distribution(values: list[float]) -> dict[str, Any]:
@@ -209,6 +240,11 @@ def build_crossover_episode(
     arm_measurements: list[dict[str, Any]],
     evidence_epoch_id: str | None,
     candidate_key: str | None = None,
+    evidence_scope_key: str | None = None,
+    baseline_envelope: str | None = None,
+    baseline_content_hash: str | None = None,
+    reference_strata_key: str | None = None,
+    compatibility_generation: str | None = None,
     constraint_reasons: list[str] | None = None,
 ) -> dict[str, Any]:
     by_arm = {str(item["arm"]): item for item in arm_measurements}
@@ -283,6 +319,11 @@ def build_crossover_episode(
         "episode_id": f"xo-{uuid.uuid4().hex[:12]}",
         "trial_id": trial_id,
         "candidate_key": candidate_key,
+        "evidence_scope_key": evidence_scope_key,
+        "baseline_envelope": baseline_envelope,
+        "baseline_content_hash": baseline_content_hash,
+        "reference_strata_key": reference_strata_key,
+        "compatibility_generation": compatibility_generation,
         "stage": stage,
         "evidence_epoch_id": evidence_epoch_id,
         "arm_ids": [by_arm[arm]["arm_id"] for arm in required if arm in by_arm],
@@ -411,8 +452,11 @@ class EvidenceEngine:
         minimum_useful_effect_w: float,
         trial_id: str | None = None,
         candidate_key: str | None = None,
+        evidence_scope_key: str | None = None,
         evidence_epoch_id: str | None = None,
     ) -> dict[str, Any]:
+        if not evidence_scope_key:
+            raise ValueError("evidence_scope_key is required for a final EvidenceDecision")
         valid = [
             episode
             for episode in episodes
@@ -483,6 +527,7 @@ class EvidenceEngine:
             "decision_id": f"ed-{uuid.uuid4().hex[:12]}",
             "trial_id": trial_id,
             "candidate_key": candidate_key,
+            "evidence_scope_key": evidence_scope_key,
             "evidence_epoch_id": evidence_epoch_id,
             "verdict": verdict,
             "minimum_useful_effect_w": minimum_useful_effect_w,

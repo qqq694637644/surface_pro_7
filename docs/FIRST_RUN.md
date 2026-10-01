@@ -340,27 +340,54 @@ fingerprint、calibration、campaign 和 mode；旧 JSONL 不能在比较时补�
 - dynamic controller
 - full PowerLab
 
-例如同一个 campaign 下分别 capture：
+每一种 candidate mode 都做一组独立的 A1-B1-B2-A2。A1/A2 都是同一个 fixed-good VERIFIED
+envelope；B1/B2 是同一个 candidate mode 的两个独立 block。
+
+例如 monitoring campaign：
 
 ~~~bash
+# 先让实际 HWP 回到选定的 fixed-good VERIFIED envelope，然后停止 PowerLab service。
+systemctl --user stop sp7-powerlab.service
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
+
+# Automation Level 0，启动 service 后连续采两个 monitoring block。
+systemctl --user start sp7-powerlab.service
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FULL_POWERLAB --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
+
+# 再让实际 HWP 回到同一个 fixed-good envelope，停止 service，采 A2。
+systemctl --user stop sp7-powerlab.service
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 ~~~
 
-记录四次输出的 `meter-...` run id，然后：
+记录 A1/B1/B2/A2 四个 `meter-...` run id，然后：
 
 ~~~bash
-sp7-powerlab overhead compare meter-fixed meter-monitoring
-sp7-powerlab overhead compare meter-fixed meter-dynamic
-sp7-powerlab overhead compare meter-fixed meter-full
+sp7-powerlab overhead compare meter-a1 meter-b1 meter-b2 meter-a2
 
 sp7-powerlab overhead summary
 ~~~
 
-三个 comparison 必须来自同一个 current evidence epoch、同一个 battery/hard/calibration context，
-并使用同一个 campaign 名称；否则不会作为一组完整 Net Benefit evidence 让 STABLE readiness 通过。
+再分别重复 dynamic controller 和 full PowerLab：
+
+- `DYNAMIC_CONTROLLER`：service 必须真实运行在 Automation Level 1 且 ControlSafety=CONTROL_ALLOWED
+- `FULL_POWERLAB`：service 必须真实运行在 Automation Level >= 2 且 ControlSafety=CONTROL_ALLOWED
+- `MONITORING`：service 必须真实运行在 Automation Level 0
+- `FIXED_GOOD`：service 必须停止，且每个 sample 的 actual HWP 都要匹配同一个 VERIFIED envelope
+
+每个 comparison 都必须是：
+
+~~~
+A1 fixed -> B1 candidate -> B2 candidate -> A2 fixed
+~~~
+
+PowerLab 会检查 brightness、active/media/remote fraction、network、temperature、BAT consistency、
+fixed HWP、reference drift、两个 candidate delta 的方向和 spread。明显不可比时结果是
+`DATA_QUALITY_FAILURE`，不会进入 STABLE evidence。
+
+monitoring / dynamic / full 三个 comparison 必须来自同一个 current evidence epoch、同一个
+battery/hard/calibration context、同一个 campaign 名称和同一个 fixed baseline content hash；否则不会
+作为一组完整 Net Benefit evidence 让 STABLE readiness 通过。
 
 如果结果建议 FIXED_GOOD_ENVELOPE，就不要因为项目已经复杂而强行保留动态系统。
 

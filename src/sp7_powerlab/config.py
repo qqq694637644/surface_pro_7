@@ -61,7 +61,7 @@ DEFAULTS: dict[str, Any] = {
         "max_sustained_compute_delta": 0.10,
     },
     "evidence": {
-        "semantics_version": 4,
+        "semantics_version": 5,
         "practical_threshold_w": 0.10,
         "min_crossover_episodes": 2,
         "medium_effect_min_crossover_episodes": 3,
@@ -76,6 +76,17 @@ DEFAULTS: dict[str, Any] = {
         "measurement_min_observation_seconds": 900.0,
         "measurement_min_consistency_windows": 2,
         "noise_arm_confidence_multiplier": 2.0,
+    },
+    "net_benefit": {
+        "max_brightness_delta_pct": 10.0,
+        "max_active_fraction_delta": 0.15,
+        "max_media_fraction_delta": 0.10,
+        "max_remote_fraction_delta": 0.10,
+        "max_network_mbps_delta": 5.0,
+        "max_mean_temp_delta_c": 5.0,
+        "max_reference_drift_w": 0.30,
+        "max_candidate_delta_spread_w": 0.30,
+        "max_interblock_gap_seconds": 900.0,
     },
     "calibration": {
         "cold_idle_min_seconds": 900.0,

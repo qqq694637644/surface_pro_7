@@ -261,6 +261,17 @@ Resume 后：
 - 标记 rolled back/failed；
 - rollback integrity 不可信时 Control 进入 EMERGENCY/READ_ONLY。
 
+root helper 暂时未启动或短暂失联时，runtime hardware refresh 会重新 discovery/bind actuator；不需要
+为了“让 helper 被发现”手工重启 PowerLab。恢复写入仍必须重新通过 ControlSafety gate。
+
+breaking SQLite schema mismatch 是人工处置状态，不应形成 restart loop。service 会以 exit status 78
+退出，systemd 不自动重启。确认允许丢弃旧 runtime 后执行：
+
+~~~bash
+sp7-powerlab reset-runtime --yes
+systemctl --user restart sp7-powerlab.service
+~~~
+
 ## 15. Drift
 
 慢性 drift 看 FrozenReferenceBaseline 对 recent distribution。
@@ -298,25 +309,38 @@ sp7-powerlab lifecycle reopen --reason "confirmed regression"
 
 ## 17. Net Benefit
 
-正式 Net Benefit capture 不再接受任意旧 JSONL 后补 epoch/campaign 标签。每次采集开始时就绑定
-current evidence epoch、battery identity/epoch、hard fingerprint、calibration、campaign 和 mode：
+正式 Net Benefit capture 不接受任意旧 JSONL 后补 epoch/campaign 标签。每次采集开始时就绑定
+current evidence epoch、battery identity/epoch、hard fingerprint、calibration、campaign、fixed
+baseline content hash 和 mode。
+
+每一种 candidate mode 使用 A1-B1-B2-A2：
 
 ~~~bash
+# A1：service 停止，actual HWP 已回到同一个 VERIFIED fixed baseline
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
+
+# B1 / B2：按目标 mode 启动 service，并连续采两个独立 block
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FULL_POWERLAB --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
+
+# A2：恢复同一个 fixed baseline 后停止 service
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 ~~~
 
-每次 capture 会输出 `meter-...` run id。比较使用 run id，并要求 provenance 匹配：
+比较使用四个 run id：
 
 ~~~bash
-sp7-powerlab overhead compare meter-fixed meter-monitoring
-sp7-powerlab overhead compare meter-fixed meter-dynamic
-sp7-powerlab overhead compare meter-fixed meter-full
+sp7-powerlab overhead compare meter-a1 meter-b1 meter-b2 meter-a2
 ~~~
 
-任一 run 的 BAT consistency/data quality 失败时不会产生可用于 STABLE 的有效 delta。
+mode 不是标签：MONITORING 要求 live Level 0；DYNAMIC_CONTROLLER 要求 live Level 1 +
+CONTROL_ALLOWED；FULL_POWERLAB 要求 live Level >=2 + CONTROL_ALLOWED；FIXED_GOOD 要求 service
+停止且每个 sample 的 actual HWP 都匹配 fixed VERIFIED envelope。
+
+MinimalMeter 还记录 brightness、active/media/remote、basic network、package temperature。任一 block
+BAT/data quality 失败、四段 provenance 不一致、inter-block gap 超限、fixed baseline 改变、covariate
+明显不可比、reference drift 过大、B1/B2 effect 方向冲突或 spread 过大时，都不会产生可用于
+STABLE 的有效 delta。
 
 历史：
 

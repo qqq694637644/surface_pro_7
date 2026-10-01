@@ -11,6 +11,7 @@ from sp7_powerlab.longterm import (
     UsageCoverage,
     assess_net_benefit,
     compare_meter_runs,
+    compare_paired_meter_runs,
     minutes_gained_per_charge,
 )
 from sp7_powerlab.storage import Database
@@ -42,6 +43,32 @@ def meter_row(ts: float, power: float, energy: float) -> dict:
         "battery_power_w": power,
         "battery_energy_wh": energy,
     }
+
+
+def paired_meter_rows(
+    power: float,
+    *,
+    brightness: float = 50.0,
+    active: bool = True,
+    media: bool = False,
+    remote: bool = False,
+    network_mbps: float = 1.0,
+    temp_c: float = 42.0,
+) -> list[dict]:
+    return [
+        {
+            **meter_row(ts, power, 40.0 - power * ts / 3600.0),
+            "brightness_pct": brightness,
+            "user_active": active,
+            "media_playing": media,
+            "remote_present": remote,
+            "network_rx_mbps": network_mbps / 2.0,
+            "network_tx_mbps": network_mbps / 2.0,
+            "package_temp_c": temp_c,
+            "hwp_matches_fixed_envelope": True,
+        }
+        for ts in range(0, 601, 60)
+    ]
 
 
 def test_usage_coverage_requires_verified_policy_and_frozen_reference(project_root: Path):
@@ -240,8 +267,11 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
                 {
                     "candidate_minus_reference_w": -0.1,
                     "comparison_quality": "OK",
+                    "comparison_design": "A_B_B_A",
                     "evidence_epoch_id": epoch,
                     "campaign_id": "stable-campaign",
+                    "fixed_baseline_envelope": "INTERACTIVE_EFFICIENT",
+                    "fixed_baseline_content_hash": "fixed-hash",
                 },
             )
 
@@ -258,7 +288,14 @@ def _completed_run(mode: str, delta_w: float, ts: float) -> dict:
         "start_ts": ts - 60,
         "end_ts": ts,
         "mode": mode,
-        "result": {"candidate_minus_reference_w": delta_w, "comparison_quality": "OK"},
+        "result": {
+            "candidate_minus_reference_w": delta_w,
+            "comparison_quality": "OK",
+            "comparison_design": "A_B_B_A",
+            "campaign_id": "unit-campaign",
+            "fixed_baseline_envelope": "INTERACTIVE_EFFICIENT",
+            "fixed_baseline_content_hash": "fixed-hash",
+        },
     }
 
 
@@ -354,6 +391,53 @@ def test_usage_coverage_ignores_rollups_from_other_evidence_epochs(project_root:
         db.close()
 
 
+def test_usage_coverage_keeps_dirty_rollup_in_total_but_not_trusted(project_root: Path):
+    db = Database(project_root / "runtime/coverage-dirty.sqlite3")
+    registry = EnvelopeRegistry(project_root, db)
+    registry.load()
+    try:
+        epoch = db.ensure_evidence_epoch(
+            hard_identity_hash="hard",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=1,
+            payload={},
+        )
+        now = time.time()
+        item = rollup(now - 60, 5.0)
+        item["evidence_epoch_id"] = epoch
+        item["reference_eligible"] = False
+        item["reference_ineligible_reasons"] = ["power_source_not_all_discharging"]
+        item["valid_seconds"] = 20.0
+        db.add_rollup(item)
+        db.upsert_reference_baseline(
+            {
+                "reference_id": "ref-dirty-stratum",
+                "created_ts": now,
+                "evidence_epoch_id": epoch,
+                "strata_key": reference_strata_key(item),
+                "envelope": "INTERACTIVE_EFFICIENT",
+                "median_power_w": 5.0,
+                "mad_power_w": 0.05,
+                "p25_power_w": 4.95,
+                "p75_power_w": 5.05,
+                "sample_count": 10,
+                "frozen": True,
+            }
+        )
+        coverage = UsageCoverage(db).summarize(
+            since_ts=now - 3600,
+            evidence_epoch_id=epoch,
+        )
+        assert coverage["total_valid_seconds"] == 20.0
+        assert coverage["verified_seconds"] == 20.0
+        assert coverage["trusted_seconds"] == 0.0
+        assert coverage["trusted_fraction"] == 0.0
+        assert sum(coverage["uncovered_demand_seconds"].values()) == 20.0
+    finally:
+        db.close()
+
+
 def test_net_benefit_filters_runs_by_current_evidence_epoch():
     runs = [
         {
@@ -429,6 +513,26 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
     assert result["campaign_id"] is None
 
 
+def test_net_benefit_rejects_same_campaign_with_different_fixed_baselines():
+    runs = []
+    for index, mode in enumerate(("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB")):
+        run = _completed_run(mode, -0.2, 100 + index * 10)
+        run["result"] = {
+            **run["result"],
+            "evidence_epoch_id": "current",
+            "campaign_id": "campaign-a",
+            "fixed_baseline_content_hash": f"fixed-{index}",
+        }
+        runs.append(run)
+    result = assess_net_benefit(
+        runs,
+        practical_threshold_w=0.1,
+        evidence_epoch_id="current",
+    )
+    assert result["complete"] is False
+    assert result["recommendation"] == "NEED_MORE_DATA"
+
+
 def test_meter_comparison_uses_time_weighted_power_and_fails_closed_on_mismatch():
     reference = [
         meter_row(0, 4.0, 40.0),
@@ -453,3 +557,32 @@ def test_meter_comparison_uses_time_weighted_power_and_fails_closed_on_mismatch(
     failed = compare_meter_runs(reference, mismatched, max_gap_seconds=120.0)
     assert failed["comparison_quality"] == "DATA_QUALITY_FAILURE"
     assert failed["candidate_minus_reference_w"] is None
+
+
+def test_paired_meter_comparison_requires_comparable_a_b_b_a_blocks():
+    before = paired_meter_rows(5.0)
+    candidate = paired_meter_rows(4.8)
+    after = paired_meter_rows(5.1)
+    result = compare_paired_meter_runs(
+        before,
+        candidate,
+        paired_meter_rows(4.85),
+        after,
+        minimum_block_seconds=300.0,
+    )
+    assert result["comparison_design"] == "A_B_B_A"
+    assert result["comparison_quality"] == "OK"
+    assert abs(result["paired_reference_power_w"] - 5.05) < 1e-9
+    assert abs(result["candidate_minus_reference_w"] + 0.225) < 1e-9
+    assert len(result["candidate_block_deltas_w"]) == 2
+
+    incomparable = compare_paired_meter_runs(
+        before,
+        paired_meter_rows(4.8, brightness=80.0),
+        paired_meter_rows(4.85, brightness=80.0),
+        after,
+        minimum_block_seconds=300.0,
+    )
+    assert incomparable["comparison_quality"] == "DATA_QUALITY_FAILURE"
+    assert "candidate_first_brightness_not_comparable" in incomparable["comparison_quality_reasons"]
+    assert incomparable["candidate_minus_reference_w"] is None

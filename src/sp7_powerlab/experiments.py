@@ -14,7 +14,9 @@ from .evaluation import compare_arm_constraints, summarize_block
 from .evidence import (
     EvidenceEngine,
     build_crossover_episode,
+    evidence_scope_key,
     reference_strata_key,
+    relevant_compatibility_generation,
 )
 from .measurement import measurement_trust_matches_epoch
 from .storage import Database
@@ -255,9 +257,27 @@ class TrialManager:
             candidate = self.registry.candidate_from_named(str(proposal["candidate_envelope"]))
         else:
             candidate = self.registry.candidate_from_change(baseline, dict(proposal["changes"]))
+        compatibility_generation = relevant_compatibility_generation(current_sample)
+        baseline_content_hash = str(baseline_env.get("content_hash") or "")
+        candidate_content_hash = str(candidate.get("content_hash") or "")
+        scope_key = evidence_scope_key(
+            evidence_epoch_id=str(evidence_epoch["epoch_id"]),
+            compatibility_generation=compatibility_generation,
+            baseline_content_hash=baseline_content_hash,
+            reference_strata=strata,
+            candidate_content_hash=candidate_content_hash,
+        )
+        proposed_scope = str(proposal.get("evidence_scope_key") or "")
+        if proposed_scope and proposed_scope != scope_key:
+            raise TrialError("scheduler proposal evidence scope no longer matches current context")
         validation = self._validation_for_proposal(proposal, current_sample)
         target = {
             "evidence_epoch_id": str(evidence_epoch["epoch_id"]),
+            "evidence_scope_key": scope_key,
+            "reference_strata_key": strata,
+            "compatibility_generation": compatibility_generation,
+            "baseline_content_hash": baseline_content_hash,
+            "candidate_content_hash": candidate_content_hash,
             "battery_epoch": current_sample.get("battery_epoch"),
             "brightness_bucket": brightness_bucket(current_sample.get("brightness_pct")),
             "brightness_pct": current_sample.get("brightness_pct"),
@@ -326,6 +346,10 @@ class TrialManager:
             return False
         if remote_bucket(sample.get("remote_hint")) != int(target.get("remote_bucket", 0)):
             return False
+        if relevant_compatibility_generation(sample) != str(
+            target.get("compatibility_generation") or ""
+        ):
+            return False
         return True
 
     def _external_window_change(
@@ -361,6 +385,10 @@ class TrialManager:
             return "user active/idle state changed"
         if remote_bucket(sample.get("remote_hint")) != int(target.get("remote_bucket", 0)):
             return "remote/local workload changed"
+        if relevant_compatibility_generation(sample) != str(
+            target.get("compatibility_generation") or ""
+        ):
+            return "compatibility generation changed"
         if arm.startswith("A"):
             if target.get("demand_region") and sample.get("demand_region") != target.get(
                 "demand_region"
@@ -444,19 +472,22 @@ class TrialManager:
             return
         target = trial.get("target") or {}
         trial_epoch_id = str(target.get("evidence_epoch_id") or "")
-        if not trial_epoch_id:
-            trial_epoch_id = str((self.db.active_evidence_epoch() or {}).get("epoch_id") or "")
-        previous = self.db.candidate_frontier_entry(candidate_key) or {}
-        if str(previous.get("evidence_epoch_id") or "") != trial_epoch_id:
-            previous = {}
+        scope_key = str(target.get("evidence_scope_key") or "")
+        if not trial_epoch_id or not scope_key:
+            return
+        previous = self.db.candidate_frontier_entry(scope_key) or {}
         attempts = int(previous.get("attempts") or 0)
         if status == "TESTING":
             attempts += 1
         self.db.upsert_candidate_frontier(
             {
                 "candidate_key": candidate_key,
+                "evidence_scope_key": scope_key,
                 "evidence_epoch_id": trial_epoch_id or None,
                 "baseline_envelope": str(trial.get("baseline_envelope") or ""),
+                "baseline_content_hash": str(target.get("baseline_content_hash") or ""),
+                "reference_strata_key": str(target.get("reference_strata_key") or ""),
+                "compatibility_generation": str(target.get("compatibility_generation") or ""),
                 "status": status,
                 "attempts": attempts,
                 "updated_ts": time.time(),
@@ -708,9 +739,21 @@ class TrialManager:
         if not trial_epoch_id or str(evidence_epoch.get("epoch_id") or "") != trial_epoch_id:
             raise TrialError("hard evidence epoch changed before trial evaluation")
         candidate_key = str(trial["candidate"].get("content_hash") or "")
+        target = trial.get("target") or {}
+        scope_key = str(target.get("evidence_scope_key") or "")
+        reference_strata = str(target.get("reference_strata_key") or "")
+        compatibility_generation = str(target.get("compatibility_generation") or "")
+        baseline_content_hash = str(target.get("baseline_content_hash") or "")
+        if not all((scope_key, reference_strata, compatibility_generation, baseline_content_hash)):
+            raise TrialError("trial evidence scope metadata is incomplete")
         episode = build_crossover_episode(
             trial_id=trial["trial_id"],
             candidate_key=candidate_key,
+            evidence_scope_key=scope_key,
+            baseline_envelope=str(trial.get("baseline_envelope") or ""),
+            baseline_content_hash=baseline_content_hash,
+            reference_strata_key=reference_strata,
+            compatibility_generation=compatibility_generation,
             stage=stage,
             arm_measurements=measurements,
             evidence_epoch_id=trial_epoch_id,
@@ -718,13 +761,9 @@ class TrialManager:
         )
         self.db.add_crossover_episode(episode)
 
-        strata_source = {
-            **(trial.get("target") or {}),
-            "current_envelope": trial.get("baseline_envelope"),
-        }
         useful_effect = self.evidence.minimum_useful_effect(
             evidence_epoch_id=episode.get("evidence_epoch_id"),
-            strata_key=reference_strata_key(strata_source),
+            strata_key=reference_strata,
         )
         minimum_useful_effect_w = float(useful_effect["minimum_useful_effect_w"])
         if stage == "initial":
@@ -744,6 +783,7 @@ class TrialManager:
                         "decision_id": f"ed-{uuid.uuid4().hex[:12]}",
                         "trial_id": trial["trial_id"],
                         "candidate_key": candidate_key,
+                        "evidence_scope_key": scope_key,
                         "evidence_epoch_id": episode.get("evidence_epoch_id"),
                         "verdict": independent["verdict"],
                         "minimum_useful_effect_w": minimum_useful_effect_w,
@@ -765,13 +805,11 @@ class TrialManager:
                 )
             else:
                 evidence_result = self.evidence.decide(
-                    self.db.candidate_crossover_episodes(
-                        candidate_key,
-                        evidence_epoch_id=episode.get("evidence_epoch_id"),
-                    ),
+                    self.db.evidence_scope_crossover_episodes(scope_key),
                     minimum_useful_effect_w=minimum_useful_effect_w,
                     trial_id=trial["trial_id"],
                     candidate_key=candidate_key,
+                    evidence_scope_key=scope_key,
                     evidence_epoch_id=episode.get("evidence_epoch_id"),
                 )
         result = {
