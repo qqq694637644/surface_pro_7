@@ -34,19 +34,22 @@ transactional HWP actuator
 intel_pstate / Intel HWP
 ~~~
 
-长期学习链：
+测量 / 学习链：
 
 ~~~
 BAT + telemetry
     |
     v
-Power rollups
+Measurement Trust
+    |
+    v
+current hard evidence epoch
+    |
+    v
+clean Power rollups
     |
     +--> FrozenReferenceBaseline
     +--> RecentNoiseDistribution
-    |
-    v
-EvidenceEngine
     |
     v
 CandidateScheduler
@@ -55,7 +58,7 @@ CandidateScheduler
 A/B/A + independent revalidation
     |
     v
-EvidenceDecision
+deterministic EvidenceDecision
     |
     v
 VERIFIED winner / reject / equivalent / inconclusive
@@ -80,6 +83,20 @@ Attribution
                          |
                          v
                  reopen optimization
+~~~
+
+收敛链：
+
+~~~
+Stage D validation / real-usage burn-in
+        +
+Stage E bounded Net Benefit campaign
+        |
+        v
+StableReadiness
+        |
+        v
+STABLE -> monitor / drift / NO_CHANGE
 ~~~
 
 AI 不在 10 秒级实时控制回路中。AI 读取聚合事实、调查异常、设计/审查实验、修改代码和配置、判断是否应继续保留复杂度。
@@ -149,7 +166,22 @@ Investigation = INVESTIGATING
 
 此时可以继续安全使用 verified envelope，但 Scheduler 不应因为一次异常直接开始调参。
 
-## 3. 源码地图
+## 3. Evidence identity 地图
+
+不同层有不同 identity，不能用“名字一样”代替兼容性判断：
+
+- battery epoch：电池 identity/capacity context
+- hard evidence epoch：battery/kernel/power-driver/calibration/thermal/core semantics 边界
+- compatibility generation：browser/Mesa/media 等局部兼容边界
+- envelope content hash：natural Reference/Noise 的 policy revision identity
+- evidence_scope_key：hard epoch + compatibility + baseline + workload/reference strata + candidate
+- runtime policy fingerprint：Stage E 的实际 treatment identity
+- Net Benefit campaign：有 OPEN/COMPLETE/INVALID 生命周期的 bounded validation session
+
+历史数据可以做 prior/diagnosis，但只有满足对应 identity contract 才能进入当前 promotion、trusted
+coverage 或 STABLE readiness。
+
+## 4. 源码地图
 
 ### src/sp7_powerlab/agent_context.py
 
@@ -308,6 +340,14 @@ Candidate Scheduler。
 
 Controller 不调用 LLM。
 
+### src/sp7_powerlab/service.py
+
+主 runtime orchestrator。
+
+负责把 telemetry、demand、thermal、lifecycle、controller、trial tick、rollup、NoiseTracker、Drift、
+UnexpectedPower、Scheduler 和 hardware refresh 串成一个服务循环。这里也是 sample-time envelope content
+hash 冻结、rollup reference eligibility、actuator rebind/reconnect policy 等跨模块运行时合同的连接点。
+
 ### src/sp7_powerlab/envelopes.py
 
 Envelope registry。
@@ -399,6 +439,7 @@ UnexpectedPower detector。
 - brightness/active/media/remote/network/temperature comparability veto
 - fixed baseline content hash / campaign coherence gate
 - Net Benefit campaign OPEN/COMPLETE/INVALID lifecycle + max span
+- recommendation -> selected policy fingerprint mapping；STABLE 校验 selected policy 仍是当前 runtime
 - minutes gained per charge
 - Net Benefit assessment
 
@@ -426,6 +467,7 @@ run INVALID；campaign 有独立 DB lifecycle，不允许跨周复用裸字符�
 - KEEP_FULL_POWERLAB
 - KEEP_DYNAMIC_REDUCE_MONITORING
 - FIXED_GOOD_ENVELOPE
+- NEED_MORE_DATA
 
 ### src/sp7_powerlab/lifecycle.py
 
@@ -457,7 +499,7 @@ sp7-powerlab-agent 便利 CLI。
 
 人类和 Agent 的主 CLI 入口。
 
-## 4. 配置地图
+## 5. 配置地图
 
 ### config/powerlab.toml
 
@@ -470,6 +512,8 @@ sp7-powerlab-agent 便利 CLI。
 - automation level
 - scheduler budgets
 - stable coverage
+- Net Benefit campaign/comparability limits
+- helper downgrade/reconnect threshold
 - drift thresholds
 
 不要把这些数值复制到 PLAN2；运行时以当前 config 为准。
@@ -497,7 +541,7 @@ TOML 中存在一个 envelope 不等于它在当前机器/epoch 已 VERIFIED。
 
 thermal model 参数。
 
-## 5. SQLite 事实模型
+## 6. SQLite 事实模型
 
 关键概念：
 
@@ -505,6 +549,7 @@ thermal model 参数。
 - calibration_runs
 - evidence_epochs
 - compatibility_tags
+- power_rollups（包含 frozen envelope content hash / reference eligibility）
 - reference_baselines
 - recent_noise_distributions
 - arm_measurements
@@ -519,11 +564,12 @@ thermal model 参数。
 - unexpected_power_events
 - investigations
 - monitoring_overhead_runs
+- net_benefit_campaigns
 - minimal_meter_runs
 
 不要直接依赖表结构猜业务语义；优先读对应模块和 PLAN2。
 
-## 6. CLI 导航
+## 7. CLI 导航
 
 ### “现在机器和项目处于什么状态？”
 
@@ -565,6 +611,8 @@ sp7-powerlab lifecycle readiness
 
 sp7-powerlab lifecycle coverage
 
+先完成 Stage D validation/burn-in，再完成 Stage E Net Benefit；readiness 通过后才 freeze STABLE。
+
 ### “有异常功耗吗？”
 
 sp7-powerlab unexpected-power list
@@ -591,7 +639,7 @@ sp7-powerlab trial status
 
 sp7-powerlab envelope list
 
-## 7. 常见调查路线
+## 8. 常见调查路线
 
 ### 电池掉得快
 
@@ -637,7 +685,7 @@ REMOTE_EFFICIENT 的判断不应依赖某个低 CPU ssh 进程一定进入 top-N
 - media
 - interaction latency
 
-## 8. 文档地图
+## 9. 文档地图
 
 - ../AGENTS.md：AI 第一个读
 - ../README.md：人类入口
@@ -650,7 +698,10 @@ REMOTE_EFFICIENT 的判断不应依赖某个低 CPU ssh 进程一定进入 top-N
 - AI_LOOP.md：Agent 与 PowerLab runtime 交互
 - MCP.md：可选结构化接口
 
-## 9. 什么时候读 PLAN2
+按任务读，不要机械加载全部文档：仓库工程优先 PROJECT_STATUS + PROJECT_MAP；真实 SP7 运维优先
+PROJECT_STATUS + agent-context + LLM_BEHAVIOR/OPERATIONS；设计变更再读 PLAN2。
+
+## 10. 什么时候读 PLAN2
 
 以下情况必须读相关 PLAN2 章节：
 

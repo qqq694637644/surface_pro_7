@@ -87,6 +87,8 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - FrozenReferenceBaseline
 - RecentNoiseDistribution
 - reference/noise rollup 要求 clean Discharging、无 resume/gap 且 valid fraction 达标
+- natural Reference/Noise identity 绑定 frozen envelope content hash；同名新 revision 不继承旧基线
+- NoiseTracker 独立要求当前 envelope 仍 VERIFIED 且 content hash 与 rollup 匹配
 - kernel/linux-surface relevant change 进入 hard evidence epoch
 - browser/Mesa/media backend 使用 media compatibility generation 隔离 media reference/noise
 - hard strata + comparison constraints
@@ -154,8 +156,10 @@ Investigation：
 - single-writer ownership
 - limited root helper
 - runtime hardware refresh 会重新 discovery/bind root helper；helper 晚启动不再永久锁死为 READ_ONLY
+- 已绑定可用 helper 时，单次 probe failure 不瞬时 downgrade；active trial 冻结 actuator backend identity
 - STABLE readiness / usage coverage
 - dirty/transitional rollup 保留在 usage 分母，但不计 trusted coverage
+- STABLE readiness 有 minimum valid/trusted usage、distinct usage days、observation span floor
 
 仍需真机：
 
@@ -253,6 +257,8 @@ IMPLEMENTED + SOFTWARE-VALIDATED
 - sp7-powerlab-agent convenience interface
 - knowledge pack / structured decision contract
 - Bash/workspace Agent 信任模型
+- task-mode-aware Agent 入口：仓库工程与真实 SP7 运维不再共用一套机械启动流程
+- Agent 入口统一 Stage A→B→C→D→E→STABLE 生命周期与 evidence identity 模型
 
 AI 不进入 10 秒级实时控制链。
 
@@ -278,7 +284,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - 正式 Net Benefit 使用 A1-B1-B2-A2 paired campaign，检查两个 candidate delta 的方向/spread
 - runtime policy fingerprint 固定 controller/config、Automation Level、VERIFIED envelope set/hash 与 override
 - Net Benefit campaign 是 OPEN/COMPLETE/INVALID 实体，限制最大 campaign span，完成后三类结果即关闭
-- STABLE 只接受同 hard epoch/campaign/fixed baseline content hash 的三类完整 comparison，并验证 FULL policy 仍代表当前 runtime
+- STABLE 只接受同 hard epoch/campaign/fixed baseline content hash 的三类完整 comparison，并验证 recommendation 对应的 selected policy 仍代表当前 runtime
 - KEEP_FULL_POWERLAB
 - KEEP_DYNAMIC_REDUCE_MONITORING
 - FIXED_GOOD_ENVELOPE
@@ -310,8 +316,9 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 8. adopt 当前真实 HWP state 为首个 verified baseline
 9. 收集只属于当前 evidence epoch、稳定 brightness/envelope 的自然 baseline/noise
 10. coarse optimization
-11. STABLE burn-in
-12. fixed-good / monitoring / dynamic / full Net Benefit comparison
+11. Stage D independent validation + representative real-usage burn-in
+12. Stage E fixed-good / monitoring / dynamic / full Net Benefit campaign
+13. deterministic readiness 全部通过后 freeze STABLE
 
 ## 当前不能声称
 

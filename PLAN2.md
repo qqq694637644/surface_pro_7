@@ -74,8 +74,8 @@ Telemetry
 ~~~
 Telemetry / MinimalMeter
   -> Measurement Trust
+  -> current hard evidence epoch
   -> Frozen Reference + Recent Noise
-  -> Evidence Engine
   -> finite Candidate Scheduler
   -> controlled Trial
   -> EvidenceDecision
@@ -90,6 +90,17 @@ UnexpectedPower / Drift
   -> verification
   -> expected/no change
      or confirmed regression/reopen
+~~~
+
+收敛链：
+
+~~~
+independent validation + real-usage coverage
+  + current Reference / Noise
+  + end-to-end Net Benefit campaign
+  -> StableReadiness
+  -> STABLE
+  -> monitor / drift / NO_CHANGE
 ~~~
 
 ### 不变量
@@ -111,6 +122,10 @@ UnexpectedPower / Drift
 
 6. **AI 不进入实时控制主链。**
    AI 可以调查、解释、设计实验、修改代码/配置和维护 Git，但不做每 10 秒 DVFS 微调。
+
+7. **同名对象不是证据身份。**
+   battery/evidence epoch、compatibility generation、envelope content hash、trial evidence scope、
+   runtime policy fingerprint 和 Net Benefit campaign 都是不同的兼容边界；不能因为名称相同就继承历史证据。
 
 ---
 
@@ -991,8 +1006,10 @@ epoch、同一个显式 validation campaign、同一个 fixed baseline content h
 validation campaign 是有生命周期的 DB entity，不是可无限复用的字符串。campaign 从 OPEN 开始，
 固定 hard/battery/calibration/semantics context 与 fixed baseline identity；超过 `max_campaign_span_seconds`
 或 context/baseline 变化时 INVALID。三种有效 comparison 各完成一次后自动 COMPLETE/CLOSED，禁止继续
-往旧 campaign 塞新结果。STABLE 还必须验证用于 FULL_POWERLAB 的 policy fingerprint 与当前 runtime
-policy fingerprint 一致；policy 已改变时旧 Net Benefit 只能作为历史记录，不能继续为当前系统背书。
+往旧 campaign 塞新结果。Net Benefit 必须把 recommendation 映射到一个 selected policy fingerprint：
+KEEP_FULL_POWERLAB 对应 Full policy，KEEP_DYNAMIC_REDUCE_MONITORING 对应 Dynamic policy，
+FIXED_GOOD_ENVELOPE 对应 Level-0/fixed-good policy。STABLE 必须验证这个**被选中的** policy fingerprint
+与当前 runtime 一致；当前 policy 已改变时旧 Net Benefit 只能作为历史记录，不能继续为当前系统背书。
 
 MonitoringOverhead 只用于解释，不从已经包含 monitoring 的结果中重复扣除。
 
@@ -1041,6 +1058,8 @@ fixed-good 与复杂系统实际续航/UX 等价时，删掉复杂度是成功�
 - UnexpectedPower / investigation
 - monitoring / MinimalMeter runs
 - MinimalMeter capture provenance
+- Net Benefit campaign lifecycle
+- runtime policy fingerprint
 
 详细字段属于实现，不复制进 PLAN2。
 
@@ -1089,21 +1108,25 @@ Git 保存：
 - 验证 stop rules
 - 只找 practical gains
 
-**Stage D — Validation / STABLE**
+**Stage D — Validation / Burn-in**
 
 - independent revalidation
-- real usage coverage
+- representative real usage coverage
+- minimum valid/trusted usage seconds
+- minimum distinct usage days / observation span
 - no unresolved regression
-- STABLE 后系统真正安静
 
-**Stage E — Net Benefit**
+**Stage E — Net Benefit / Complexity Selection**
 
 - fixed-good
 - monitoring
 - dynamic
 - full PowerLab
+- complete one bounded validation campaign
+- selected/recommended policy fingerprint still matches runtime
 
-然后决定保留哪些复杂度。
+完成 Stage E 后，只有 deterministic StableReadiness 的全部 gate 都通过，才进入 STABLE。
+STABLE 是 A–E 完成后的收敛状态，不是 Stage E 之前的 burn-in 状态。
 
 ### 12.4 核心验收
 
@@ -1153,10 +1176,12 @@ Git 保存：
 **STABLE / Net Benefit**
 
 - 真实 usage coverage 达标
+- denominator floor / distinct usage days / observation span 达标
 - 稀有 workload 有安全 fallback
 - 无 active trial/investigation
 - reference/noise 可用
-- monitoring/dynamic/full 都经过 end-to-end 评估
+- monitoring/dynamic/full 来自同一 bounded COMPLETE campaign
+- selected/recommended policy fingerprint 仍代表当前 runtime
 - full PowerLab 无 practical net gain 时允许退回 fixed-good
 
 ### 12.5 当前明确不做

@@ -262,6 +262,8 @@ def assess_net_benefit(
             "campaign_id": selected_campaign,
             "fixed_baseline_content_hash": None,
             "full_policy_fingerprint": None,
+            "selected_policy_mode": None,
+            "selected_policy_fingerprint": None,
             "latest_runs": latest,
         }
 
@@ -279,12 +281,28 @@ def assess_net_benefit(
         ((latest.get("FULL_POWERLAB") or {}).get("result") or {}).get("runtime_policy_fingerprint")
         or ""
     )
+    monitoring_policy_fingerprint = str(
+        ((latest.get("MONITORING_OVERHEAD") or {}).get("result") or {}).get(
+            "runtime_policy_fingerprint"
+        )
+        or ""
+    )
+    dynamic_policy_fingerprint = str(
+        ((latest.get("DYNAMIC_CONTROLLER") or {}).get("result") or {}).get(
+            "runtime_policy_fingerprint"
+        )
+        or ""
+    )
 
     if full_delta <= -practical_threshold_w:
         recommendation = "KEEP_FULL_POWERLAB"
+        selected_policy_mode = "FULL_POWERLAB"
+        selected_policy_fingerprint = full_policy_fingerprint
         reasons.append("full PowerLab has practically meaningful net battery savings")
     elif dynamic_delta <= -practical_threshold_w:
         recommendation = "KEEP_DYNAMIC_REDUCE_MONITORING"
+        selected_policy_mode = "DYNAMIC_CONTROLLER"
+        selected_policy_fingerprint = dynamic_policy_fingerprint
         reasons.append(
             "dynamic control helps but full PowerLab does not clear the net-benefit threshold"
         )
@@ -292,6 +310,11 @@ def assess_net_benefit(
             reasons.append("monitoring overhead consumes part of the controller savings")
     else:
         recommendation = "FIXED_GOOD_ENVELOPE"
+        selected_policy_mode = "FIXED_GOOD"
+        # The MONITORING comparison runs at Automation Level 0 and _meter_campaign
+        # requires the same policy fingerprint for its A1/B1/B2/A2 blocks. Its
+        # fingerprint therefore represents the validated fixed-good runtime policy.
+        selected_policy_fingerprint = monitoring_policy_fingerprint
         reasons.append("dynamic/full PowerLab does not beat fixed-good by a practical margin")
 
     return {
@@ -307,6 +330,8 @@ def assess_net_benefit(
         "campaign_id": selected_campaign,
         "fixed_baseline_content_hash": fixed_baseline_content_hash or None,
         "full_policy_fingerprint": full_policy_fingerprint or None,
+        "selected_policy_mode": selected_policy_mode,
+        "selected_policy_fingerprint": selected_policy_fingerprint or None,
         "latest_runs": latest,
     }
 
@@ -403,11 +428,11 @@ class StableReadiness:
         if not net_benefit["complete"]:
             reasons.append("net_benefit_validation_incomplete")
         current_policy = runtime_policy_snapshot(self.config, self.db)
-        full_policy_fingerprint = str(net_benefit.get("full_policy_fingerprint") or "")
-        if net_benefit["complete"] and full_policy_fingerprint != str(
+        selected_policy_fingerprint = str(net_benefit.get("selected_policy_fingerprint") or "")
+        if net_benefit["complete"] and selected_policy_fingerprint != str(
             current_policy["fingerprint"]
         ):
-            reasons.append("net_benefit_full_policy_is_stale")
+            reasons.append("net_benefit_selected_policy_is_stale")
 
         feedback_lookback_days = int(self.config.get("stable.feedback_lookback_days", 7))
         negative_feedback = [

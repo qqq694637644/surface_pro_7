@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from sp7_powerlab.agent_context import (
+    _stage_and_actions,
     build_agent_context,
     build_agent_context_without_runtime,
 )
@@ -47,6 +48,18 @@ def test_agent_context_is_compact_runtime_truth_entrypoint(
     db = Database(project_root / "runtime/powerlab.sqlite3")
     registry = EnvelopeRegistry(project_root, db)
     registry.load()
+    verified = db.envelopes()[0]
+    verified["status"] = "VERIFIED"
+    verified["content_hash"] = "agent-context-envelope-hash"
+    db.upsert_envelope(verified)
+    db.add_sample(
+        {
+            "ts": 1.0,
+            "wall_ts": "1970-01-01T00:00:01Z",
+            "current_envelope": verified["name"],
+            "current_envelope_content_hash": "agent-context-envelope-hash",
+        }
+    )
     monkeypatch.setattr(
         "sp7_powerlab.agent_context.inspect_hardware",
         lambda **_kwargs: FakeHardwareReport(),
@@ -69,6 +82,11 @@ def test_agent_context_is_compact_runtime_truth_entrypoint(
         assert context["project"]["git"]["commit"] == "abc123"
         assert context["documentation"]["ai_entry"] == "AGENTS.md"
         assert context["documentation"]["design_contract"] == "PLAN2.md"
+        assert context["documentation"]["project_map"] == "docs/PROJECT_MAP.md"
+        assert context["documentation"]["first_run"] == "docs/FIRST_RUN.md"
+        assert context["documentation"]["deployment"] == "docs/DEPLOYMENT.md"
+        assert context["documentation"]["agent_loop"] == "docs/AI_LOOP.md"
+        assert context["documentation"]["structured_agent_interface"] == "docs/MCP.md"
         assert context["hardware"]["supported_machine"] is True
         assert context["current_stage"]["name"] == "STAGE_A_MEASUREMENT_TRUST"
         assert context["current_stage"]["status"] == "BLOCKED"
@@ -76,6 +94,19 @@ def test_agent_context_is_compact_runtime_truth_entrypoint(
         assert "Runtime state in this output" in context["truth_note"]
         assert "latest_runs" not in context["net_benefit"]
         assert "measurement_trust" not in context["stable_readiness"]
+        assert "minimum_total_valid_usage_seconds" in context["stable_readiness"]
+        assert "minimum_observation_span_days" in context["stable_readiness"]
+        assert "campaign_id" in context["net_benefit"]
+        assert "full_policy_fingerprint" in context["net_benefit"]
+        assert "selected_policy_mode" in context["net_benefit"]
+        assert "selected_policy_fingerprint" in context["net_benefit"]
+        assert context["runtime"]["latest_sample"]["current_envelope_content_hash"] == (
+            "agent-context-envelope-hash"
+        )
+        verified_context = next(
+            item for item in context["verified_envelopes"] if item["name"] == verified["name"]
+        )
+        assert verified_context["content_hash"] == "agent-context-envelope-hash"
         assert context["scheduler"]["potential_neighbor_count"] == 0
     finally:
         db.close()
@@ -261,3 +292,60 @@ def test_agent_context_does_not_call_stale_stable_converged(
         assert context["current_stage"]["status"] == "BLOCKED"
     finally:
         db.close()
+
+
+def test_agent_context_stage_model_separates_validation_burn_in_from_net_benefit():
+    evidence_epoch = {
+        "epoch_id": "epoch-current",
+        "battery_epoch": 1,
+        "calibration_version": 2,
+        "evidence_semantics_version": 6,
+    }
+    measurement_trust = {
+        "status": "READY",
+        "evidence_epoch_id": "epoch-current",
+        "battery_epoch": 1,
+        "calibration_version": 2,
+        "evidence_semantics_version": 6,
+    }
+    base = {
+        "hardware": {"supported_machine": True},
+        "calibration_valid": True,
+        "measurement_trust": measurement_trust,
+        "lifecycle": {"learning_lifecycle": "VALIDATING"},
+        "active_battery_epoch": 1,
+        "evidence_epoch": evidence_epoch,
+        "frozen_reference_count": 1,
+        "active_investigation": None,
+        "scheduler": {"eligible": False, "reasons": []},
+    }
+
+    burn_in_stage, burn_in_actions = _stage_and_actions(
+        **base,
+        stable_readiness={
+            "ready": False,
+            "reasons": [
+                "total_valid_usage_below_minimum",
+                "net_benefit_validation_incomplete",
+            ],
+        },
+    )
+    assert burn_in_stage["name"] == "STAGE_D_VALIDATION_BURN_IN"
+    assert burn_in_actions[0]["action"] == "continue_validation_burn_in"
+
+    net_benefit_stage, net_benefit_actions = _stage_and_actions(
+        **base,
+        stable_readiness={
+            "ready": False,
+            "reasons": ["net_benefit_validation_incomplete"],
+        },
+    )
+    assert net_benefit_stage["name"] == "STAGE_E_NET_BENEFIT"
+    assert net_benefit_actions[0]["action"] == "complete_net_benefit_validation"
+
+    stable_ready_stage, stable_ready_actions = _stage_and_actions(
+        **base,
+        stable_readiness={"ready": True, "reasons": []},
+    )
+    assert stable_ready_stage["name"] == "STABLE_READY"
+    assert stable_ready_actions[0]["action"] == "consider_freezing_stable"

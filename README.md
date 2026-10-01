@@ -22,7 +22,8 @@ PowerLab 是一个只针对 **Microsoft Surface Pro 7 / Intel Core i5-1035G4 / L
 - finite Candidate Scheduler
 - tiered telemetry / Diagnostic Burst
 - Net Benefit / complexity deletion
-- A1-B1-B2-A2 paired Net Benefit + runtime-mode/covariate gates
+- bounded A1-B1-B2-A2 Net Benefit campaign + runtime policy fingerprint/covariate gates
+- STABLE denominator floor（usage/trusted time + distinct days + observation span）
 - Automation Level 0–4
 - AI runtime context
 
@@ -85,19 +86,22 @@ Telemetry
 Measurement Trust
    |
    v
-Reference + Noise
+current hard evidence epoch
    |
    v
-Evidence Engine
+Reference + Noise (envelope revision aware)
    |
    v
 Bounded Candidate Scheduler
    |
    v
-A/B/A + independent revalidation
+Trial + deterministic Evidence
    |
    v
-Verified Envelope
+Stage D real-usage validation/burn-in
+   |
+   v
+Stage E end-to-end Net Benefit
    |
    v
 STABLE
@@ -332,6 +336,7 @@ sp7-powerlab overhead summary
 - KEEP_FULL_POWERLAB
 - KEEP_DYNAMIC_REDUCE_MONITORING
 - FIXED_GOOD_ENVELOPE
+- NEED_MORE_DATA
 
 如果复杂系统没有足够实际净收益，回到 fixed-good 是正确结果。
 

@@ -66,11 +66,16 @@ def _project_context(config: Config, identity: dict[str, Any]) -> dict[str, Any]
 def _documentation_context() -> dict[str, str]:
     return {
         "ai_entry": "AGENTS.md",
+        "human_entry": "README.md",
         "project_map": "docs/PROJECT_MAP.md",
         "implementation_status": "docs/PROJECT_STATUS.md",
         "design_contract": "PLAN2.md",
         "agent_behavior": "docs/LLM_BEHAVIOR.md",
+        "first_run": "docs/FIRST_RUN.md",
         "operations": "docs/OPERATIONS.md",
+        "deployment": "docs/DEPLOYMENT.md",
+        "agent_loop": "docs/AI_LOOP.md",
+        "structured_agent_interface": "docs/MCP.md",
     }
 
 
@@ -253,6 +258,12 @@ def _compact_net_benefit(value: dict[str, Any]) -> dict[str, Any]:
             "monitoring_overhead_w",
             "dynamic_net_saving_w",
             "full_net_saving_w",
+            "campaign_id",
+            "fixed_baseline_envelope",
+            "fixed_baseline_content_hash",
+            "full_policy_fingerprint",
+            "selected_policy_mode",
+            "selected_policy_fingerprint",
             "recommendation",
             "reasons",
         )
@@ -267,6 +278,10 @@ def _compact_stable_readiness(value: dict[str, Any]) -> dict[str, Any]:
             "reasons",
             "coverage_days",
             "target_trusted_fraction",
+            "minimum_total_valid_usage_seconds",
+            "minimum_total_trusted_usage_seconds",
+            "minimum_distinct_usage_days",
+            "minimum_observation_span_days",
             "frozen_reference_count",
             "open_unexpected_power_events",
             "recent_negative_feedback_count",
@@ -445,21 +460,6 @@ def _stage_and_actions(
             )
         return stage, actions
 
-    if learning == "VALIDATING":
-        return (
-            {
-                "name": "STAGE_D_VALIDATION",
-                "status": "ACTIVE",
-                "reason": "candidate/controller behavior is being validated before convergence",
-            },
-            [
-                {
-                    "action": "continue_validation",
-                    "reason": "collect independent evidence and user-experience outcomes without changing the active judge",
-                }
-            ],
-        )
-
     if learning == "STABLE":
         return (
             {
@@ -490,15 +490,62 @@ def _stage_and_actions(
             ],
         )
 
+    readiness_reasons = set(stable_readiness.get("reasons") or [])
+    net_benefit_reasons = {
+        "net_benefit_validation_incomplete",
+        "net_benefit_selected_policy_is_stale",
+    }
+    if readiness_reasons and readiness_reasons <= net_benefit_reasons:
+        return (
+            {
+                "name": "STAGE_E_NET_BENEFIT",
+                "status": "ACTIVE",
+                "reason": (
+                    "measurement/reference/usage validation is sufficient; end-to-end "
+                    "PowerLab net-benefit evidence is the remaining convergence gate"
+                ),
+            },
+            [
+                {
+                    "action": "complete_net_benefit_validation",
+                    "reason": ", ".join(sorted(readiness_reasons)),
+                }
+            ],
+        )
+
+    if learning == "VALIDATING":
+        return (
+            {
+                "name": "STAGE_D_VALIDATION_BURN_IN",
+                "status": "ACTIVE",
+                "reason": (
+                    "candidate/controller behavior and representative real usage are being "
+                    "validated before end-to-end Net Benefit and convergence"
+                ),
+            },
+            [
+                {
+                    "action": "continue_validation_burn_in",
+                    "reason": ", ".join(
+                        stable_readiness.get("reasons")
+                        or ["collect independent evidence and representative real usage"]
+                    ),
+                }
+            ],
+        )
+
     return (
         {
-            "name": "BASELINE_OBSERVATION",
+            "name": "STAGE_D_VALIDATION_BURN_IN",
             "status": "ACTIVE",
-            "reason": "system is calibrated but has not yet reached a later learning state",
+            "reason": (
+                "current-epoch reference exists, but representative real-usage validation "
+                "or another non-Net-Benefit STABLE prerequisite is still incomplete"
+            ),
         },
         [
             {
-                "action": "resolve_stable_readiness_gaps",
+                "action": "continue_validation_burn_in",
                 "reason": ", ".join(stable_readiness.get("reasons") or ["more evidence required"]),
             }
         ],
@@ -638,6 +685,7 @@ def build_agent_context(
                 "remote_hint",
                 "media_playing",
                 "current_envelope",
+                "current_envelope_content_hash",
                 "trial_id",
                 "resume_grace",
             )
@@ -685,6 +733,7 @@ def build_agent_context(
                     "name",
                     "status",
                     "revision",
+                    "content_hash",
                     "epp",
                     "max_perf_pct",
                     "turbo",

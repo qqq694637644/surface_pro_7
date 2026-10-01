@@ -122,6 +122,21 @@ Active trial 期间，不为了让当前 candidate 通过而修改：
 
 如果发现 Evidence 设计本身有问题，可以正常修改系统，但要把它当作新的 evidence semantics / compatibility 边界重新验证。
 
+### Evidence identity 不能靠名称推断
+
+Agent 在复用历史 evidence 前必须先判断它属于哪个 identity：
+
+- battery epoch
+- hard evidence epoch
+- relevant compatibility generation
+- envelope content hash
+- trial evidence_scope_key
+- Stage E runtime policy fingerprint / Net Benefit campaign
+
+同名 envelope promotion 后可能已经是新 policy revision；同样叫 FULL_POWERLAB 的 B1/B2 也可能因为
+config、Automation Level、verified envelope set 或 manual override 变化而不是同一个 treatment。
+名称相同不是兼容性证明。
+
 ## 6. UnexpectedPower 先调查
 
 检测到 UnexpectedPower 或 sustained drift 时：
@@ -226,6 +241,11 @@ i5-1035G4 的持续高功耗会快速增加机身/CPU 热量，并可能造成�
 - expensive attribution 降频；
 - 只有异常/漂移时 diagnostic burst；
 - 只有明确 reopen 条件才重新搜索。
+
+STABLE 不是“先 freeze 再慢慢做 Net Benefit”。进入 STABLE 之前必须先完成 Stage D representative
+real-usage validation/burn-in 和 Stage E end-to-end Net Benefit；StableReadiness 还要求 usage denominator
+floor、distinct usage days、observation span、current Reference/Noise、无 unresolved event，以及 Stage E
+recommendation 对应的 selected policy identity 仍与 Net Benefit evidence 匹配。
 
 主动建议停止、冻结或简化，当：
 

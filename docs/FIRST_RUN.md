@@ -1,43 +1,36 @@
 # First Run — Surface Pro 7 PowerLab
 
-本文件只描述真实 Surface Pro 7 第一次部署和新电池重新建基线的顺序。
+本文件只描述真实 Surface Pro 7 第一次部署、新电池重新建基线，以及从空白 runtime 走到 STABLE 的**唯一操作顺序**。
 
-AI / Agent 先读根目录 AGENTS.md。
+AI / Agent 先读根目录 AGENTS.md。项目实现成熟度看 docs/PROJECT_STATUS.md。
 
 任何时候都可以先运行：
 
+```bash
 sp7-powerlab agent-context
+```
 
-它会告诉你当前 runtime stage 和 blocker。
+它会报告当前 runtime stage 和 blocker。不要从本文推断实时状态。
 
 ## 1. 安装
 
-~~~bash
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-~~~
 
-安装用户服务：
-
-~~~bash
 bash scripts/install-user-services.sh
-~~~
-
-安装 root helper：
-
-~~~bash
 bash scripts/install-root-helper.sh
-~~~
+```
 
-root helper 只提供有限 HWP 操作，不提供任意 root shell。
+root helper 只提供有限 HWP inspect/snapshot/apply/restore，不提供任意 root shell。
 
 ## 2. 先确认硬件契约
 
-~~~bash
+```bash
 sp7-powerlab doctor
 sp7-powerlab agent-context
-~~~
+```
 
 自动控制至少依赖：
 
@@ -56,20 +49,17 @@ sp7-powerlab agent-context
 
 ## 3. 新电池先建立新的 battery epoch
 
-如果刚更换电池：
+如果刚更换电池，先确认 user service 已经写入至少一条新电池 telemetry：
 
-先确认 user service 已经写入至少一条新电池 telemetry：
-
-~~~bash
+```bash
 sp7-powerlab observe power --hours 1
-~~~
+```
 
-输出必须有 latest battery sample。若刚启动 service，先等正常采样出现，不要用旧电池最后一条
-sample 创建新 epoch。
+输出必须有 latest battery sample。若刚启动 service，先等正常采样出现，不要用旧电池最后一条 sample 创建新 epoch。
 
-~~~bash
+```bash
 sp7-powerlab calibrate new-battery
-~~~
+```
 
 新 battery epoch 会使旧 calibration / verified evidence 失效或需要重新验证。
 
@@ -77,17 +67,15 @@ sp7-powerlab calibrate new-battery
 
 ## 4. 先只读收集真实放电
 
-默认 automation.level = 0。
+默认 `automation.level = 0`。
 
-保持只读，进行真实日常使用。
+保持只读，进行真实日常使用：
 
-检查：
-
-~~~bash
+```bash
 sp7-powerlab observe now
 sp7-powerlab observe power --hours 6
 sp7-powerlab agent-context
-~~~
+```
 
 尽量覆盖：
 
@@ -99,23 +87,21 @@ sp7-powerlab agent-context
 
 此阶段不要为了“加速学习”故意持续本地满载。
 
-## 5. Stage A — Measurement Trust
+## 5. Stage A — Preliminary Measurement Trust
 
 先看 gauge：
 
-~~~bash
+```bash
 sp7-powerlab evidence gauge --hours 6
-~~~
+```
 
 再评估：
 
-~~~bash
+```bash
 sp7-powerlab evidence trust --hours 6
-~~~
+```
 
-目标是：
-
-Measurement Trust = READY
+目标是 preliminary Measurement Trust = READY。
 
 需要真实解决：
 
@@ -124,24 +110,23 @@ Measurement Trust = READY
 - power_now cadence/quantization
 - BAT integration
 - energy delta
-- contiguous valid-discharge window consistency
+- contiguous valid-discharge consistency
 - minimum arm duration
 
-长时间观察可以被 Charging/suspend/resume 打断，但 READY 必须来自足够长的连续 Discharging
-window 的真实 integration-vs-energy consistency；多个短放电片段累计够时长不能替代这个检查。
+长时间观察可以被 Charging/suspend/resume 打断，但 READY 必须来自足够长的连续 Discharging consistency windows；多个短片段累计够时长不能代替这个检查。
 
 如果仍 BLOCKED：
 
-- 继续收集更长的 Discharging 数据；
+- 继续收集更长的有效 Discharging 数据；
 - 检查 suspend/resume gap；
-- 检查 battery telemetry 是否稳定；
-- 不开始自动 candidate search。
+- 检查 battery telemetry；
+- 不开始 candidate search。
 
-## 6. preliminary Measurement Trust READY 后再 Calibration
+## 6. Calibration，然后重新建立 current-epoch Measurement Trust
 
-按顺序：
+preliminary trust READY 后，按顺序完成：
 
-~~~bash
+```bash
 sp7-powerlab calibrate start cold_idle
 sp7-powerlab calibrate finish
 
@@ -153,108 +138,99 @@ sp7-powerlab calibrate finish
 
 sp7-powerlab calibrate start bounded_burst
 sp7-powerlab calibrate finish
-~~~
 
-检查：
-
-~~~bash
 sp7-powerlab calibrate status
 sp7-powerlab agent-context
-~~~
+```
 
-bounded_burst 只用于热惯性和短时行为。
+bounded_burst 只用于热惯性和短时行为，不是 sustained benchmark。
 
-不要把它当 sustained benchmark。
+Calibration 会改变 hard evidence context。之前的 preliminary trust 只证明“测量路径可用”，不能授权新的 current epoch。
 
-Calibration 完成会改变 hard evidence context。此时之前的 preliminary trust 只证明“测量路径可用”，
-不能直接授权当前 epoch 的长期学习。重新运行：
+重新运行：
 
-~~~bash
+```bash
 sp7-powerlab evidence gauge --hours 6
 sp7-powerlab evidence trust --hours 6
-~~~
+```
 
-只有新的 current-epoch Measurement Trust READY 后，才建立 Frozen Reference / Recent Noise 或开始 trial。
+只有这次 current-epoch Measurement Trust READY 后，才开始 Stage B。
 
-## 7. 收编第一个真实 verified baseline
+## 7. Stage B — Verified Baseline + Natural Reference / Noise
 
-不要把 config/envelopes.toml 里的 candidate 直接宣布 VERIFIED。
+### 7.1 收编第一条真实 VERIFIED baseline
 
-当 hardware contract、Measurement Trust、calibration 和 helper 都正常后：
+不要把 `config/envelopes.toml` 里的 candidate 直接宣布 VERIFIED。
 
-~~~bash
+当 hardware contract、current-epoch Measurement Trust、calibration 和 helper 都正常后：
+
+```bash
 sp7-powerlab envelope adopt-current INTERACTIVE_EFFICIENT \
   --note "current real HWP baseline"
-~~~
+
+sp7-powerlab envelope list
+sp7-powerlab agent-context
+```
 
 它读取机器当前真实 HWP snapshot。
 
-检查：
+### 7.2 自然积累 Reference / Noise
 
-~~~bash
-sp7-powerlab envelope list
-sp7-powerlab agent-context
-~~~
+继续真实日常使用：
 
-## 8. Stage B — Natural Baseline / Noise
-
-先让机器在真实日常工作里自然运行。
-
-目标：
-
-- FrozenReferenceBaseline
-- RecentNoiseDistribution
-- representative usage coverage
-
-检查：
-
-~~~bash
+```bash
 sp7-powerlab evidence status
 sp7-powerlab evidence noise
 sp7-powerlab lifecycle coverage
-~~~
+```
 
-不要急着搜索。
+自然 Reference/Noise 只接受 clean Discharging rollup，并按 frozen envelope content hash 隔离 policy revision。
 
-如果 noise baseline 不够，Scheduler 应保持 blocked。
+这意味着：
 
-## 9. 再进入 coarse optimization
+- Charging/resume/gap transitional minute 可以保留为 usage telemetry，但不能进入 Reference/Noise；
+- 同名 envelope promotion 后的新 content hash 不继承旧 Frozen Reference/Recent Noise；
+- 当前 DB envelope 必须仍是 VERIFIED 且 content hash 匹配，才能继续作为 trusted policy evidence。
 
-建议先 Level 2。
+如果 noise/reference 不足，Scheduler 应保持 blocked。
 
-修改 config/powerlab.toml：
+## 8. Stage C — Bounded Coarse Search
 
-~~~toml
+建议先使用 Level 2：
+
+```toml
 [automation]
 level = 2
 auto_promote = false
-~~~
+```
 
 然后：
 
-~~~bash
+```bash
 sp7-powerlab lifecycle optimize --reason "begin coarse search"
 sp7-powerlab scheduler status
 sp7-powerlab scheduler candidates INTERACTIVE_EFFICIENT
-~~~
+```
 
 Level 2 默认只提出 candidate。
 
-实验前仍应检查：
+实验前仍检查：
 
-- current ControlSafetyState
-- Measurement Trust
-- noise
-- arm duration
+- ControlSafetyState
+- current-epoch Measurement Trust
+- current Reference/Noise
+- minimum arm duration
 - battery level
 - thermal cooldown
 - experiment budget
+- active investigation
+- current evidence scope
 
-## 10. Trial
+### Trial
 
 常规 proposal：
 
-~~~json
+```json
 {
   "kind": "envelope",
   "baseline_envelope": "INTERACTIVE_EFFICIENT",
@@ -262,37 +238,202 @@ Level 2 默认只提出 candidate。
     "max_perf_pct": 55
   }
 }
-~~~
+```
 
 启动：
 
-~~~bash
+```bash
 sp7-powerlab trial start proposals/example.json
-~~~
-
-查看：
-
-~~~bash
 sp7-powerlab trial status
-~~~
+```
 
 实验必须经历 initial crossover 和 independent revalidation。
 
-最终只有 VERIFIED_WINNER 才能 promotion。
+只有 VERIFIED_WINNER 才能 promotion；PRACTICALLY_EQUIVALENT 和 INCONCLUSIVE 都是正常终点。
 
-## 11. 用户反馈
+candidate 造成的 PSI、thermal、media 或 UX 坏结果不能被过滤掉。
 
-出现卡顿、滚动不顺、remote latency 或不稳定时及时记录：
+## 9. 及时记录用户体验
 
-~~~bash
+出现卡顿、滚动不顺、remote latency 或不稳定时：
+
+```bash
 sp7-powerlab feedback sluggish \
   --trial-id trial-xxxx \
   --notes "browser scroll/input latency"
-~~~
+```
 
-不要为了节能数字忽略真实体验退化。
+用户负面体验是重要 outcome，不要为了 BAT 更低而忽略。
 
-## 12. Stage C/D 后才考虑 Level 3
+## 10. Stage D — Independent Validation + Real-Usage Burn-in
+
+当 coarse search 已经找到值得保留的 verified policy，进入 validation：
+
+```bash
+sp7-powerlab lifecycle validate --reason "begin independent validation and usage burn-in"
+sp7-powerlab lifecycle coverage
+sp7-powerlab lifecycle readiness
+```
+
+Stage D 的目标不是“先 freeze STABLE”，而是证明当前系统在代表性真实使用中稳定成立。
+
+必须积累：
+
+- independent revalidation；
+- representative real usage；
+- trusted usage fraction；
+- minimum total valid usage seconds；
+- minimum total trusted usage seconds；
+- minimum distinct usage days；
+- minimum observation span；
+- 没有 unresolved UnexpectedPower/investigation；
+- 没有近期严重负面反馈。
+
+`stable.coverage_days` 是 lookback window，不代表已经自动观察了这么久。
+
+此时 readiness 仍可能因为 `net_benefit_validation_incomplete` 被 BLOCKED，这是正常的：还需要 Stage E。
+
+## 11. Stage E — End-to-End Net Benefit / Complexity Selection
+
+PowerLab 自己也必须证明值得。
+
+正式 Net Benefit 不接受任意旧 JSONL 在比较时补贴 epoch/campaign 标签。每个 capture 在开始时固定：
+
+- battery identity / epoch
+- current hard evidence epoch/fingerprint
+- calibration version
+- evidence semantics
+- capture mode
+- fixed baseline name/content hash
+- runtime policy fingerprint
+- validation campaign
+
+runtime policy fingerprint 代表 relevant runtime/config、Automation Level、VERIFIED envelope set/content hashes 和 manual override。B1/B2 如果 policy fingerprint 不同，即使 mode 名相同也不是同一 treatment。
+
+每一个 A1-B1-B2-A2 comparison 开始前，先把 Automation Level、verified envelope set 和 manual override
+设成该 comparison 要验证的 policy，并在四个 block 期间保持不变。FIXED_GOOD A block 只是停止 service，
+不是临时改 config；否则 A/B fingerprint 会不同。
+
+### 11.1 一个 comparison 使用 A1-B1-B2-A2
+
+例如 monitoring：
+
+```bash
+# A1：实际 HWP 回到选定的 fixed-good VERIFIED envelope，然后停止 service。
+systemctl --user stop sp7-powerlab.service
+# FIXED_GOOD 会拒绝仍然 fresh 的 service heartbeat；默认配置下等待 >30s。
+sleep 35
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
+
+# B1/B2：Automation Level 0，启动 service，连续采两个 monitoring block。
+systemctl --user start sp7-powerlab.service
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
+
+# A2：恢复同一个 fixed-good envelope，停止 service。
+systemctl --user stop sp7-powerlab.service
+sleep 35
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
+```
+
+记录四个 `meter-...` run id：
+
+```bash
+sp7-powerlab overhead compare meter-a1 meter-b1 meter-b2 meter-a2
+```
+
+再在**同一个 OPEN campaign** 中分别完成：
+
+- MONITORING
+- DYNAMIC_CONTROLLER
+- FULL_POWERLAB
+
+对应 runtime mode：
+
+- `MONITORING`：live service + Automation Level 0 + fixed HWP
+- `DYNAMIC_CONTROLLER`：live CONTROL_ALLOWED service + Automation Level 1
+- `FULL_POWERLAB`：live CONTROL_ALLOWED service + Automation Level >= 2
+- `FIXED_GOOD`：service stopped + actual HWP 每点匹配同一个 VERIFIED fixed envelope
+
+PowerLab 会检查：
+
+- BAT consistency / data quality
+- provenance
+- A1/B1/B2/A2 时间顺序和 inter-block gap
+- fixed baseline identity
+- runtime policy fingerprint
+- brightness
+- active/media/remote fraction
+- network
+- package temperature
+- reference drift
+- 两个 candidate delta 的方向和 spread
+
+明显不可比时结果不会进入 STABLE evidence。
+
+### 11.2 campaign 不是字符串标签
+
+`--campaign` 对应数据库中的 validation campaign entity：
+
+- 新 campaign 必须从 FIXED_GOOD A1 开始；
+- 固定 hard/battery/calibration/semantics context 与 fixed baseline；
+- 受 `net_benefit.max_campaign_span_seconds` 限制；
+- context/baseline 变化或超时会 INVALID；
+- Monitoring/Dynamic/Full 三类有效 comparison 各完成一次后自动 COMPLETE/CLOSED；
+- CLOSED campaign 不能继续塞结果。
+
+查看：
+
+```bash
+sp7-powerlab overhead history
+sp7-powerlab overhead summary
+sp7-powerlab lifecycle readiness
+```
+
+可能结论：
+
+- KEEP_FULL_POWERLAB
+- KEEP_DYNAMIC_REDUCE_MONITORING
+- FIXED_GOOD_ENVELOPE
+- NEED_MORE_DATA
+
+如果结果是 FIXED_GOOD_ENVELOPE，不要因为系统已经复杂就强行保留动态层。
+
+在进入 STABLE 前，把 runtime 恢复到 recommendation 对应、已经验证过的 policy identity：
+
+- KEEP_FULL_POWERLAB：恢复 Full comparison 的 policy/config；
+- KEEP_DYNAMIC_REDUCE_MONITORING：恢复 Dynamic comparison 的 policy/config；
+- FIXED_GOOD_ENVELOPE：恢复 Level-0/fixed-good policy，并确保 actual HWP 是固定 VERIFIED baseline。
+
+随后再次运行 readiness；不要用“最后采集的是 Full”代替“最终选择的是哪个 policy”。
+
+## 12. A–E 全部完成后才进入 STABLE
+
+再次检查：
+
+```bash
+sp7-powerlab lifecycle readiness
+```
+
+只有 deterministic readiness 为 ready 才正常 freeze：
+
+```bash
+sp7-powerlab lifecycle freeze --reason "Stage A-E and current policy net benefit validated"
+```
+
+STABLE 还会确认 recommendation 对应的 selected policy fingerprint 仍代表**当前** runtime。Stage E 后如果
+config、verified envelope set 或 override 改变，旧 Net Benefit 只能当历史记录，需要重新验证。
+
+进入 STABLE 后：
+
+- core telemetry 继续；
+- drift / UnexpectedPower 继续；
+- expensive attribution 降频；
+- Scheduler 默认睡眠；
+- 不主动 trial；
+- 正常 Agent 结论应经常是 NO_CHANGE。
+
+## 13. Level 3/4 只在真机链路成熟后考虑
 
 只有以下链路在真机反复可靠后再考虑 Level 3：
 
@@ -303,6 +444,8 @@ sp7-powerlab feedback sluggish \
 - Scheduler stop rules
 - experiment budget
 - negative feedback
+- Stage D burn-in
+- Stage E Net Benefit
 
 Level 3 允许 daemon 自动开始通过全部 gate 的低风险 trial。
 
@@ -310,96 +453,7 @@ Level 4 还允许满足条件的自动 promotion。
 
 个人设备没有必要为了“自动化程度高”升级 level。
 
-## 13. STABLE
-
-检查：
-
-~~~bash
-sp7-powerlab lifecycle readiness
-~~~
-
-STABLE 需要真实 coverage、reference/noise、无 unresolved investigation 和 Net Benefit evidence。
-
-满足后：
-
-~~~bash
-sp7-powerlab lifecycle freeze --reason "real usage coverage and net benefit validated"
-~~~
-
-进入 STABLE 后正常行为应该更安静，而不是继续找新参数。
-
-## 14. PowerLab 本身的 Net Benefit
-
-用 sp7-powerlab-meter 分别记录可比较条件。capture 开始时就固定 battery/evidence epoch、hard
-fingerprint、calibration、campaign、mode、fixed baseline hash 和 runtime policy fingerprint；旧 JSONL
-不能在比较时补贴成当前 epoch。
-
-至少比较：
-
-- fixed-good
-- monitoring
-- dynamic controller
-- full PowerLab
-
-每一种 candidate mode 都做一组独立的 A1-B1-B2-A2。A1/A2 都是同一个 fixed-good VERIFIED
-envelope；B1/B2 是同一个 candidate mode 的两个独立 block。
-
-例如 monitoring campaign：
-
-~~~bash
-# 先让实际 HWP 回到选定的 fixed-good VERIFIED envelope，然后停止 PowerLab service。
-systemctl --user stop sp7-powerlab.service
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
-
-# Automation Level 0，启动 service 后连续采两个 monitoring block。
-systemctl --user start sp7-powerlab.service
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
-
-# 再让实际 HWP 回到同一个 fixed-good envelope，停止 service，采 A2。
-systemctl --user stop sp7-powerlab.service
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
-~~~
-
-记录 A1/B1/B2/A2 四个 `meter-...` run id，然后：
-
-~~~bash
-sp7-powerlab overhead compare meter-a1 meter-b1 meter-b2 meter-a2
-
-sp7-powerlab overhead summary
-~~~
-
-再分别重复 dynamic controller 和 full PowerLab：
-
-- `DYNAMIC_CONTROLLER`：service 必须真实运行在 Automation Level 1 且 ControlSafety=CONTROL_ALLOWED
-- `FULL_POWERLAB`：service 必须真实运行在 Automation Level >= 2 且 ControlSafety=CONTROL_ALLOWED
-- `MONITORING`：service 必须真实运行在 Automation Level 0
-- `FIXED_GOOD`：service 必须停止，且每个 sample 的 actual HWP 都要匹配同一个 VERIFIED envelope
-
-每个 comparison 都必须是：
-
-~~~
-A1 fixed -> B1 candidate -> B2 candidate -> A2 fixed
-~~~
-
-PowerLab 会检查 brightness、active/media/remote fraction、network、temperature、BAT consistency、
-fixed HWP、reference drift、两个 candidate delta 的方向和 spread。明显不可比时结果是
-`DATA_QUALITY_FAILURE`，不会进入 STABLE evidence。
-
-四个 block 的 runtime policy fingerprint 也必须一致。B1/B2 之间如果发生 envelope promotion、
-controller/config 修改或 manual override 变化，这组 comparison 作废，必须重新采集。
-
-monitoring / dynamic / full 三个 comparison 必须来自同一个 current evidence epoch、同一个
-battery/hard/calibration context、同一个 campaign 名称和同一个 fixed baseline content hash；否则不会
-作为一组完整 Net Benefit evidence 让 STABLE readiness 通过。
-
-campaign 不是可无限复用的字符串：它由数据库以 OPEN/COMPLETE/INVALID 生命周期管理，并受最大
-campaign span 限制。新 campaign 先采 FIXED_GOOD A1；三种 mode 各完成一次有效 comparison 后自动
-关闭。STABLE 还会确认保存的 FULL_POWERLAB policy fingerprint 仍代表当前 runtime policy。
-
-如果结果建议 FIXED_GOOD_ENVELOPE，就不要因为项目已经复杂而强行保留动态系统。
-
-## 15. 真机完成前不要声称什么
+## 14. 真机完成前不要声称什么
 
 在实际新电池 Stage A–E 完成前，不要声称：
 

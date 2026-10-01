@@ -118,18 +118,33 @@ PowerLab 保留：
 - rollback
 - restricted root helper
 - active trial deterministic Evidence contract
+- current evidence identity / epoch compatibility
+- StableReadiness / Net Benefit validity
+- destructive runtime reset 的显式授权边界
 
 root helper 不接受任意 shell / arbitrary sysfs / arbitrary MSR。
 
 ## 6. 推荐 Agent 入口
 
-如果 Agent 能执行 Bash：
+先按 AGENTS.md 判断任务模式。
+
+真实 SP7 运维/优化且 Agent 能执行 Bash：
 
 ~~~bash
 cat AGENTS.md
 cat docs/PROJECT_STATUS.md
 sp7-powerlab agent-context
 ~~~
+
+纯仓库工程/代码维护则优先：
+
+~~~bash
+cat AGENTS.md
+cat docs/PROJECT_STATUS.md
+cat docs/PROJECT_MAP.md
+~~~
+
+非 SP7 开发机上的 hardware/runtime BLOCKED 不应被解释成代码维护 blocker，也不构成 reset runtime 的授权。
 
 需要详细历史时再调用 knowledge pack。
 

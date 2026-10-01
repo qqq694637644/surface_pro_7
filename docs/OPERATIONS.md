@@ -1,148 +1,188 @@
 # Operations
 
-日常运维的第一条命令：
+本文件描述**已经部署的真实 Surface Pro 7** 的日常运维、调查、实验、Stage D/E validation 和 STABLE 操作。
 
-~~~bash
+如果你是 AI，先读根目录 AGENTS.md。纯仓库工程/代码维护不要把本文件当作启动检查单；非 SP7 开发机的 runtime/hardware BLOCKED 也不是仓库维护 blocker。
+
+真实 SP7 运维的第一条命令：
+
+```bash
 sp7-powerlab agent-context
-~~~
+```
 
-如果你是 AI，先读根目录 AGENTS.md。
+不要从 Markdown 推断实时状态。
 
-## 1. 状态总览
+## 1. 状态总览与三类 runtime state
 
-~~~bash
+```bash
 sp7-powerlab agent-context
 sp7-powerlab service status
-~~~
-
-按需继续：
-
-~~~bash
 sp7-powerlab lifecycle status
 sp7-powerlab safety status
+```
+
+必须分开理解：
+
+- Control Safety：现在能不能写机器；
+- Learning Lifecycle：现在应该积累什么 evidence / Scheduler 是否应工作；
+- Investigation：是否正在调查异常。
+
+它们是正交状态，不要压成一个“系统正常/异常”。
+
+按问题继续：
+
+```bash
 sp7-powerlab evidence status
 sp7-powerlab scheduler status
-~~~
-
-不要从文档推断实时状态。
+sp7-powerlab lifecycle readiness
+```
 
 ## 2. 日常 power / thermal
 
-~~~bash
+```bash
 sp7-powerlab observe now
 sp7-powerlab observe power --hours 24
 sp7-powerlab observe thermal --hours 24
-~~~
+```
 
 关注：
 
 - battery_status
-- BAT W
+- BAT W / battery energy
 - battery %
 - package temperature
 - thermal state
 - current envelope
+- current envelope revision/content identity
 - demand region
 - resume grace
 
-短时间高 W 不自动等于问题。
+短时间高 W 不自动等于问题。先判断 workload、data quality 和持续时间。
 
-## 3. UnexpectedPower
+## 3. UnexpectedPower / Drift 先调查
 
 检查：
 
-~~~bash
+```bash
 sp7-powerlab unexpected-power list
-~~~
-
-看具体事件：
-
-~~~bash
 sp7-powerlab unexpected-power inspect <event-id>
-~~~
+```
 
 如果有 investigation：
 
-~~~bash
+```bash
 sp7-powerlab investigation list
 sp7-powerlab investigation inspect <investigation-id>
 sp7-powerlab investigation attribute <investigation-id>
-~~~
+```
 
 正确顺序：
 
-UnexpectedPower -> Investigation -> Attribution -> verification
+```
+UnexpectedPower / Drift
+  -> Investigation
+  -> Attribution
+  -> verification
+```
 
 不是：
 
-UnexpectedPower -> 降 CPU
+```
+UnexpectedPower -> 降 CPU -> 自动搜索
+```
+
+慢性 drift 看 FrozenReferenceBaseline 对 recent distribution；不要让 recent adaptive distribution 吞掉长期退化。
 
 ## 4. 关闭 investigation
 
 只有有证据时分类。
 
-示例：
+例如：
 
-~~~bash
+```bash
 sp7-powerlab investigation close <id> EXPECTED_WORKLOAD_CHANGE \
   --reason "user requested file transfer"
 
 sp7-powerlab investigation close <id> CONFIRMED_CONFIG_REGRESSION \
   --reason "verified envelope regression reproduced"
-~~~
+```
 
-CONFIRMED_CONFIG_REGRESSION 会让 learning reopen。
+`CONFIRMED_CONFIG_REGRESSION` 会让 learning reopen。
 
-普通 EXPECTED_WORKLOAD_CHANGE 不应该唤醒 Scheduler。
+普通 `EXPECTED_WORKLOAD_CHANGE` 不应唤醒 Scheduler。
 
 ## 5. Measurement Trust
 
-~~~bash
+```bash
 sp7-powerlab evidence gauge --hours 6
 sp7-powerlab evidence trust --hours 6
-~~~
+```
 
 如果 Measurement Trust BLOCKED：
 
 - 不解释微小 W 差异；
 - 不手工绕开 Scheduler gate；
-- 先增加有效 Discharging 数据或修 telemetry。
+- 先增加有效 Discharging 数据或修 telemetry；
+- 检查 contiguous consistency windows，而不是只看累计 valid seconds。
 
-Measurement Trust 绑定当前 battery/calibration/evidence epoch。换电池、重新 calibration 或 hard epoch
-变化后，旧 READY 自动失效，必须重新评估。
+Measurement Trust 绑定当前 battery/calibration/evidence epoch。换电池、重新 calibration 或 hard epoch 变化后，旧 READY 不能继续授权当前学习。
 
-## 6. Evidence / Noise
+## 6. Evidence identity / Reference / Noise
 
-~~~bash
+```bash
 sp7-powerlab evidence status
 sp7-powerlab evidence noise
-~~~
+sp7-powerlab envelope list
+```
 
-重点看：
+复用历史 evidence 前先判断 identity：
 
-- active hard evidence epoch
-- frozen reference
-- recent noise
-- MUE
-- recent decisions
+- battery epoch
+- hard evidence epoch
+- relevant compatibility generation
+- envelope content hash
+- trial `evidence_scope_key`
+- Stage E runtime policy fingerprint / campaign
 
-自然 reference/noise 只接受当前 evidence epoch 且同一分钟内 brightness bucket、envelope、
-media/active/remote 状态稳定的 rollup。整个窗口还必须保持 Discharging、无 resume grace、无超限
-sample gap、battery epoch 单一，并达到 minimum valid-discharge fraction；transitional/mixed 分钟
-不会进入 frozen reference/noise。
+同名不等于同一证据。
 
-sample 会冻结 `current_envelope_content_hash`。同名 envelope promotion 后，新 revision 会进入新的
-reference/noise scope；Evidence 层还会要求 envelope 当前仍是 VERIFIED 且 DB content hash 与 rollup
-冻结值完全一致。BLOCKED/RETIRED 或 hash 已变化的历史窗口不会继续生成/复用自然基线。
+Natural Reference/Noise 只接受 clean Discharging rollup：
 
-如果旧 epoch 与当前环境不兼容，不要把历史 winner 直接当当前 winner。
+- 无 Charging/AC；
+- 无 resume grace；
+- 无超限 sample gap；
+- battery/evidence epoch 单一；
+- brightness/envelope/media/active/remote 等 required strata 稳定；
+- valid-discharge fraction 达标。
 
-## 7. Scheduler
+sample 会冻结 `current_envelope_content_hash`。同名 envelope promotion 后，新 revision 进入新的 Reference/Noise scope；当前 envelope 还必须仍为 VERIFIED 且 DB content hash 与 rollup 冻结值匹配。
 
-~~~bash
+历史 evidence 可以做 prior / regression investigation，但不能在 identity 不兼容时直接给当前 promotion 或 trusted coverage 投票。
+
+## 7. Envelope 与 manual override
+
+```bash
+sp7-powerlab envelope list
+sp7-powerlab envelope inspect INTERACTIVE_EFFICIENT
+```
+
+Manual override：
+
+```bash
+sp7-powerlab envelope override INTERACTIVE_EFFICIENT
+sp7-powerlab envelope clear-override
+```
+
+普通 Controller 只使用 VERIFIED envelope。
+
+注意：manual override 和 VERIFIED envelope set/content hash 都属于 Stage E runtime policy identity。修改它们后，旧 FULL_POWERLAB Net Benefit 可能不再代表当前 runtime。
+
+## 8. Scheduler
+
+```bash
 sp7-powerlab scheduler status
 sp7-powerlab scheduler candidates INTERACTIVE_EFFICIENT
-~~~
+```
 
 常见 blocker：
 
@@ -159,66 +199,54 @@ sp7-powerlab scheduler candidates INTERACTIVE_EFFICIENT
 - minimum_arm_duration_exceeds_daily_candidate_budget
 - cpu_headroom_below_minimum_useful_effect
 
-这些 blocker 是正常停止机制。
+这些 blocker 是正常停止机制，不是需要“绕开”的错误。
 
-## 8. Trial
+Scheduler 是有限搜索器。没有 practical headroom 时应停止。
+
+## 9. Trial / deterministic Evidence
 
 查看：
 
-~~~bash
+```bash
 sp7-powerlab trial status
-~~~
+```
 
 手动启动：
 
-~~~bash
+```bash
 sp7-powerlab trial start proposals/example.json
-~~~
+```
 
 必要时回滚：
 
-~~~bash
+```bash
 sp7-powerlab trial rollback --trial-id trial-xxxx \
   --reason "manual rollback"
-~~~
+```
 
 Promotion：
 
-~~~bash
+```bash
 sp7-powerlab trial promote trial-xxxx
-~~~
+```
 
 只有 VERIFIED_WINNER 能 promotion。
 
-## 9. 用户体验反馈
+Trial evidence 必须按当前 `evidence_scope_key` 聚合；相同 candidate 参数在不同 baseline/workload/compatibility 下不是同一个实验问题。
 
-~~~bash
+Initial crossover 和 independent revalidation 必须独立。Candidate 造成的 thermal / PSI / media / UX 坏结果不能过滤。
+
+## 10. 用户体验反馈
+
+```bash
 sp7-powerlab feedback good --envelope INTERACTIVE_EFFICIENT
 
 sp7-powerlab feedback sluggish \
   --trial-id trial-xxxx \
   --notes "remote interaction feels slower"
-~~~
+```
 
-负面反馈是重要 outcome。
-
-不要因为 BAT 更低而忽略卡顿。
-
-## 10. Envelope
-
-~~~bash
-sp7-powerlab envelope list
-sp7-powerlab envelope inspect INTERACTIVE_EFFICIENT
-~~~
-
-Manual override：
-
-~~~bash
-sp7-powerlab envelope override INTERACTIVE_EFFICIENT
-sp7-powerlab envelope clear-override
-~~~
-
-普通控制只接受 verified envelope。
+负面反馈是重要 outcome，不要因为 BAT 更低而忽略卡顿、不稳定或 remote latency。
 
 ## 11. Thermal
 
@@ -230,34 +258,35 @@ THERMAL_PRESSURE / THROTTLING 时：
 - 先检查 workload 是否异常；
 - 持续高本地负载优先考虑远程执行，而不是放宽热安全。
 
+thermal safety 可以抢占任何 trial。
+
 ## 12. Rollback integrity recovery
 
-如果 HWP apply 后无法精确恢复并验证 baseline，PowerLab 会把
-`rollback_integrity_fault` 持久锁存为 EMERGENCY。helper/sysfs 后续重新可写不会自动清除它。
+如果 HWP apply 后无法精确恢复并验证 baseline，PowerLab 会把 `rollback_integrity_fault` 持久锁存为 EMERGENCY。helper/sysfs 后续重新可写不会自动清除它。
 
 先人工确认机器状态，再执行：
 
-~~~bash
-sp7-powerlab safety recover-rollback --reason "verified actual HWP state after manual inspection"
-~~~
+```bash
+sp7-powerlab safety recover-rollback \
+  --reason "verified actual HWP state after manual inspection"
+```
 
-只有实际 HWP snapshot 能唯一匹配一个 VERIFIED envelope 时 recovery 才成功。命令成功后先进入
-READ_ONLY，下一轮正常 runtime safety synchronization 再决定是否恢复 CONTROL_ALLOWED。
+只有实际 HWP snapshot 能唯一匹配一个 VERIFIED envelope 时 recovery 才成功。命令成功后先进入 READ_ONLY，下一轮正常 safety synchronization 再决定是否恢复 CONTROL_ALLOWED。
 
 ## 13. Suspend / Resume
 
 Resume 后：
 
-- 不信任 suspend gap 内的 BAT integration；
+- 不信任 suspend gap 内 BAT integration；
 - experiment-local rolling state 重建；
 - resume grace 内不自动控制；
 - HWP actual state 重新 reconcile。
 
-如果 resume 后当前 envelope 和真实 HWP 不一致，应以真实 HWP snapshot/reconcile 为准。
+如果 resume 后当前 envelope 与真实 HWP 不一致，以真实 snapshot/reconcile 为准。
 
-## 14. Service restart
+## 14. Service / root helper restart
 
-重启时不继续跨重启 active trial。
+service restart 不继续跨重启 active trial。
 
 未完成 trial：
 
@@ -265,108 +294,147 @@ Resume 后：
 - 标记 rolled back/failed；
 - rollback integrity 不可信时 Control 进入 EMERGENCY/READ_ONLY。
 
-root helper 暂时未启动或短暂失联时，runtime hardware refresh 会重新 discovery/bind actuator；不需要
-为了“让 helper 被发现”手工重启 PowerLab。恢复写入仍必须重新通过 ControlSafety gate。
+root helper 晚启动时，runtime hardware refresh 会重新 discovery/bind actuator，不需要为了“让 helper 被发现”手工重启 PowerLab。
 
-breaking SQLite schema mismatch 是人工处置状态，不应形成 restart loop。service 会以 exit status 78
-退出，systemd 不自动重启。确认允许丢弃旧 runtime 后执行：
+已经绑定可用 backend 后：
 
-~~~bash
+- 单次 probe failure 不会瞬时换成 unavailable backend；
+- 默认需要连续失败达到配置阈值才允许 downgrade；
+- active trial 期间 actuator backend identity 冻结，避免 transient helper restart 切断 candidate/rollback path。
+
+恢复写入仍必须重新通过 Control Safety gate。
+
+## 15. Breaking runtime schema
+
+项目不维护旧 SQLite runtime migration/fallback。
+
+schema mismatch 是人工处置状态：
+
+- service 使用 exit status 78；
+- systemd 不应 crash-loop；
+- Agent 不得仅因为 agent-context 建议 reset 就自行删除 runtime。
+
+确认用户允许丢弃旧 runtime 后：
+
+```bash
 sp7-powerlab reset-runtime --yes
 systemctl --user restart sp7-powerlab.service
-~~~
+```
 
-## 15. Drift
+这是破坏式 reset。
 
-慢性 drift 看 FrozenReferenceBaseline 对 recent distribution。
+## 16. Stage D — Validation / Real-Usage Burn-in
 
-不要让 adaptive recent baseline 吞掉长期退化。
+Stage C 找到值得保留的 verified policy 后，进入 validation：
 
-出现 sustained drift：
+```bash
+sp7-powerlab lifecycle validate --reason "begin validation and real-usage burn-in"
+sp7-powerlab lifecycle coverage
+sp7-powerlab lifecycle readiness
+```
 
-- 打开 investigation；
-- diagnostic burst；
-- 不直接开始参数搜索。
-
-## 16. STABLE
+Stage D 要证明当前 policy 在代表性真实使用中成立，而不是立刻 freeze STABLE。
 
 检查：
 
-~~~bash
-sp7-powerlab lifecycle readiness
-sp7-powerlab lifecycle coverage
-~~~
+- independent revalidation；
+- trusted usage fraction；
+- minimum total valid usage seconds；
+- minimum total trusted usage seconds；
+- minimum distinct usage days；
+- minimum observation span；
+- current Reference/Noise；
+- no active trial；
+- no unresolved investigation/UnexpectedPower；
+- no recent severe negative feedback。
 
-STABLE 下：
+`stable.coverage_days` 是 lookback window，不等于已经观察够时长。
 
-- core telemetry 保留；
-- expensive attribution 降频；
-- Scheduler 睡眠；
-- 无主动 trial；
-- 异常时 diagnostic burst。
+如果此时 readiness 的主要剩余 blocker 是 `net_benefit_validation_incomplete`，说明 Stage D 已接近完成，进入 Stage E；**不要先 freeze STABLE**。
 
-如果真实数据不再支持当前配置，才 reopen：
+## 17. Stage E — Net Benefit / Complexity Selection
 
-~~~bash
-sp7-powerlab lifecycle reopen --reason "confirmed regression"
-~~~
+正式 Net Benefit capture 不接受任意旧 JSONL 后补 epoch/campaign 标签。capture-time provenance 包括：
 
-## 17. Net Benefit
+- current evidence epoch
+- battery identity/epoch
+- hard fingerprint
+- calibration
+- evidence semantics
+- campaign
+- fixed baseline name/content hash
+- capture mode
+- runtime policy fingerprint
 
-正式 Net Benefit capture 不接受任意旧 JSONL 后补 epoch/campaign 标签。每次采集开始时就绑定
-current evidence epoch、battery identity/epoch、hard fingerprint、calibration、campaign、fixed
-baseline content hash、mode 和 runtime policy fingerprint。
+runtime policy fingerprint 覆盖 relevant runtime/config、Automation Level、VERIFIED envelope set/content hashes 和 manual override。
 
-每一种 candidate mode 使用 A1-B1-B2-A2：
+每个 A1-B1-B2-A2 comparison 内必须先冻结该次要验证的 policy/config；四个 block 期间 Automation
+Level、VERIFIED envelope set 和 manual override 不得变化。FIXED_GOOD 只停止 service，不临时改 policy。
 
-~~~bash
-# A1：service 停止，actual HWP 已回到同一个 VERIFIED fixed baseline
+### 17.1 每一种 candidate mode 使用 A1-B1-B2-A2
+
+```bash
+# A1: service stopped, actual HWP at the same VERIFIED fixed baseline
+systemctl --user stop sp7-powerlab.service
+# wait until the last service heartbeat is no longer fresh (default >30s)
+sleep 35
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 
-# B1 / B2：按目标 mode 启动 service，并连续采两个独立 block
+# B1/B2: run the target mode and capture two independent blocks
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
 
-# A2：恢复同一个 fixed baseline 后停止 service
+# A2: return to the same fixed baseline and stop service
+systemctl --user stop sp7-powerlab.service
+sleep 35
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
-~~~
+```
 
-比较使用四个 run id：
+比较：
 
-~~~bash
+```bash
 sp7-powerlab overhead compare meter-a1 meter-b1 meter-b2 meter-a2
-~~~
+```
 
-mode 不是标签：MONITORING 要求 live Level 0；DYNAMIC_CONTROLLER 要求 live Level 1 +
-CONTROL_ALLOWED；FULL_POWERLAB 要求 live Level >=2 + CONTROL_ALLOWED；FIXED_GOOD 要求 service
-停止且每个 sample 的 actual HWP 都匹配 fixed VERIFIED envelope。
+runtime mode 不是标签：
 
-同一个四段 comparison 的 runtime policy fingerprint 必须完全一致；它覆盖 relevant runtime/config、
-Automation Level、VERIFIED envelope 集合/content hashes 和 manual override。B1/B2 如果中间发生
-promotion/config/policy 修改，即使都叫 FULL_POWERLAB，也会被拒绝。
+- MONITORING：live Level 0 + fixed HWP
+- DYNAMIC_CONTROLLER：live Level 1 + CONTROL_ALLOWED
+- FULL_POWERLAB：live Level >=2 + CONTROL_ALLOWED
+- FIXED_GOOD：service stopped + actual HWP 每点匹配同一个 VERIFIED fixed envelope
 
-MinimalMeter 还记录 brightness、active/media/remote、basic network、package temperature。任一 block
-BAT/data quality 失败、四段 provenance 不一致、inter-block gap 超限、fixed baseline 改变、covariate
-明显不可比、reference drift 过大、B1/B2 effect 方向冲突或 spread 过大时，都不会产生可用于
-STABLE 的有效 delta。
+A1/B1/B2/A2 四块必须具有同一 runtime policy fingerprint。B1/B2 中间发生 promotion/config/override/policy 修改时，该 comparison 作废。
 
-`--campaign` 对应数据库中的 validation campaign entity。一个新 campaign 必须从 FIXED_GOOD A1
-开始；它固定 hard/battery/calibration/semantics context 与 fixed baseline，并受
-`net_benefit.max_campaign_span_seconds` 限制。context/baseline 改变或超时会 INVALID；Monitoring、
-Dynamic、Full 三种有效 comparison 各完成一次后 campaign 自动 COMPLETE/CLOSED，不能继续复用旧名字。
-STABLE 还会要求 FULL_POWERLAB 结果的 policy fingerprint 与当前 runtime policy 相同。
+PowerLab 还检查：
 
-历史：
+- BAT consistency/data quality
+- provenance
+- inter-block gap
+- fixed baseline identity
+- brightness / active / media / remote
+- network
+- package temperature
+- reference drift
+- B1/B2 effect direction/spread
 
-~~~bash
+### 17.2 campaign 是 bounded DB entity
+
+`--campaign` 对应 OPEN/COMPLETE/INVALID validation campaign：
+
+- 新 campaign 从 FIXED_GOOD A1 开始；
+- 固定 hard/battery/calibration/semantics context 与 fixed baseline；
+- 受 `net_benefit.max_campaign_span_seconds` 限制；
+- context/baseline 改变或超时会 INVALID；
+- Monitoring/Dynamic/Full 三类有效 comparison 各完成一次后自动 COMPLETE/CLOSED；
+- CLOSED campaign 不能继续复用名字写入新结果。
+
+查看：
+
+```bash
 sp7-powerlab overhead history
-~~~
-
-结论：
-
-~~~bash
 sp7-powerlab overhead summary
-~~~
+sp7-powerlab lifecycle readiness
+```
 
 可能结果：
 
@@ -377,35 +445,81 @@ sp7-powerlab overhead summary
 
 Full PowerLab 没有 practical net gain 时，应简化。
 
-## 18. Git / Knowledge
+Stage E 结束后，把当前 runtime 恢复为 recommendation 对应的**已验证 selected policy**：Full、Dynamic，
+或 Level-0/fixed-good。StableReadiness 校验的是 selected policy fingerprint，而不是无条件要求保留 Full。
 
-高频 SQLite 不提交 Git。
+## 18. 进入和运行 STABLE
+
+**只有 Stage A–E 和 deterministic readiness 全部通过后**才正常 freeze：
+
+```bash
+sp7-powerlab lifecycle readiness
+sp7-powerlab lifecycle freeze --reason "Stage A-E and current policy net benefit validated"
+```
+
+STABLE readiness 会重新确认 recommendation 对应的 selected policy fingerprint 仍代表当前 runtime。
+Stage E 后若 selected policy identity 已变化，旧 Net Benefit 只能当历史记录。
+
+STABLE 下：
+
+- core telemetry 保留；
+- drift / UnexpectedPower detector 保留；
+- expensive attribution 降频；
+- Scheduler 睡眠；
+- 无主动 trial；
+- 正常 Agent 结论经常是 NO_CHANGE。
+
+如果真实数据不再支持当前配置，才 reopen：
+
+```bash
+sp7-powerlab lifecycle reopen --reason "confirmed regression"
+```
+
+reopen 后按当前证据缺口回到合适 Stage，不是假设必须从零重跑所有历史。
+
+## 19. Git / Knowledge
+
+高频 SQLite / runtime telemetry 不提交 Git。
 
 代码、配置、文档和 durable knowledge 可以提交。
 
-如果需要长期知识快照：
+需要长期知识快照：
 
-~~~bash
+```bash
 sp7-powerlab knowledge-export
 bash scripts/commit-knowledge.sh
-~~~
+```
 
 默认不自动 push。
 
-## 19. 常见排查入口
+仓库代码/文档修改涉及架构、schema、Evidence、Lifecycle、Agent 入口、实验或部署链时，本地运行：
+
+```bash
+bash scripts/quality-gate.sh
+```
+
+## 20. 常见入口
 
 代码/文件不知道在哪：
 
-docs/PROJECT_MAP.md
+- docs/PROJECT_MAP.md
 
 不知道项目做到哪：
 
-docs/PROJECT_STATUS.md
+- docs/PROJECT_STATUS.md
 
 不知道设计为什么这样：
 
-PLAN2.md
+- PLAN2.md
 
-AI 调教纪律：
+AI 调教/调查纪律：
 
-docs/LLM_BEHAVIOR.md
+- docs/LLM_BEHAVIOR.md
+
+首次新电池/从零建证据：
+
+- docs/FIRST_RUN.md
+
+systemd/root helper/schema reset：
+
+- docs/DEPLOYMENT.md

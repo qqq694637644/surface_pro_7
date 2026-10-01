@@ -280,26 +280,31 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
             fixed_baseline_envelope="INTERACTIVE_EFFICIENT",
             fixed_baseline_content_hash=fixed_hash,
         )
-        for mode in ("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB"):
+        mode_results = {
+            "MONITORING_OVERHEAD": (0.18, "monitoring-policy"),
+            "DYNAMIC_CONTROLLER": (-0.28, policy_fingerprint),
+            "FULL_POWERLAB": (-0.05, "full-policy"),
+        }
+        for mode, (delta_w, run_policy_fingerprint) in mode_results.items():
             run_id = db.start_monitoring_overhead_run(mode=mode)
             db.finish_monitoring_overhead_run(
                 run_id,
                 {
-                    "candidate_minus_reference_w": -0.1,
+                    "candidate_minus_reference_w": delta_w,
                     "comparison_quality": "OK",
                     "comparison_design": "A_B_B_A",
                     "evidence_epoch_id": epoch,
                     "campaign_id": "stable-campaign",
                     "fixed_baseline_envelope": "INTERACTIVE_EFFICIENT",
                     "fixed_baseline_content_hash": fixed_hash,
-                    "runtime_policy_fingerprint": policy_fingerprint,
+                    "runtime_policy_fingerprint": run_policy_fingerprint,
                 },
             )
             db.record_net_benefit_campaign_comparison(
                 "stable-campaign",
                 mode=mode,
                 overhead_run_id=run_id,
-                runtime_policy_fingerprint=policy_fingerprint,
+                runtime_policy_fingerprint=run_policy_fingerprint,
             )
 
         too_short = StableReadiness(config, db).assess(now=now)
@@ -320,6 +325,9 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
 
         ready = StableReadiness(config, db).assess(now=now)
         assert ready["ready"] is True
+        assert ready["net_benefit"]["recommendation"] == "KEEP_DYNAMIC_REDUCE_MONITORING"
+        assert ready["net_benefit"]["selected_policy_mode"] == "DYNAMIC_CONTROLLER"
+        assert ready["net_benefit"]["selected_policy_fingerprint"] == policy_fingerprint
         assert ready["usage_coverage"]["trusted_fraction"] == 1.0
         assert ready["usage_coverage"]["distinct_usage_days"] == 5
         assert ready["usage_coverage"]["observation_span_seconds"] >= 7 * 86400.0
@@ -327,12 +335,18 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
         config.data["automation"]["level"] = 4
         stale = StableReadiness(config, db).assess(now=now)
         assert stale["ready"] is False
-        assert "net_benefit_full_policy_is_stale" in stale["reasons"]
+        assert "net_benefit_selected_policy_is_stale" in stale["reasons"]
     finally:
         db.close()
 
 
-def _completed_run(mode: str, delta_w: float, ts: float) -> dict:
+def _completed_run(
+    mode: str,
+    delta_w: float,
+    ts: float,
+    *,
+    policy_fingerprint: str = "policy-fingerprint",
+) -> dict:
     return {
         "run_id": f"{mode}-{ts}",
         "start_ts": ts - 60,
@@ -345,7 +359,7 @@ def _completed_run(mode: str, delta_w: float, ts: float) -> dict:
             "campaign_id": "unit-campaign",
             "fixed_baseline_envelope": "INTERACTIVE_EFFICIENT",
             "fixed_baseline_content_hash": "fixed-hash",
-            "runtime_policy_fingerprint": "policy-fingerprint",
+            "runtime_policy_fingerprint": policy_fingerprint,
         },
     }
 
@@ -353,39 +367,45 @@ def _completed_run(mode: str, delta_w: float, ts: float) -> dict:
 def test_net_benefit_recommends_full_when_full_system_clears_threshold():
     result = assess_net_benefit(
         [
-            _completed_run("MONITORING_OVERHEAD", 0.05, 100),
-            _completed_run("DYNAMIC_CONTROLLER", -0.30, 110),
-            _completed_run("FULL_POWERLAB", -0.20, 120),
+            _completed_run("MONITORING_OVERHEAD", 0.05, 100, policy_fingerprint="monitoring"),
+            _completed_run("DYNAMIC_CONTROLLER", -0.30, 110, policy_fingerprint="dynamic"),
+            _completed_run("FULL_POWERLAB", -0.20, 120, policy_fingerprint="full"),
         ],
         practical_threshold_w=0.10,
     )
     assert result["complete"] is True
     assert result["recommendation"] == "KEEP_FULL_POWERLAB"
+    assert result["selected_policy_mode"] == "FULL_POWERLAB"
+    assert result["selected_policy_fingerprint"] == "full"
 
 
 def test_net_benefit_prefers_dynamic_when_monitoring_consumes_controller_savings():
     result = assess_net_benefit(
         [
-            _completed_run("MONITORING_OVERHEAD", 0.18, 100),
-            _completed_run("DYNAMIC_CONTROLLER", -0.28, 110),
-            _completed_run("FULL_POWERLAB", -0.05, 120),
+            _completed_run("MONITORING_OVERHEAD", 0.18, 100, policy_fingerprint="monitoring"),
+            _completed_run("DYNAMIC_CONTROLLER", -0.28, 110, policy_fingerprint="dynamic"),
+            _completed_run("FULL_POWERLAB", -0.05, 120, policy_fingerprint="full"),
         ],
         practical_threshold_w=0.10,
     )
     assert result["recommendation"] == "KEEP_DYNAMIC_REDUCE_MONITORING"
+    assert result["selected_policy_mode"] == "DYNAMIC_CONTROLLER"
+    assert result["selected_policy_fingerprint"] == "dynamic"
     assert "monitoring overhead consumes part" in " ".join(result["reasons"])
 
 
 def test_net_benefit_prefers_fixed_good_when_complexity_has_no_practical_gain():
     result = assess_net_benefit(
         [
-            _completed_run("MONITORING_OVERHEAD", 0.04, 100),
-            _completed_run("DYNAMIC_CONTROLLER", -0.03, 110),
-            _completed_run("FULL_POWERLAB", 0.02, 120),
+            _completed_run("MONITORING_OVERHEAD", 0.04, 100, policy_fingerprint="monitoring"),
+            _completed_run("DYNAMIC_CONTROLLER", -0.03, 110, policy_fingerprint="dynamic"),
+            _completed_run("FULL_POWERLAB", 0.02, 120, policy_fingerprint="full"),
         ],
         practical_threshold_w=0.10,
     )
     assert result["recommendation"] == "FIXED_GOOD_ENVELOPE"
+    assert result["selected_policy_mode"] == "FIXED_GOOD"
+    assert result["selected_policy_fingerprint"] == "monitoring"
 
 
 def test_usage_coverage_ignores_rollups_from_other_evidence_epochs(project_root: Path):

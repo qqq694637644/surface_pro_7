@@ -53,6 +53,10 @@ systemctl --user restart sp7-powerlab.service
 
 这是破坏式 reset；不要自动兜底删除 runtime。
 
+在非 SP7 开发机或纯仓库工程任务中，本地 runtime DB 过旧不等于必须 reset。只有任务确实针对该
+runtime，且用户明确允许丢弃旧数据时，才执行上述破坏式操作。不要为了让开发环境的
+`agent-context` 看起来 healthy 而重置数据或放宽硬件契约。
+
 本地提交/部署前可运行完整软件质量门：
 
 ~~~bash
