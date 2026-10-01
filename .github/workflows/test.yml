@@ -72,7 +72,8 @@ jobs:
           enabled = false
           EOF
           sp7-powerlab --help
-          sp7-powerlab-agent --help
+          sp7-powerlab review-pack --help
+          sp7-powerlab net-benefit --help
           sp7-powerlab --config /tmp/sp7-powerlab-ci.toml doctor
           sp7-powerlab --config /tmp/sp7-powerlab-ci.toml envelope list
 
