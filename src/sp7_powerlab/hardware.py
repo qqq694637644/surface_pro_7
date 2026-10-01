@@ -201,6 +201,17 @@ def systemd_user_unit_state(unit: str) -> str:
     return "unknown"
 
 
+def systemd_user_unit_enabled(unit: str) -> str:
+    if not systemd_available():
+        return "unavailable"
+    code, state = _command(["systemctl", "--user", "is-enabled", unit])
+    if state:
+        return state
+    if code == 4:
+        return "unavailable"
+    return "unknown"
+
+
 @dataclass(frozen=True)
 class HardwareReport:
     product: str
@@ -375,4 +386,21 @@ def system_fingerprint(report: HardwareReport) -> dict[str, Any]:
         "hwp_epp": report.capabilities.get("hwp_epp"),
         "thermal_sensor": report.thermal_sensor,
         "versions": versions,
+    }
+
+
+def compatibility_state(report: HardwareReport) -> dict[str, Any]:
+    fingerprint = system_fingerprint(report)
+    versions = fingerprint.get("versions") or {}
+    software_versions = {
+        "kernel": fingerprint.get("kernel"),
+        **{key: value for key, value in versions.items() if key != "thermald"},
+    }
+    media_keys = {"firefox", "chromium", "google-chrome", "playerctl", "mesa"}
+    media_versions = {key: software_versions.get(key) for key in sorted(media_keys)}
+    return {
+        "system_fingerprint": fingerprint,
+        "software_versions": software_versions,
+        "media_versions": media_versions,
+        "media_compatibility_generation": f"media-{fingerprint_hash(media_versions)}",
     }

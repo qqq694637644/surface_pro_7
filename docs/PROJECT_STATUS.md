@@ -16,8 +16,8 @@ sp7-powerlab agent-context
 
 当前 runtime：
 
-- SQLite schema v9
-- evidence semantics v8
+- SQLite schema v10
+- evidence semantics v9
 - 旧 runtime schema fail-fast，不维护兼容迁移
 - AI 入口：AGENTS.md + sp7-powerlab agent-context
 - 设计合同：PLAN2.md
@@ -283,15 +283,18 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - STABLE negative feedback 只阻塞当前保留策略的未解决负面证据；已 reject/rollback 的 candidate 不继续冷却当前策略
 - Net Benefit block 必须是单一 contiguous Discharging observation；Charging/resume/gap/epoch change 整块 fail-closed
 - Net Benefit 使用 time-weighted integrated BAT power，并对 data quality fail-closed
-- FIXED_GOOD 用 live systemd 状态 + one-shot runtime audit 证明 service inactive、thermald/ownership/hard identity/HWP 都正确
+- FIXED_GOOD 用 live systemd 状态 + one-shot runtime audit 证明 service inactive、thermald/ownership/hard identity/HWP 都正确；作为 STABLE selected policy 时还要求 main service disabled、fixed oneshot enabled 且持久选择与 baseline identity 一致
 - MinimalMeter 用 wall-vs-monotonic 检测短 suspend；formal block 任一 suspend/resume 整块 fail-closed
-- capture mode 验证真实 service state / Automation Level / ControlSafety；FIXED 每点核对实际 HWP
+- capture mode 验证真实 service state / Automation Level / ControlSafety；live Dynamic/Monitoring 还要求 daemon heartbeat 中的 loaded code/config identity 与当前磁盘/config 一致；FIXED 每点核对实际 HWP
 - 正式 capture 会拒绝残留旧 hourly unit 若其处于 active；当前安装不再部署 scheduled review unit
-- brightness/active/media/remote/network/temperature 作为低成本 comparability veto
+- brightness/active/media/remote/network 作为低成本 comparability veto；package temperature 是 treatment outcome，不用于过滤 Dynamic 自己造成的热改善/恶化
 - 正式 Net Benefit 使用 A1-B1-B2-A2 paired campaign，检查两个 candidate delta 的方向/spread
-- Dynamic policy fingerprint 只固定 Level-1 runtime 相关 config / VERIFIED set / override / explicit code allowlist
-- Stage E 另有 measurement-contract code identity，包含 CLI/MinimalMeter/measurement/longterm 等正式比较代码
-- media compatibility generation 进入 capture/campaign provenance
+- Dynamic policy fingerprint 只固定 Level-1 runtime 相关 config / VERIFIED set / override / explicit code allowlist；Scheduler 保持在 Level-1 identity 之外，Level-1 实际执行的 evidence/evaluation/longterm/calibration 等路径包含在内
+- Stage E 使用 measurement-contract identity：正式比较代码 + 相关阈值/config 子集共同决定；代码或合同参数变化后旧 Stage E 自动 stale
+- media compatibility generation 进入 capture/campaign provenance，并在 compare/readiness 时用现场 browser/Mesa 状态重新验证
+- formal capture 开始时拒绝 active investigation / unresolved UnexpectedPower / Diagnostic Burst；capture 期间新 investigation/event 或非 thermal 的 Control Safety interruption 会使 block INVALID，thermal intervention 作为 outcome 记录
+- restricted root helper 暴露 protocol/implementation identity；主 runtime 与 root-owned wheel 不一致时直接 READ_ONLY，不兼容旧 helper
+- `sp7-powerlab fixed apply <VERIFIED>` 提供不写 manual override 的 baseline 恢复原语；最终 fixed-good 用 `sp7-powerlab-fixed.service` 在 login/reboot one-shot 重应用选中的 envelope
 - Net Benefit campaign 是 OPEN/COMPLETE/INVALID 实体；一个有效 Dynamic A1-B1-B2-A2 即可 COMPLETE
 - 两个 Dynamic candidate block 都必须达到 practical saving；只有一个达到时 NEED_MORE_DATA
 - MONITORING 仅为按需诊断，不进入 StableReadiness

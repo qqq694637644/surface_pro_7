@@ -30,3 +30,12 @@ def test_user_service_does_not_restart_forever_on_breaking_schema_mismatch():
     root = Path(__file__).resolve().parents[1]
     unit = (root / "systemd/sp7-powerlab.service.in").read_text(encoding="utf-8")
     assert "RestartPreventExitStatus=78" in unit
+
+
+def test_fixed_good_runtime_is_a_boot_oneshot_not_a_daemon():
+    root = Path(__file__).resolve().parents[1]
+    unit = (root / "systemd/sp7-powerlab-fixed.service.in").read_text(encoding="utf-8")
+    assert "Type=oneshot" in unit
+    assert "RemainAfterExit=yes" in unit
+    assert "envelope apply-fixed" in unit
+    assert "Restart=" not in unit

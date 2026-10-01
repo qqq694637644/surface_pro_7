@@ -315,13 +315,15 @@ Level 2+ 的 Scheduler/Agent/自动实验不是必须长期常开的第四种 tr
 - capture mode
 - fixed baseline name/content hash
 - runtime policy fingerprint
-- Stage E measurement-contract code identity
+- Stage E measurement-contract identity（正式比较代码 + 相关 config/threshold）
 - media compatibility generation
 - validation campaign
 
 Dynamic runtime policy fingerprint 只包含 Level-1 长期 runtime 真正使用的 config / VERIFIED set / override
-和明确 code allowlist；Scheduler/Trial/Agent 代码不在其中。Stage E 的测量/比较代码另有独立 code identity，
-其中包括 cli.py、MinimalMeter、measurement/longterm 等；任一 identity 改变都不会继续复用旧 Stage E。
+和明确 code allowlist；Scheduler/Agent search code 不在其中，Level-1 实际执行的 evidence/evaluation/
+longterm/calibration 等路径进入。Stage E 的测量/比较代码和相关合同参数组成独立 contract identity；任一
+identity 改变都不会继续复用旧 Stage E。Dynamic/Monitoring 还会把 live daemon heartbeat 中的 loaded
+code/config identity 与当前磁盘/config 比较；更新代码/config 后正式 Stage E 前必须 restart main service。
 
 ### 11.1 正式 capture 前清理遗留 scheduled review
 
@@ -331,22 +333,29 @@ Dynamic runtime policy fingerprint 只包含 Level-1 长期 runtime 真正使用
 ### 11.2 一个 comparison 使用 A1-B1-B2-A2
 
 正式 comparison 前把 Automation Level 设为 1，并在 A1-B1-B2-A2 四个 block 内保持 config、verified
-envelope set 和 manual override 不变。A block 只停止 main service，不临时改 config。
+envelope set 和 manual override 不变。A block 不使用 manual override；停止 main service 后用
+`sp7-powerlab fixed apply <VERIFIED envelope>` 显式恢复同一个真实 HWP baseline。
 
 ```bash
 # A1
 systemctl --user stop sp7-powerlab.service
+sp7-powerlab fixed apply INTERACTIVE_EFFICIENT
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 
 # B1 / B2
-systemctl --user start sp7-powerlab.service
+systemctl --user restart sp7-powerlab.service
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
 
 # A2
 systemctl --user stop sp7-powerlab.service
+sp7-powerlab fixed apply INTERACTIVE_EFFICIENT
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 ```
+
+MinimalMeter 默认每 60 秒采样；`--count 60` 约为一小时。短暂 Control Safety transition 通过 durable
+history 事后检查，不依赖更高频 polling。实际 formal minimum 仍以当前 Measurement Trust recommendation
+和实验配置下限为准。
 
 记录四个 `meter-...` run id：
 
@@ -363,16 +372,19 @@ PowerLab 会检查：
 - A1/B1/B2/A2 时间顺序和 inter-block gap
 - fixed baseline identity
 - runtime policy fingerprint
-- Stage E code identity / media compatibility generation
+- Stage E contract identity / live media compatibility generation
+- daemon loaded runtime code/config identity
 - 遗留 scheduled-review units 不 active
+- 无 active investigation / unresolved UnexpectedPower / Diagnostic Burst
+- capture 期间无新 investigation/event；非 thermal Control Safety interruption 使 Dynamic block INVALID
 - brightness
 - active/media/remote fraction
 - network
-- package temperature
 - reference drift
 - 两个 candidate delta 的方向和 spread
 
-明显不可比时结果不会进入 STABLE evidence。
+package temperature 是 treatment outcome，不是 comparability veto；更凉不会被过滤，明显更热或 thermal
+intervention 会阻止直接 KEEP_DYNAMIC_CONTROLLER。明显不可比时结果不会进入 STABLE evidence。
 
 ### 11.3 campaign 不是字符串标签
 

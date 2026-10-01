@@ -85,6 +85,42 @@ def test_fixed_runtime_audit_proves_live_physical_state(project_root, monkeypatc
         assert audit["ready"] is True
         assert audit["hwp_matches_fixed_baseline"] is True
 
+        db.set_meta(
+            "fixed_good_selection",
+            {
+                "evidence_epoch_id": epoch_id,
+                "envelope": envelope["name"],
+                "content_hash": envelope["content_hash"],
+            },
+        )
+        monkeypatch.setattr(
+            "sp7_powerlab.runtime_audit.systemd_user_unit_enabled",
+            lambda unit: "disabled" if unit == "sp7-powerlab.service" else "enabled",
+        )
+        persistent = audit_fixed_runtime(
+            config,
+            db,
+            evidence_epoch=epoch,
+            fixed_baseline_envelope=envelope["name"],
+            fixed_baseline_content_hash=envelope["content_hash"],
+            require_persistent_selection=True,
+        )
+        assert persistent["ready"] is True
+
+        monkeypatch.setattr(
+            "sp7_powerlab.runtime_audit.systemd_user_unit_enabled",
+            lambda _unit: "disabled",
+        )
+        missing_boot_apply = audit_fixed_runtime(
+            config,
+            db,
+            evidence_epoch=epoch,
+            fixed_baseline_envelope=envelope["name"],
+            fixed_baseline_content_hash=envelope["content_hash"],
+            require_persistent_selection=True,
+        )
+        assert "fixed_oneshot_not_enabled" in missing_boot_apply["reasons"]
+
         monkeypatch.setattr(
             "sp7_powerlab.runtime_audit.systemd_user_unit_state",
             lambda unit: "active" if unit == "sp7-powerlab.service" else "unavailable",

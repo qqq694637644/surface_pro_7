@@ -7,8 +7,10 @@ from .actuators.hwp import HWPActuator
 from .config import Config, load_machine, load_thermal_config
 from .envelopes import snapshot_matches_envelope
 from .hardware import (
+    compatibility_state,
     hard_control_identity,
     inspect_hardware,
+    systemd_user_unit_enabled,
     systemd_user_unit_state,
 )
 from .storage import Database
@@ -31,6 +33,30 @@ def fixed_runtime_identity(
     )
 
 
+def live_media_compatibility(
+    config: Config,
+    *,
+    sys_root: Path = Path("/sys"),
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any]:
+    machine = load_machine(config.root)
+    identity = machine.get("identity") or {}
+    report = inspect_hardware(
+        sys_root=sys_root,
+        proc_root=proc_root,
+        expected_product=str(identity.get("expected_product", "Surface Pro 7")),
+        expected_cpu_substring=str(identity.get("expected_cpu_substring", "i5-1035G4")),
+        configured_thermal_sensor=str((machine.get("thermal") or {}).get("sensor_path") or "")
+        or None,
+        include_versions=True,
+    )
+    state = compatibility_state(report)
+    return {
+        "media_compatibility_generation": state["media_compatibility_generation"],
+        "media_versions": state["media_versions"],
+    }
+
+
 def audit_fixed_runtime(
     config: Config,
     db: Database,
@@ -40,6 +66,7 @@ def audit_fixed_runtime(
     fixed_baseline_content_hash: str | None,
     sys_root: Path = Path("/sys"),
     proc_root: Path = Path("/proc"),
+    require_persistent_selection: bool = False,
 ) -> dict[str, Any]:
     machine = load_machine(config.root)
     identity = machine.get("identity") or {}
@@ -61,12 +88,25 @@ def audit_fixed_runtime(
     )
 
     service_state = systemd_user_unit_state("sp7-powerlab.service")
+    service_enabled = systemd_user_unit_enabled("sp7-powerlab.service")
+    fixed_unit_enabled = systemd_user_unit_enabled("sp7-powerlab-fixed.service")
     hourly_timer_state = systemd_user_unit_state("sp7-powerlab-hourly.timer")
     hourly_service_state = systemd_user_unit_state("sp7-powerlab-hourly.service")
 
     reasons: list[str] = []
     if service_state != "inactive":
         reasons.append("main_service_not_inactive")
+    selection = db.get_meta("fixed_good_selection", {})
+    if require_persistent_selection:
+        if service_enabled not in {"disabled", "masked"}:
+            reasons.append("main_service_not_disabled")
+        if fixed_unit_enabled != "enabled":
+            reasons.append("fixed_oneshot_not_enabled")
+        if not isinstance(selection, dict) or (
+            str(selection.get("envelope") or "") != str(fixed_baseline_envelope or "")
+            or str(selection.get("content_hash") or "") != str(fixed_baseline_content_hash or "")
+        ):
+            reasons.append("fixed_persistent_selection_mismatch")
     if hourly_timer_state not in {"inactive", "unavailable"}:
         reasons.append("hourly_timer_active")
     if hourly_service_state not in {"inactive", "unavailable"}:
@@ -101,11 +141,15 @@ def audit_fixed_runtime(
                 reasons.append("fixed_hwp_state_mismatch")
     else:
         reasons.append("fixed_hwp_baseline_unavailable")
+    compatibility = compatibility_state(report)
 
     return {
         "ready": not reasons,
         "reasons": sorted(set(reasons)),
         "service_state": service_state,
+        "service_enabled": service_enabled,
+        "fixed_oneshot_enabled": fixed_unit_enabled,
+        "fixed_good_selection": selection,
         "hourly_timer_state": hourly_timer_state,
         "hourly_service_state": hourly_service_state,
         "thermald_active": report.thermald.get("active"),
@@ -118,4 +162,6 @@ def audit_fixed_runtime(
         "fixed_baseline_verified": bool(envelope and envelope.get("status") == "VERIFIED"),
         "hwp_matches_fixed_baseline": hwp_matches,
         "hwp_snapshot": hwp_snapshot,
+        "live_media_compatibility_generation": compatibility["media_compatibility_generation"],
+        "live_media_versions": compatibility["media_versions"],
     }

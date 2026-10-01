@@ -10,7 +10,7 @@ from typing import Any
 
 from .measurement import valid_discharge_interval_seconds
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 NET_BENEFIT_CAMPAIGN_MODES = {
     "DYNAMIC_CONTROLLER",
 }
@@ -1445,6 +1445,23 @@ class Database:
         item = dict(row)
         item["payload"] = _loads(item.pop("payload_json"), {})
         return item
+
+    def runtime_states_since(self, kind: str, since_ts: float) -> list[dict[str, Any]]:
+        table = {
+            "control": "control_safety_history",
+            "learning": "learning_lifecycle_history",
+        }.get(kind)
+        if not table:
+            raise ValueError(f"unknown runtime state kind: {kind}")
+        result: list[dict[str, Any]] = []
+        for row in self.conn.execute(
+            f"SELECT * FROM {table} WHERE ts>=? ORDER BY ts",
+            (since_ts,),
+        ):
+            item = dict(row)
+            item["payload"] = _loads(item.pop("payload_json"), {})
+            result.append(item)
+        return result
 
     def add_unexpected_power_event(self, value: dict[str, Any]) -> str:
         event_id = value.get("event_id") or f"up-{uuid.uuid4().hex[:12]}"

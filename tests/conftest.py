@@ -87,9 +87,6 @@ enabled = false
 enabled = false
 socket = "runtime/helper.sock"
 
-[minimal_meter]
-sample_seconds = 60
-
 [scheduler]
 min_noise_windows = 3
 min_cpu_rapl_w = 0.5

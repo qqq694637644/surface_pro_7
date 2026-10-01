@@ -83,6 +83,17 @@ def test_v8_database_fails_fast_after_agent_surface_cleanup(tmp_path: Path):
         Database(path)
 
 
+def test_v9_database_fails_fast_after_runtime_identity_contract_break(tmp_path: Path):
+    path = tmp_path / "powerlab.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value_json TEXT NOT NULL)")
+    conn.execute("INSERT INTO metadata(key,value_json) VALUES('schema_version','9')")
+    conn.commit()
+    conn.close()
+    with pytest.raises(LegacyDatabaseError, match="schema 9"):
+        Database(path)
+
+
 def test_v1_database_fails_fast(tmp_path: Path):
     path = tmp_path / "powerlab.sqlite3"
     conn = sqlite3.connect(path)

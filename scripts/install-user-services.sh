@@ -11,6 +11,7 @@ fi
 
 USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 mkdir -p "$USER_DIR"
+FIXED_WAS_ENABLED="$(systemctl --user is-enabled sp7-powerlab-fixed.service 2>/dev/null || true)"
 
 # Remove the old scheduled review units. Review packs are now explicit/on-demand.
 systemctl --user disable --now sp7-powerlab-hourly.timer 2>/dev/null || true
@@ -18,8 +19,15 @@ systemctl --user stop sp7-powerlab-hourly.service 2>/dev/null || true
 rm -f "$USER_DIR/sp7-powerlab-hourly.service" "$USER_DIR/sp7-powerlab-hourly.timer"
 
 sed   -e "s|@ROOT@|$ROOT|g"   -e "s|@POWERLAB_BIN@|$BIN|g"   "$ROOT/systemd/sp7-powerlab.service.in"   > "$USER_DIR/sp7-powerlab.service"
+sed   -e "s|@ROOT@|$ROOT|g"   -e "s|@POWERLAB_BIN@|$BIN|g"   "$ROOT/systemd/sp7-powerlab-fixed.service.in"   > "$USER_DIR/sp7-powerlab-fixed.service"
 
 systemctl --user daemon-reload
-systemctl --user enable --now sp7-powerlab.service
+if [[ "$FIXED_WAS_ENABLED" == "enabled" ]]; then
+  systemctl --user disable --now sp7-powerlab.service 2>/dev/null || true
+  systemctl --user enable --now sp7-powerlab-fixed.service
+else
+  systemctl --user disable --now sp7-powerlab-fixed.service 2>/dev/null || true
+  systemctl --user enable --now sp7-powerlab.service
+fi
 
-echo "PowerLab user service installed. Review packs are explicit via 'sp7-powerlab review-pack'."
+echo "PowerLab user services installed; the previously selected Dynamic/Fixed runtime mode was preserved."

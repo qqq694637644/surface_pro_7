@@ -75,7 +75,7 @@ def test_agent_context_is_compact_runtime_truth_entrypoint(
     try:
         context = build_agent_context(config, db, registry)
 
-        assert context["project"]["runtime_schema"] == 9
+        assert context["project"]["runtime_schema"] == 10
         assert context["project"]["git"]["commit"] == "abc123"
         assert context["documentation"]["ai_entry"] == "AGENTS.md"
         assert context["documentation"]["design_contract"] == "PLAN2.md"
@@ -421,3 +421,26 @@ def test_agent_context_stale_selected_policy_suggests_reconcile_not_retest():
     assert actions[0]["action"] == "reconcile_selected_net_benefit_policy"
     assert "selected=DYNAMIC_CONTROLLER" in actions[0]["reason"]
     assert "current=FIXED_GOOD" in actions[0]["reason"]
+
+    stale_runtime_stage, stale_runtime_actions = _stage_and_actions(
+        hardware={"supported_machine": True},
+        calibration_valid=True,
+        measurement_trust=measurement_trust,
+        lifecycle={"learning_lifecycle": "VALIDATING"},
+        active_battery_epoch=1,
+        evidence_epoch=evidence_epoch,
+        frozen_reference_count=1,
+        active_investigation=None,
+        stable_readiness={
+            "ready": False,
+            "reasons": ["dynamic_runtime_implementation_stale"],
+            "net_benefit": {
+                "selected_policy_mode": "DYNAMIC_CONTROLLER",
+                "selected_policy_fingerprint": "policy-dynamic",
+            },
+            "current_runtime_mode": {"mode": "DYNAMIC_CONTROLLER"},
+        },
+        scheduler={"eligible": False, "reasons": []},
+    )
+    assert stale_runtime_stage["name"] == "STAGE_E_NET_BENEFIT"
+    assert stale_runtime_actions[0]["action"] == "restart_stale_dynamic_runtime"

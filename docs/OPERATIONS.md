@@ -368,13 +368,26 @@ Stage D 要证明当前 policy 在代表性真实使用中成立，而不是立�
 - fixed baseline name/content hash
 - capture mode
 - runtime policy fingerprint
+- Stage E contract identity
+- live media compatibility generation
 
 Dynamic runtime policy fingerprint 覆盖 Level-1 runtime 真正使用的 config、Automation Level、VERIFIED
-envelope set/content hashes、manual override 和 explicit code allowlist。Stage E 测量合同另有独立 code
-identity；media compatibility generation 也属于 campaign provenance。
+envelope set/content hashes、manual override 和 explicit code allowlist。Scheduler search code 不进入 Level-1
+identity；Level-1 实际执行的 evidence/evaluation/longterm/calibration 等路径进入。Stage E 测量合同另有
+独立 contract identity（正式比较代码 + 相关 config/threshold）；media compatibility generation 也属于
+campaign provenance，并在 compare/readiness 时现场刷新。
+
+live service 的 heartbeat 还带 daemon 启动时冻结的 runtime code/config identity。正式 Dynamic/Monitoring
+capture 会把它与当前磁盘源码/config 重算值比较；若代码或 `powerlab.toml` 已更新但 service 没 restart，
+capture 直接拒绝。部署代码/config 后，正式 Stage E 前先：
+
+```bash
+systemctl --user restart sp7-powerlab.service
+```
 
 每个 A1-B1-B2-A2 comparison 内必须先冻结该次要验证的 policy/config；四个 block 期间 Automation
-Level、VERIFIED envelope set 和 manual override 不得变化。FIXED_GOOD 只停止 service，不临时改 policy。
+Level、VERIFIED envelope set 和 manual override 不得变化。FIXED_GOOD 不使用 manual override；A1/A2 都用
+`sp7-powerlab fixed apply <VERIFIED envelope>` 显式恢复同一个物理 baseline。
 
 正式 Stage E 只强制比较：
 
@@ -390,19 +403,25 @@ MONITORING 是可选 observer-overhead 诊断，不参与 StableReadiness。Leve
 ### 17.1 正式 Dynamic vs Fixed 使用 A1-B1-B2-A2
 
 ```bash
-# A1: service stopped, actual HWP at the same VERIFIED fixed baseline
+# A1: stop service, then explicitly restore the VERIFIED fixed baseline
 systemctl --user stop sp7-powerlab.service
+sp7-powerlab fixed apply INTERACTIVE_EFFICIENT
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 
-# B1/B2: Automation Level 1, service live, two independent Dynamic blocks
-systemctl --user start sp7-powerlab.service
+# B1/B2: Automation Level 1, current daemon implementation, two independent Dynamic blocks
+systemctl --user restart sp7-powerlab.service
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
 
-# A2: return to the same fixed baseline and stop service
+# A2: stop service and physically restore the exact same fixed baseline again
 systemctl --user stop sp7-powerlab.service
+sp7-powerlab fixed apply INTERACTIVE_EFFICIENT
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 ```
+
+MinimalMeter 默认 60 秒采样；上面的 `--count 60` 约为一小时。短暂 Control Safety 跳变不依赖提高
+MinimalMeter 轮询频率捕获，而是在 block 结束后查询 durable `control_safety_history`。实际最低 block duration 仍取当前
+Measurement Trust recommendation 与配置下限的较大值。
 
 比较：
 
@@ -415,7 +434,10 @@ runtime mode 不是标签：
 - DYNAMIC_CONTROLLER：live Level 1 + CONTROL_ALLOWED
 - FIXED_GOOD：live systemd state 必须 inactive + actual HWP 每点匹配同一个 VERIFIED fixed envelope
 
-A1/B1/B2/A2 四块必须具有同一 runtime policy fingerprint。B1/B2 中间发生 promotion/config/override/policy 修改时，该 comparison 作废。
+A1/B1/B2/A2 四块必须具有同一 runtime policy fingerprint、Stage E contract identity 和 media generation。
+B1/B2 中间发生 promotion/config/override/policy 修改时，该 comparison 作废。完成 comparison 后，summary/
+readiness 仍会用**当前** contract identity 与现场 browser/Mesa generation 复核，旧 COMPLETE campaign 不会
+永久背书 STABLE。
 
 PowerLab 还检查：
 
@@ -426,9 +448,16 @@ PowerLab 还检查：
 - fixed baseline identity
 - brightness / active / media / remote
 - network
-- package temperature
 - reference drift
 - B1/B2 effect direction/spread
+
+package temperature 单独作为 treatment outcome。Dynamic 更凉不会被 veto；明显更热或出现 thermal safety
+intervention 会阻止直接 KEEP_DYNAMIC_CONTROLLER，转为 NEED_MORE_DATA。
+
+formal capture 还要求没有 active investigation、unresolved UnexpectedPower 或 Diagnostic Burst。capture
+期间若新 investigation/event 出现，run INVALID；结束时会查询 `control_safety_history`，helper/ownership/
+sensor 等导致的 READ_ONLY/DEGRADED/EMERGENCY interruption 会使 Dynamic block INVALID，thermal emergency
+作为 outcome 保留。
 
 ### 17.2 campaign 是 bounded DB entity
 
@@ -458,8 +487,20 @@ sp7-powerlab lifecycle readiness
 只有 B1/B2 两个 Dynamic paired delta 都达到 practical threshold 才保留 Dynamic；只有一个达到时
 NEED_MORE_DATA；两个都达不到时回到 fixed-good。MONITORING 只在需要解释 observer overhead 时按需运行。
 
-Stage E 结束后，把当前 runtime 恢复为 recommendation 对应的**已验证 selected policy**：Dynamic 或
-Level-0/fixed-good。StableReadiness 同时校验 selected policy fingerprint 和 actual runtime mode。
+Stage E 结束后，把当前 runtime 落成 recommendation 对应的**已验证 selected policy**：
+
+```bash
+# 如果 summary 选择 FIXED_GOOD_ENVELOPE：
+sp7-powerlab envelope activate-fixed-good
+
+# 如果 summary 选择 KEEP_DYNAMIC_CONTROLLER（且 automation.level=1）：
+sp7-powerlab envelope activate-dynamic
+```
+
+`activate-fixed-good` 会 disable main daemon、应用并回读 fixed baseline、保存 epoch/hash selection，并 enable
+`sp7-powerlab-fixed.service`。该 oneshot 在 login/reboot 重应用 fixed envelope 后退出；不会把 10 秒 collector/
+controller 重新常驻。`activate-dynamic` 做相反切换。之后 StableReadiness 同时校验 selected policy
+fingerprint、actual runtime mode/daemon identity 或 fixed persistent audit。
 
 ## 18. 进入和运行 STABLE
 
@@ -470,8 +511,9 @@ sp7-powerlab lifecycle readiness
 sp7-powerlab lifecycle freeze --reason "Stage A-E and current policy net benefit validated"
 ```
 
-STABLE readiness 对 Dynamic 校验 selected runtime fingerprint/mode；对 Fixed-good 执行 one-shot live audit，
-直接验证 service、thermald、ownership、hard identity、baseline hash 和 actual HWP。
+STABLE readiness 对 Dynamic 校验 selected runtime fingerprint/mode 和 daemon loaded code/config identity；对
+Fixed-good 执行 one-shot live audit，直接验证 service inactive+disabled、fixed oneshot enabled、thermald、
+ownership、hard identity、现场 media compatibility、baseline hash、persistent selection 和 actual HWP。
 
 STABLE 下：
 

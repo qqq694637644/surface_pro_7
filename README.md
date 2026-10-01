@@ -177,7 +177,10 @@ bash scripts/install-user-services.sh
 bash scripts/install-root-helper.sh
 ~~~
 
-root helper 只提供有限 HWP inspect/snapshot/apply/restore，不提供任意 root shell。
+root helper 只提供有限 HWP inspect/snapshot/apply/restore，不提供任意 root shell；主 runtime 会校验 helper
+protocol/implementation identity，源码更新导致 root-owned wheel 过旧时保持 READ_ONLY，需重新运行
+`scripts/install-root-helper.sh`。若 fixed-good oneshot 已启用，helper 安装脚本会在新 root wheel 启动后重启
+该 oneshot，避免持久 fixed 选择停在一次旧-helper identity 失败上。
 
 ## 新电池 / 新 battery epoch
 
@@ -326,6 +329,10 @@ sp7-powerlab net-benefit summary
 正式 Stage E 用 MinimalMeter 只做一次 Dynamic vs Fixed-good 的 A1-B1-B2-A2 paired comparison。
 monitoring-only observer overhead 是按需诊断，不是 STABLE blocker。
 
+A1/A2 通过 `sp7-powerlab fixed apply <VERIFIED envelope>` 明确恢复同一个真实 HWP baseline，不使用 manual
+override。Dynamic block 绑定 daemon 实际加载的 code/config identity；已完成结果还必须匹配当前 Stage-E
+contract identity 和现场 media generation。
+
 Automation Level 2+ 的 Scheduler/Agent 学习能力按需运行，不作为必须长期常开的第四种 Stage E treatment。
 
 系统允许得出：
@@ -335,6 +342,10 @@ Automation Level 2+ 的 Scheduler/Agent 学习能力按需运行，不作为必�
 - NEED_MORE_DATA
 
 如果复杂系统没有足够实际净收益，回到 fixed-good 是正确结果。
+
+最终选择 fixed-good 时执行 `sp7-powerlab envelope activate-fixed-good`：main daemon 会被 disable，登录/重启
+只运行最小 `sp7-powerlab-fixed.service` oneshot 重新应用 selected envelope 后退出。若选择 Dynamic，使用
+`sp7-powerlab envelope activate-dynamic` 恢复 Level-1 main service。
 
 ## 文档
 

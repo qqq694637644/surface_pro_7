@@ -15,19 +15,27 @@ from .measurement import (
     measurement_energy_summary,
     measurement_trust_matches_epoch,
 )
-from .runtime_audit import audit_fixed_runtime, fixed_runtime_identity
+from .runtime_audit import audit_fixed_runtime, fixed_runtime_identity, live_media_compatibility
 from .storage import Database
 
 NET_BENEFIT_MODES = ("DYNAMIC_CONTROLLER",)
 
 DYNAMIC_RUNTIME_CODE_FILES = (
+    "actuators/base.py",
     "actuators/hwp.py",
+    "calibration.py",
+    "config.py",
     "controller.py",
     "demand.py",
     "envelopes.py",
+    "evaluation.py",
+    "evidence.py",
+    "experiments.py",
     "hardware.py",
     "helper.py",
     "lifecycle.py",
+    "longterm.py",
+    "measurement.py",
     "service.py",
     "storage.py",
     "telemetry.py",
@@ -46,14 +54,40 @@ STAGE_E_CODE_FILES = (
     "storage.py",
 )
 
-DYNAMIC_POLICY_CONFIG_SECTIONS = (
+DAEMON_RUNTIME_CONFIG_SECTIONS = (
     "activity",
     "automation",
+    "calibration",
     "collector",
     "controller",
     "drift",
+    "evidence",
+    "experiments",
+    "helper",
+    "storage",
     "unexpected_power",
 )
+
+STAGE_E_CONTRACT_CONFIG = {
+    "evidence": (
+        "practical_threshold_w",
+        "max_energy_consistency_ratio",
+        "max_energy_consistency_abs_wh",
+    ),
+    "experiments": ("min_block_seconds",),
+    "net_benefit": (
+        "max_brightness_delta_pct",
+        "max_active_fraction_delta",
+        "max_media_fraction_delta",
+        "max_remote_fraction_delta",
+        "max_network_mbps_delta",
+        "max_candidate_temp_worsening_c",
+        "max_reference_drift_w",
+        "max_candidate_delta_spread_w",
+        "max_interblock_gap_seconds",
+        "max_campaign_span_seconds",
+    ),
+}
 
 
 def _code_identity(config: Config, files_to_hash: tuple[str, ...]) -> dict[str, Any]:
@@ -74,12 +108,34 @@ def _code_identity(config: Config, files_to_hash: tuple[str, ...]) -> dict[str, 
     }
 
 
-def stage_e_code_identity(config: Config) -> dict[str, Any]:
-    return _code_identity(config, STAGE_E_CODE_FILES)
+def _payload_identity(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def dynamic_runtime_code_identity(config: Config) -> dict[str, Any]:
+    return _code_identity(config, DYNAMIC_RUNTIME_CODE_FILES)
+
+
+def dynamic_runtime_config_identity(config: Config) -> dict[str, Any]:
+    payload = {key: config.data.get(key) for key in DAEMON_RUNTIME_CONFIG_SECTIONS}
+    return {"identity": _payload_identity(payload), "config": payload}
+
+
+def stage_e_contract_identity(config: Config) -> dict[str, Any]:
+    contract_config = {
+        section: {key: config.get(f"{section}.{key}") for key in keys}
+        for section, keys in STAGE_E_CONTRACT_CONFIG.items()
+    }
+    payload = {
+        "code": _code_identity(config, STAGE_E_CODE_FILES),
+        "config": contract_config,
+    }
+    return {"identity": _payload_identity(payload), "payload": payload}
 
 
 def runtime_policy_snapshot(config: Config, db: Database) -> dict[str, Any]:
-    policy_config = {key: config.data.get(key) for key in DYNAMIC_POLICY_CONFIG_SECTIONS}
+    runtime_config = dynamic_runtime_config_identity(config)
     verified_envelopes = [
         {
             "name": str(item.get("name") or ""),
@@ -91,10 +147,11 @@ def runtime_policy_snapshot(config: Config, db: Database) -> dict[str, Any]:
     ]
     verified_envelopes.sort(key=lambda item: item["name"])
     payload = {
-        "config": policy_config,
+        "config": runtime_config["config"],
+        "runtime_config_identity": runtime_config["identity"],
         "verified_envelopes": verified_envelopes,
         "manual_override": db.get_meta("manual_override"),
-        "code_identity": _code_identity(config, DYNAMIC_RUNTIME_CODE_FILES),
+        "code_identity": dynamic_runtime_code_identity(config),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {
@@ -121,6 +178,10 @@ def runtime_mode_status(
         else None
     )
     control_state = str(heartbeat.get("control_state") or "") if heartbeat_fresh else ""
+    latest_control = db.latest_runtime_state("control") if heartbeat_fresh else None
+    control_reason = str((latest_control or {}).get("reason") or "")
+    thermal_emergency = bool(heartbeat.get("thermal_emergency")) if heartbeat_fresh else False
+    telemetry_mode = str(heartbeat.get("telemetry_mode") or "") if heartbeat_fresh else ""
 
     if not heartbeat_fresh:
         mode = "FIXED_GOOD"
@@ -128,6 +189,13 @@ def runtime_mode_status(
         mode = "MONITORING"
     elif configured_level == 1 and runtime_level == 1 and control_state == "CONTROL_ALLOWED":
         mode = "DYNAMIC_CONTROLLER"
+    elif (
+        configured_level == 1
+        and runtime_level == 1
+        and control_state == "EMERGENCY"
+        and thermal_emergency
+    ):
+        mode = "THERMAL_INTERVENTION"
     elif (
         configured_level >= 2
         and runtime_level is not None
@@ -144,6 +212,15 @@ def runtime_mode_status(
         "configured_automation_level": configured_level,
         "runtime_automation_level": runtime_level,
         "control_state": control_state or None,
+        "control_reason": control_reason or None,
+        "thermal_emergency": thermal_emergency,
+        "telemetry_mode": telemetry_mode or None,
+        "runtime_code_identity": (
+            str(heartbeat.get("runtime_code_identity") or "") if heartbeat_fresh else None
+        ),
+        "runtime_config_identity": (
+            str(heartbeat.get("runtime_config_identity") or "") if heartbeat_fresh else None
+        ),
     }
 
 
@@ -294,8 +371,28 @@ def assess_net_benefit(
     evidence_epoch_id: str | None = None,
     complete_campaign_ids: set[str] | None = None,
     max_campaign_span_seconds: float = 86400.0,
+    current_stage_e_contract_identity: str | None = None,
+    current_media_compatibility_generation: str | None = None,
+    max_candidate_temp_worsening_c: float = 5.0,
 ) -> dict[str, Any]:
     selected_campaign: str | None = None
+    stale_reasons: list[str] = []
+    for run in runs:
+        result = run.get("result") or {}
+        if str(run.get("mode") or "") not in NET_BENEFIT_MODES:
+            continue
+        if evidence_epoch_id is not None and str(result.get("evidence_epoch_id") or "") != str(
+            evidence_epoch_id
+        ):
+            continue
+        if current_stage_e_contract_identity is not None and str(
+            result.get("stage_e_contract_identity") or ""
+        ) != str(current_stage_e_contract_identity):
+            stale_reasons.append("stage_e_contract_identity_stale")
+        if current_media_compatibility_generation is not None and str(
+            result.get("media_compatibility_generation") or ""
+        ) != str(current_media_compatibility_generation):
+            stale_reasons.append("media_compatibility_generation_stale")
     filtered_runs = [
         run
         for run in runs
@@ -306,6 +403,16 @@ def assess_net_benefit(
         and bool((run.get("result") or {}).get("fixed_baseline_envelope"))
         and bool((run.get("result") or {}).get("fixed_baseline_content_hash"))
         and bool((run.get("result") or {}).get("runtime_policy_fingerprint"))
+        and (
+            current_stage_e_contract_identity is None
+            or str((run.get("result") or {}).get("stage_e_contract_identity") or "")
+            == str(current_stage_e_contract_identity)
+        )
+        and (
+            current_media_compatibility_generation is None
+            or str((run.get("result") or {}).get("media_compatibility_generation") or "")
+            == str(current_media_compatibility_generation)
+        )
         and (
             complete_campaign_ids is None
             or str((run.get("result") or {}).get("campaign_id") or "") in complete_campaign_ids
@@ -377,14 +484,17 @@ def assess_net_benefit(
             "practical_threshold_w": practical_threshold_w,
             "deltas_w": deltas,
             "recommendation": "NEED_MORE_DATA",
-            "reasons": [
-                (
-                    "complete same-epoch same-campaign fixed-good crossover comparison "
-                    "is unavailable"
-                    if evidence_epoch_id is not None
-                    else "complete fixed-good crossover comparison is unavailable"
-                )
-            ],
+            "reasons": sorted(
+                set(stale_reasons)
+                | {
+                    (
+                        "complete same-epoch same-campaign fixed-good crossover comparison "
+                        "is unavailable"
+                        if evidence_epoch_id is not None
+                        else "complete fixed-good crossover comparison is unavailable"
+                    )
+                }
+            ),
             "campaign_id": selected_campaign,
             "fixed_baseline_envelope": None,
             "fixed_baseline_content_hash": None,
@@ -404,6 +514,11 @@ def assess_net_benefit(
         for value in (dynamic_result.get("candidate_block_deltas_w") or [])
         if isinstance(value, (int, float))
     ]
+    candidate_temp_deltas = [
+        float(value)
+        for value in (dynamic_result.get("candidate_mean_temp_deltas_c") or [])
+        if isinstance(value, (int, float))
+    ]
     if len(dynamic_block_deltas) != 2:
         return {
             "complete": False,
@@ -421,7 +536,28 @@ def assess_net_benefit(
             "latest_runs": latest,
         }
     practical_blocks = [value <= -float(practical_threshold_w) for value in dynamic_block_deltas]
+    thermal_worsening = (
+        any(value > float(max_candidate_temp_worsening_c) for value in candidate_temp_deltas)
+        or int(dynamic_result.get("candidate_thermal_intervention_count") or 0) > 0
+    )
 
+    if all(practical_blocks) and thermal_worsening:
+        return {
+            "complete": False,
+            "missing_modes": [],
+            "practical_threshold_w": practical_threshold_w,
+            "deltas_w": deltas,
+            "dynamic_block_deltas_w": dynamic_block_deltas,
+            "candidate_mean_temp_deltas_c": candidate_temp_deltas,
+            "recommendation": "NEED_MORE_DATA",
+            "reasons": ["dynamic treatment has a material thermal worsening outcome"],
+            "campaign_id": selected_campaign,
+            "fixed_baseline_envelope": fixed_baseline_envelope or None,
+            "fixed_baseline_content_hash": fixed_baseline_content_hash or None,
+            "selected_policy_mode": None,
+            "selected_policy_fingerprint": None,
+            "latest_runs": latest,
+        }
     if all(practical_blocks):
         recommendation = "KEEP_DYNAMIC_CONTROLLER"
         selected_policy_mode = "DYNAMIC_CONTROLLER"
@@ -462,6 +598,7 @@ def assess_net_benefit(
         "deltas_w": deltas,
         "dynamic_net_saving_w": -dynamic_delta,
         "dynamic_block_deltas_w": dynamic_block_deltas,
+        "candidate_mean_temp_deltas_c": candidate_temp_deltas,
         "recommendation": recommendation,
         "reasons": reasons,
         "campaign_id": selected_campaign,
@@ -469,8 +606,36 @@ def assess_net_benefit(
         "fixed_baseline_content_hash": fixed_baseline_content_hash or None,
         "selected_policy_mode": selected_policy_mode,
         "selected_policy_fingerprint": selected_policy_fingerprint or None,
+        "stage_e_contract_identity": dynamic_result.get("stage_e_contract_identity"),
+        "media_compatibility_generation": dynamic_result.get("media_compatibility_generation"),
         "latest_runs": latest,
     }
+
+
+def assess_current_net_benefit(config: Config, db: Database, *, limit: int = 100) -> dict[str, Any]:
+    epoch = db.active_evidence_epoch()
+    complete_campaign_ids = {
+        str(item["campaign_id"])
+        for item in db.net_benefit_campaigns(status="COMPLETE", limit=limit)
+    }
+    current_contract = stage_e_contract_identity(config)
+    current_media = live_media_compatibility(config)
+    return assess_net_benefit(
+        [run for run in db.net_benefit_results(limit) if run.get("end_ts") is not None],
+        practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
+        evidence_epoch_id=(epoch or {}).get("epoch_id"),
+        complete_campaign_ids=complete_campaign_ids,
+        max_campaign_span_seconds=float(
+            config.get("net_benefit.max_campaign_span_seconds", 86400.0)
+        ),
+        current_stage_e_contract_identity=str(current_contract.get("identity") or ""),
+        current_media_compatibility_generation=str(
+            current_media.get("media_compatibility_generation") or ""
+        ),
+        max_candidate_temp_worsening_c=float(
+            config.get("net_benefit.max_candidate_temp_worsening_c", 5.0)
+        ),
+    )
 
 
 @dataclass
@@ -547,22 +712,7 @@ class StableReadiness:
         if open_events:
             reasons.append("unresolved_unexpected_power_event")
 
-        net_benefit_results = [
-            run for run in self.db.net_benefit_results(100) if run.get("end_ts") is not None
-        ]
-        complete_campaign_ids = {
-            str(item["campaign_id"])
-            for item in self.db.net_benefit_campaigns(status="COMPLETE", limit=100)
-        }
-        net_benefit = assess_net_benefit(
-            net_benefit_results,
-            practical_threshold_w=float(self.config.get("evidence.practical_threshold_w", 0.10)),
-            evidence_epoch_id=(epoch or {}).get("epoch_id"),
-            complete_campaign_ids=complete_campaign_ids,
-            max_campaign_span_seconds=float(
-                self.config.get("net_benefit.max_campaign_span_seconds", 86400.0)
-            ),
-        )
+        net_benefit = assess_current_net_benefit(self.config, self.db, limit=100)
         if not net_benefit["complete"]:
             reasons.append("net_benefit_validation_incomplete")
         current_policy = runtime_policy_snapshot(self.config, self.db)
@@ -573,6 +723,19 @@ class StableReadiness:
         if net_benefit["complete"] and selected_policy_mode == "DYNAMIC_CONTROLLER":
             if selected_policy_fingerprint != str(current_policy["fingerprint"]):
                 reasons.append("net_benefit_selected_policy_is_stale")
+            expected_runtime_code = str(
+                dynamic_runtime_code_identity(self.config).get("aggregate_sha256") or ""
+            )
+            expected_runtime_config = str(
+                dynamic_runtime_config_identity(self.config).get("identity") or ""
+            )
+            if (
+                str(current_runtime_mode.get("runtime_code_identity") or "")
+                != expected_runtime_code
+                or str(current_runtime_mode.get("runtime_config_identity") or "")
+                != expected_runtime_config
+            ):
+                reasons.append("dynamic_runtime_implementation_stale")
         elif net_benefit["complete"] and selected_policy_mode == "FIXED_GOOD":
             expected_fixed_identity = fixed_runtime_identity(
                 evidence_epoch_id=str((epoch or {}).get("epoch_id") or ""),
@@ -587,6 +750,7 @@ class StableReadiness:
                 evidence_epoch=epoch,
                 fixed_baseline_envelope=net_benefit.get("fixed_baseline_envelope"),
                 fixed_baseline_content_hash=net_benefit.get("fixed_baseline_content_hash"),
+                require_persistent_selection=True,
             )
             if not fixed_runtime_audit.get("ready"):
                 reasons.append("fixed_runtime_audit_failed")
@@ -856,6 +1020,7 @@ def summarize_minimal_meter_samples(
             "remote_fraction": (sum(remote_values) / len(remote_values) if remote_values else None),
             "mean_network_mbps": (statistics.fmean(network_values) if network_values else None),
             "mean_package_temp_c": statistics.fmean(temp_values) if temp_values else None,
+            "max_package_temp_c": max(temp_values) if temp_values else None,
             "fixed_hwp_sample_count": len(fixed_hwp_values),
             "fixed_hwp_all_match": (all(fixed_hwp_values) if fixed_hwp_values else None),
         }
@@ -873,7 +1038,6 @@ def _paired_covariate_reasons(
     max_media_fraction_delta: float,
     max_remote_fraction_delta: float,
     max_network_mbps_delta: float,
-    max_mean_temp_delta_c: float,
 ) -> list[str]:
     checks = (
         ("mean_brightness_pct", max_brightness_delta_pct, "brightness"),
@@ -881,7 +1045,6 @@ def _paired_covariate_reasons(
         ("media_fraction", max_media_fraction_delta, "media_fraction"),
         ("remote_fraction", max_remote_fraction_delta, "remote_fraction"),
         ("mean_network_mbps", max_network_mbps_delta, "network"),
-        ("mean_package_temp_c", max_mean_temp_delta_c, "temperature"),
     )
     reasons: list[str] = []
     for field, threshold, label in checks:
@@ -913,7 +1076,6 @@ def compare_paired_meter_runs(
     max_media_fraction_delta: float = 0.10,
     max_remote_fraction_delta: float = 0.10,
     max_network_mbps_delta: float = 5.0,
-    max_mean_temp_delta_c: float = 5.0,
     max_reference_drift_w: float = 0.30,
     max_candidate_delta_spread_w: float = 0.30,
     require_candidate_fixed_hwp: bool = False,
@@ -979,7 +1141,6 @@ def compare_paired_meter_runs(
                 max_media_fraction_delta=max_media_fraction_delta,
                 max_remote_fraction_delta=max_remote_fraction_delta,
                 max_network_mbps_delta=max_network_mbps_delta,
-                max_mean_temp_delta_c=max_mean_temp_delta_c,
             )
         )
 
@@ -994,6 +1155,8 @@ def compare_paired_meter_runs(
     delta_pct = None
     minutes = None
     reference_drift_w = None
+    candidate_mean_temp_deltas_c: list[float] = []
+    candidate_max_temp_deltas_c: list[float] = []
     if all(
         isinstance(value, (int, float))
         for value in (
@@ -1025,6 +1188,26 @@ def compare_paired_meter_runs(
                     baseline_power_w=baseline_power,
                     candidate_power_w=baseline_power + delta_w,
                 )
+        for candidate_block, paired_reference in (
+            (candidate_first, before),
+            (candidate_second, after),
+        ):
+            candidate_mean_temp = candidate_block.get("mean_package_temp_c")
+            reference_mean_temp = paired_reference.get("mean_package_temp_c")
+            if isinstance(candidate_mean_temp, (int, float)) and isinstance(
+                reference_mean_temp, (int, float)
+            ):
+                candidate_mean_temp_deltas_c.append(
+                    float(candidate_mean_temp) - float(reference_mean_temp)
+                )
+            candidate_max_temp = candidate_block.get("max_package_temp_c")
+            reference_max_temp = paired_reference.get("max_package_temp_c")
+            if isinstance(candidate_max_temp, (int, float)) and isinstance(
+                reference_max_temp, (int, float)
+            ):
+                candidate_max_temp_deltas_c.append(
+                    float(candidate_max_temp) - float(reference_max_temp)
+                )
     else:
         quality_reasons.append("missing_paired_power")
 
@@ -1038,6 +1221,8 @@ def compare_paired_meter_runs(
         "reference_drift_w": reference_drift_w,
         "candidate_block_deltas_w": candidate_block_deltas,
         "candidate_delta_spread_w": candidate_delta_spread_w,
+        "candidate_mean_temp_deltas_c": candidate_mean_temp_deltas_c,
+        "candidate_max_temp_deltas_c": candidate_max_temp_deltas_c,
         "candidate_minus_reference_w": delta_w,
         "candidate_minus_reference_percent": delta_pct,
         "minutes_gained_per_charge": minutes,

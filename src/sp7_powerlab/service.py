@@ -25,15 +25,18 @@ from .evaluation import valid_duration
 from .evidence import NoiseTracker
 from .experiments import TrialError, TrialManager
 from .hardware import (
-    fingerprint_hash,
+    compatibility_state,
     hard_control_identity,
     inspect_hardware,
-    system_fingerprint,
     thermal_sensor_path,
 )
-from .helper import RootHelperClient
+from .helper import (
+    ROOT_HELPER_PROTOCOL_VERSION,
+    RootHelperClient,
+    helper_implementation_identity,
+)
 from .lifecycle import CONTROL_ALLOWED, EMERGENCY, READ_ONLY, STABLE, LifecycleManager
-from .longterm import DriftDetector
+from .longterm import DriftDetector, dynamic_runtime_code_identity, dynamic_runtime_config_identity
 from .measurement import measurement_trust_matches_epoch
 from .scheduler import CandidateScheduler
 from .storage import Database
@@ -54,8 +57,8 @@ def _refresh_fingerprint_state(
     machine: dict[str, Any],
     thermal_config: dict[str, Any],
 ) -> str:
-    fingerprint_payload = system_fingerprint(report)
-    versions = fingerprint_payload.get("versions") or {}
+    compatibility = compatibility_state(report)
+    fingerprint_payload = compatibility["system_fingerprint"]
     fp_hash, _control_fingerprint = hard_control_identity(
         report,
         thermal_config=thermal_config,
@@ -67,13 +70,10 @@ def _refresh_fingerprint_state(
             "kernel/BIOS/HWP/thermal-safety/calibration hard control fingerprint changed"
         )
 
-    software_versions = {
-        "kernel": fingerprint_payload.get("kernel"),
-        **{key: value for key, value in versions.items() if key != "thermald"},
-    }
+    software_versions = compatibility["software_versions"]
     media_keys = {"firefox", "chromium", "google-chrome", "playerctl", "mesa"}
-    media_versions = {key: software_versions.get(key) for key in sorted(media_keys)}
-    media_generation = f"media-{fingerprint_hash(media_versions)}"
+    media_versions = compatibility["media_versions"]
+    media_generation = compatibility["media_compatibility_generation"]
     db.set_meta("media_compatibility_generation", media_generation)
     db.set_compatibility_tags("media", media_versions)
     previous_versions = db.get_meta("software_versions", {})
@@ -115,6 +115,10 @@ def build_actuator(config: Config) -> tuple[Any, bool, str]:
     if bool(config.get("helper.enabled", True)) and helper.available():
         try:
             state = helper.inspect()
+            if int(state.get("protocol_version") or 0) != ROOT_HELPER_PROTOCOL_VERSION:
+                return UnavailableActuator(), False, "root-helper-mismatch"
+            if str(state.get("implementation_identity") or "") != helper_implementation_identity():
+                return UnavailableActuator(), False, "root-helper-mismatch"
             return helper, bool(state.get("available")), "root-helper"
         except Exception:
             pass
@@ -142,6 +146,20 @@ def prepare_stack(root: Path, config_path: Path | None = None) -> dict[str, Any]
     registry = EnvelopeRegistry(root, db)
     registry.load()
     actuator, actuator_available, actuator_mode = build_actuator(config)
+    db.set_meta(
+        "actuator_identity_error",
+        (
+            {
+                "ts": time.time(),
+                "reason": (
+                    "root helper implementation does not match current runtime; "
+                    "rerun scripts/install-root-helper.sh"
+                ),
+            }
+            if actuator_mode == "root-helper-mismatch"
+            else None
+        ),
+    )
 
     fp_hash = _refresh_fingerprint_state(
         db=db,
@@ -222,6 +240,12 @@ class PowerLabService:
         self.stack = prepare_stack(root, config_path)
         self.config: Config = self.stack["config"]
         self.db: Database = self.stack["db"]
+        self._loaded_runtime_code_identity = str(
+            dynamic_runtime_code_identity(self.config).get("aggregate_sha256") or ""
+        )
+        self._loaded_runtime_config_identity = str(
+            dynamic_runtime_config_identity(self.config).get("identity") or ""
+        )
         self._stop = False
         self._last_rollup_bucket: float | None = None
         self._last_thermal_state: str | None = None
@@ -399,15 +423,35 @@ class PowerLabService:
         lifecycle = self.stack["lifecycle"]
         current_control = lifecycle.control_state() if hasattr(lifecycle, "control_state") else None
         if not actuator_available and current_control != EMERGENCY:
+            readonly_reason = (
+                "root helper implementation does not match current runtime; "
+                "rerun scripts/install-root-helper.sh"
+                if probed_mode == "root-helper-mismatch"
+                else "actuator probe is unavailable; normal writes disabled"
+            )
             lifecycle.set_control(
                 READ_ONLY,
-                "actuator probe is unavailable; normal writes disabled",
+                readonly_reason,
                 {
                     "actuator_mode": actuator_mode,
                     "probed_mode": probed_mode,
                     "active_trial": active_trial,
                 },
             )
+        self.db.set_meta(
+            "actuator_identity_error",
+            (
+                {
+                    "ts": ts,
+                    "reason": (
+                        "root helper implementation does not match current runtime; "
+                        "rerun scripts/install-root-helper.sh"
+                    ),
+                }
+                if probed_mode == "root-helper-mismatch"
+                else None
+            ),
+        )
         self._last_hardware_refresh_ts = ts
 
     def _refresh_compatibility_contract(self, ts: float) -> None:
@@ -878,7 +922,11 @@ class PowerLabService:
                 "automation_level": int(self.config.get("automation.level", 0)),
                 "learning_state": self.stack["lifecycle"].learning_state(),
                 "control_state": self.stack["lifecycle"].control_state(),
+                "thermal_emergency": thermal["state"] in {"THERMAL_PRESSURE", "THROTTLING"},
+                "telemetry_mode": sample.get("telemetry_mode"),
                 "current_envelope": self.stack["controller"].current_envelope(),
+                "runtime_code_identity": self._loaded_runtime_code_identity,
+                "runtime_config_identity": self._loaded_runtime_config_identity,
             },
         )
         self.db.add_sample(sample)
@@ -986,6 +1034,8 @@ def service_status(root: Path, config_path: Path | None = None) -> dict[str, Any
             "current_envelope": stack["controller"].current_envelope(),
             "override": stack["controller"].override(),
             "lifecycle": stack["lifecycle"].status(),
+            "runtime_code_identity": dynamic_runtime_code_identity(stack["config"]),
+            "runtime_config_identity": dynamic_runtime_config_identity(stack["config"]),
         }
     finally:
         stack["db"].close()

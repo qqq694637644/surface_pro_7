@@ -10,7 +10,7 @@ from .config import Config, load_machine
 from .envelopes import EnvelopeRegistry
 from .hardware import inspect_hardware
 from .lifecycle import LifecycleManager
-from .longterm import StableReadiness, UsageCoverage, assess_net_benefit
+from .longterm import StableReadiness, UsageCoverage, assess_current_net_benefit
 from .measurement import measurement_trust_matches_epoch
 from .scheduler import CandidateScheduler
 from .storage import SCHEMA_VERSION, Database
@@ -409,6 +409,7 @@ def _stage_and_actions(
             "net_benefit_selected_policy_is_stale",
             "net_benefit_selected_runtime_mode_mismatch",
             "fixed_runtime_audit_failed",
+            "dynamic_runtime_implementation_stale",
         }
         if stable_reasons and stable_reasons <= selected_policy_reasons:
             return (
@@ -422,7 +423,11 @@ def _stage_and_actions(
                         "action": (
                             "repair_fixed_runtime_state"
                             if "fixed_runtime_audit_failed" in stable_reasons
-                            else "reconcile_selected_net_benefit_policy"
+                            else (
+                                "restart_stale_dynamic_runtime"
+                                if "dynamic_runtime_implementation_stale" in stable_reasons
+                                else "reconcile_selected_net_benefit_policy"
+                            )
                         ),
                         "reason": ", ".join(sorted(stable_reasons)),
                     }
@@ -535,19 +540,22 @@ def _stage_and_actions(
         "net_benefit_selected_policy_is_stale",
         "net_benefit_selected_runtime_mode_mismatch",
         "fixed_runtime_audit_failed",
+        "dynamic_runtime_implementation_stale",
     }
     if readiness_reasons and readiness_reasons <= net_benefit_reasons:
         stale_reasons = {
             "net_benefit_selected_policy_is_stale",
             "net_benefit_selected_runtime_mode_mismatch",
             "fixed_runtime_audit_failed",
+            "dynamic_runtime_implementation_stale",
         }
         if readiness_reasons <= stale_reasons:
-            action = (
-                "repair_fixed_runtime_state"
-                if "fixed_runtime_audit_failed" in readiness_reasons
-                else "reconcile_selected_net_benefit_policy"
-            )
+            if "fixed_runtime_audit_failed" in readiness_reasons:
+                action = "repair_fixed_runtime_state"
+            elif "dynamic_runtime_implementation_stale" in readiness_reasons:
+                action = "restart_stale_dynamic_runtime"
+            else:
+                action = "reconcile_selected_net_benefit_policy"
             net_benefit = stable_readiness.get("net_benefit") or {}
             current_mode = stable_readiness.get("current_runtime_mode") or {}
             reason = (
@@ -661,19 +669,7 @@ def build_agent_context(
         evidence_epoch_id=(evidence_epoch or {}).get("epoch_id"),
     )
     stable_readiness = StableReadiness(config, db).assess(now=now)
-    net_benefit_results = db.net_benefit_results(50)
-    complete_campaign_ids = {
-        str(item["campaign_id"]) for item in db.net_benefit_campaigns(status="COMPLETE", limit=100)
-    }
-    net_benefit = assess_net_benefit(
-        net_benefit_results,
-        practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
-        evidence_epoch_id=(evidence_epoch or {}).get("epoch_id"),
-        complete_campaign_ids=complete_campaign_ids,
-        max_campaign_span_seconds=float(
-            config.get("net_benefit.max_campaign_span_seconds", 86400.0)
-        ),
-    )
+    net_benefit = assess_current_net_benefit(config, db, limit=100)
 
     latest = db.latest_sample()
     current_envelope = (
@@ -775,6 +771,9 @@ def build_agent_context(
             "investigation_status": lifecycle.get("investigation_status"),
             "automation_level": int(config.get("automation.level", 0)),
             "current_envelope": current_envelope,
+            "service_heartbeat": db.get_meta("service_heartbeat", {}),
+            "actuator_identity_error": db.get_meta("actuator_identity_error"),
+            "fixed_good_selection": db.get_meta("fixed_good_selection"),
             "latest_sample": latest_summary,
         },
         "battery": {

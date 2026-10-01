@@ -594,7 +594,29 @@ def test_kernel_is_hard_fingerprint_and_media_versions_get_compatibility_generat
             "mesa": "24.1",
         },
     }
-    monkeypatch.setattr(service_module, "system_fingerprint", lambda _report: dict(payload))
+
+    def fake_compatibility_state(_report):
+        versions = payload["versions"]
+        software = {
+            "kernel": payload["kernel"],
+            "firefox": versions.get("firefox"),
+            "mesa": versions.get("mesa"),
+        }
+        media = {
+            "chromium": None,
+            "firefox": versions.get("firefox"),
+            "google-chrome": None,
+            "mesa": versions.get("mesa"),
+            "playerctl": None,
+        }
+        return {
+            "system_fingerprint": dict(payload),
+            "software_versions": software,
+            "media_versions": media,
+            "media_compatibility_generation": f"media-{versions.get('firefox')}-{versions.get('mesa')}",
+        }
+
+    monkeypatch.setattr(service_module, "compatibility_state", fake_compatibility_state)
     machine = {"calibration": {"version": 1}}
     report = SimpleNamespace(
         product="Surface Pro 7",
@@ -638,6 +660,30 @@ def test_kernel_is_hard_fingerprint_and_media_versions_get_compatibility_generat
         assert kernel_changed != first
     finally:
         db.close()
+
+
+def test_build_actuator_rejects_stale_root_helper_identity(project_root: Path, monkeypatch):
+    config = load_config(project_root)
+    config.data["helper"]["enabled"] = True
+
+    class StaleHelper:
+        def __init__(self, _path):
+            pass
+
+        def available(self):
+            return True
+
+        def inspect(self):
+            return {
+                "available": True,
+                "protocol_version": service_module.ROOT_HELPER_PROTOCOL_VERSION,
+                "implementation_identity": "stale-helper",
+            }
+
+    monkeypatch.setattr(service_module, "RootHelperClient", StaleHelper)
+    _actuator, available, mode = service_module.build_actuator(config)
+    assert available is False
+    assert mode == "root-helper-mismatch"
 
 
 def test_hardware_refresh_rebinds_actuator_when_helper_becomes_available(

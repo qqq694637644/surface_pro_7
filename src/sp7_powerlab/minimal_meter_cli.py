@@ -15,8 +15,15 @@ from .config import load_config, load_machine
 from .demand import remote_process_tags
 from .envelopes import snapshot_matches_envelope
 from .hardware import systemd_user_unit_state, thermal_sensor_path
-from .longterm import runtime_mode_status, runtime_policy_snapshot, stage_e_code_identity
+from .longterm import (
+    dynamic_runtime_code_identity,
+    dynamic_runtime_config_identity,
+    runtime_mode_status,
+    runtime_policy_snapshot,
+    stage_e_contract_identity,
+)
 from .measurement import MinimalMeter, measurement_trust_matches_epoch
+from .runtime_audit import live_media_compatibility
 from .service import build_actuator
 from .storage import Database
 from .telemetry import _brightness, _media_playing, _network_bytes, _temperature_c, _user_active
@@ -71,7 +78,10 @@ def _service_mode_status(config: Any, db: Database, mode: str) -> dict[str, Any]
         if service_unit_state != "active" or actual_mode != "MONITORING":
             raise RuntimeError("MONITORING capture requires a live service with automation.level=0")
     elif mode == "DYNAMIC_CONTROLLER":
-        if service_unit_state != "active" or actual_mode != "DYNAMIC_CONTROLLER":
+        if service_unit_state != "active" or actual_mode not in {
+            "DYNAMIC_CONTROLLER",
+            "THERMAL_INTERVENTION",
+        }:
             raise RuntimeError(
                 "DYNAMIC_CONTROLLER capture requires a live CONTROL_ALLOWED service at automation.level=1"
             )
@@ -88,6 +98,21 @@ def _service_mode_status(config: Any, db: Database, mode: str) -> dict[str, Any]
             "Net Benefit capture requires hourly background units to be stopped: "
             + ", ".join(active_units)
         )
+    if (
+        mode in {"MONITORING", "DYNAMIC_CONTROLLER"}
+        and str(status.get("telemetry_mode") or "") == "DIAGNOSTIC_BURST"
+    ):
+        raise RuntimeError("formal Net Benefit capture cannot run during a diagnostic burst")
+    if mode in {"MONITORING", "DYNAMIC_CONTROLLER"}:
+        expected_code = str(dynamic_runtime_code_identity(config).get("aggregate_sha256") or "")
+        expected_config = str(dynamic_runtime_config_identity(config).get("identity") or "")
+        if (
+            str(status.get("runtime_code_identity") or "") != expected_code
+            or str(status.get("runtime_config_identity") or "") != expected_config
+        ):
+            raise RuntimeError(
+                "runtime implementation stale; restart sp7-powerlab.service before capture"
+            )
     return {
         **status,
         "service_unit_state": service_unit_state,
@@ -112,6 +137,12 @@ def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dic
         raise RuntimeError("MinimalMeter Net Benefit capture cannot run during an active trial")
     if db.active_calibration():
         raise RuntimeError("MinimalMeter Net Benefit capture cannot run during calibration")
+    if db.active_investigation():
+        raise RuntimeError("MinimalMeter Net Benefit capture cannot run during an investigation")
+    if any(event.get("status") == "OPEN" for event in db.recent_unexpected_power_events(200)):
+        raise RuntimeError(
+            "MinimalMeter Net Benefit capture requires no unresolved UnexpectedPower event"
+        )
     if int(epoch.get("battery_epoch") or 0) != int(battery.get("epoch") or 0):
         raise RuntimeError("active evidence epoch does not match the active battery epoch")
     if int(epoch.get("calibration_version") or 0) != int(calibration.get("version") or 0):
@@ -129,8 +160,10 @@ def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dic
         raise RuntimeError("MinimalMeter capture requires a current VERIFIED envelope")
     service_mode = _service_mode_status(config, db, mode)
     policy = runtime_policy_snapshot(config, db)
-    stage_e_identity = stage_e_code_identity(config)
-    media_generation = str(db.get_meta("media_compatibility_generation", "media-missing") or "")
+    stage_e_identity = stage_e_contract_identity(config)
+    media_generation = str(
+        live_media_compatibility(config).get("media_compatibility_generation") or "media-missing"
+    )
 
     return {
         "evidence_epoch_id": str(epoch["epoch_id"]),
@@ -142,9 +175,10 @@ def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dic
         "envelope": envelope,
         "envelope_content_hash": str(envelope_record.get("content_hash") or ""),
         "runtime_policy_fingerprint": str(policy["fingerprint"]),
-        "stage_e_code_identity": str(stage_e_identity.get("aggregate_sha256") or ""),
+        "stage_e_contract_identity": str(stage_e_identity.get("identity") or ""),
         "media_compatibility_generation": media_generation,
         "runtime_policy": policy["payload"],
+        "stage_e_contract": stage_e_identity["payload"],
         "service_mode": service_mode,
     }
 
@@ -163,7 +197,7 @@ def _capture_context_change_reason(
         "calibration_version",
         "evidence_semantics_version",
         "runtime_policy_fingerprint",
-        "stage_e_code_identity",
+        "stage_e_contract_identity",
         "media_compatibility_generation",
     )
     if any(final[field] != start[field] for field in stable_context_fields):
@@ -200,7 +234,7 @@ def _prepare_campaign(
             fixed_baseline_content_hash=str(context["envelope_content_hash"]),
             payload={
                 "comparisons": {},
-                "stage_e_code_identity": str(context["stage_e_code_identity"]),
+                "stage_e_contract_identity": str(context["stage_e_contract_identity"]),
                 "media_compatibility_generation": str(context["media_compatibility_generation"]),
             },
         )
@@ -226,10 +260,10 @@ def _prepare_campaign(
         )
         raise RuntimeError("Net Benefit campaign context changed: " + ", ".join(sorted(mismatched)))
     campaign_payload = campaign.get("payload") or {}
-    campaign_code_identity = str(campaign_payload.get("stage_e_code_identity") or "")
-    if campaign_code_identity != str(context.get("stage_e_code_identity") or ""):
-        db.invalidate_net_benefit_campaign(campaign_id, "stage_e_code_identity_changed")
-        raise RuntimeError("Net Benefit campaign Stage E code identity changed")
+    campaign_contract_identity = str(campaign_payload.get("stage_e_contract_identity") or "")
+    if campaign_contract_identity != str(context.get("stage_e_contract_identity") or ""):
+        db.invalidate_net_benefit_campaign(campaign_id, "stage_e_contract_identity_changed")
+        raise RuntimeError("Net Benefit campaign Stage E contract identity changed")
     campaign_media_generation = str(campaign_payload.get("media_compatibility_generation") or "")
     if campaign_media_generation != str(context.get("media_compatibility_generation") or ""):
         db.invalidate_net_benefit_campaign(campaign_id, "media_compatibility_generation_changed")
@@ -284,7 +318,7 @@ class _MinimalContextSampler:
         }
 
 
-def _intervening_learning_activity(db: Database, start_ts: float) -> list[str]:
+def _intervening_runtime_activity(db: Database, start_ts: float) -> list[str]:
     reasons: list[str] = []
     if db.conn.execute("SELECT 1 FROM trials WHERE created_ts>=? LIMIT 1", (start_ts,)).fetchone():
         reasons.append("trial_occurred_during_capture")
@@ -293,19 +327,45 @@ def _intervening_learning_activity(db: Database, start_ts: float) -> list[str]:
         (start_ts,),
     ).fetchone():
         reasons.append("calibration_occurred_during_capture")
+    if db.conn.execute(
+        "SELECT 1 FROM investigations WHERE start_ts>=? LIMIT 1",
+        (start_ts,),
+    ).fetchone():
+        reasons.append("investigation_occurred_during_capture")
+    if db.conn.execute(
+        "SELECT 1 FROM unexpected_power_events WHERE start_ts>=? LIMIT 1",
+        (start_ts,),
+    ).fetchone():
+        reasons.append("unexpected_power_event_occurred_during_capture")
     return reasons
+
+
+def _control_safety_activity(db: Database, start_ts: float) -> dict[str, list[dict[str, Any]]]:
+    invalid: list[dict[str, Any]] = []
+    thermal: list[dict[str, Any]] = []
+    for row in db.runtime_states_since("control", start_ts):
+        state = str(row.get("state") or "")
+        reason = str(row.get("reason") or "")
+        if state == "CONTROL_ALLOWED":
+            continue
+        if state == "EMERGENCY" and reason == "thermal emergency":
+            thermal.append(row)
+            continue
+        invalid.append(row)
+    return {"invalid": invalid, "thermal": thermal}
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    if args.interval <= 0:
-        raise SystemExit("--interval must be > 0")
     if args.count is not None and args.count <= 0:
         raise SystemExit("--count must be > 0")
 
     root = _default_root()
     config_path = Path(args.config).expanduser() if args.config else None
     config = load_config(root, config_path)
+    interval = float(args.interval)
+    if interval <= 0:
+        raise SystemExit("--interval must be > 0")
     db = Database(config.path("storage.database"))
     sys_root = Path(args.sys_root)
     proc_root = Path(args.proc_root)
@@ -318,8 +378,19 @@ def main(argv: list[str] | None = None) -> int:
     actuator, actuator_available, actuator_mode = build_actuator(config)
     if not actuator_available:
         db.close()
+        if actuator_mode == "root-helper-mismatch":
+            raise SystemExit(
+                "root helper implementation does not match current runtime; "
+                "rerun scripts/install-root-helper.sh"
+            )
         raise SystemExit("MinimalMeter Net Benefit capture requires readable actual HWP state")
     start_context = _capture_context(root, config, db, mode=args.mode)
+    if (
+        args.mode == "DYNAMIC_CONTROLLER"
+        and str((start_context.get("service_mode") or {}).get("mode") or "") != "DYNAMIC_CONTROLLER"
+    ):
+        db.close()
+        raise SystemExit("DYNAMIC_CONTROLLER capture must start outside a thermal intervention")
     _prepare_campaign(
         db,
         campaign_id=args.campaign,
@@ -354,12 +425,13 @@ def main(argv: list[str] | None = None) -> int:
         envelope_content_hash=start_context["envelope_content_hash"],
         runtime_policy_fingerprint=start_context["runtime_policy_fingerprint"],
         payload={
-            "capture_contract_version": 3,
-            "interval_seconds": float(args.interval),
+            "capture_contract_version": 4,
+            "interval_seconds": interval,
             "actuator_mode": actuator_mode,
             "service_mode": start_context["service_mode"],
             "runtime_policy": start_context["runtime_policy"],
-            "stage_e_code_identity": start_context["stage_e_code_identity"],
+            "stage_e_contract_identity": start_context["stage_e_contract_identity"],
+            "stage_e_contract": start_context["stage_e_contract"],
             "media_compatibility_generation": start_context["media_compatibility_generation"],
             "start_hwp_snapshot": start_snapshot,
         },
@@ -402,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.count is not None and count >= args.count:
                 break
             elapsed = time.monotonic() - started
-            time.sleep(max(0.0, args.interval - elapsed))
+            time.sleep(max(0.0, interval - elapsed))
     except KeyboardInterrupt:
         pass
     except Exception as exc:
@@ -426,19 +498,24 @@ def main(argv: list[str] | None = None) -> int:
         if count < 2:
             terminal_status = "INVALID"
             terminal_reason = terminal_reason or "insufficient_samples"
-        learning_activity = _intervening_learning_activity(db, capture_start_ts)
-        if learning_activity:
+        runtime_activity = _intervening_runtime_activity(db, capture_start_ts)
+        if runtime_activity:
             terminal_status = "INVALID"
-            terminal_reason = terminal_reason or ",".join(learning_activity)
+            terminal_reason = terminal_reason or ",".join(runtime_activity)
+        control_safety = _control_safety_activity(db, capture_start_ts)
+        if args.mode == "DYNAMIC_CONTROLLER" and control_safety["invalid"]:
+            terminal_status = "INVALID"
+            terminal_reason = terminal_reason or "control_safety_interrupted_dynamic_capture"
         db.finish_minimal_meter_run(
             run_id,
             {
-                "capture_contract_version": 3,
-                "interval_seconds": float(args.interval),
+                "capture_contract_version": 4,
+                "interval_seconds": interval,
                 "sample_count": count,
                 "terminal_reason": terminal_reason,
                 "final_context": final_context,
-                "learning_activity": learning_activity,
+                "runtime_activity": runtime_activity,
+                "control_safety_activity": control_safety,
             },
             status=terminal_status,
         )

@@ -12,6 +12,7 @@ from sp7_powerlab.cli import _meter_campaign
 from sp7_powerlab.config import load_config
 from sp7_powerlab.minimal_meter_cli import (
     _capture_context_change_reason,
+    _control_safety_activity,
     _prepare_campaign,
     _service_mode_status,
 )
@@ -27,7 +28,7 @@ def _meter_run(
     envelope: str = "INTERACTIVE_EFFICIENT",
     envelope_hash: str = "fixed-hash",
     policy_fingerprint: str = "policy-a",
-    stage_e_code_identity: str = "stage-e-code-a",
+    stage_e_contract_identity: str = "stage-e-contract-a",
     media_generation: str = "media-a",
     order: int,
 ) -> str:
@@ -43,7 +44,7 @@ def _meter_run(
             fixed_baseline_content_hash=envelope_hash,
             payload={
                 "comparisons": {},
-                "stage_e_code_identity": stage_e_code_identity,
+                "stage_e_contract_identity": stage_e_contract_identity,
                 "media_compatibility_generation": media_generation,
             },
         )
@@ -60,8 +61,8 @@ def _meter_run(
         envelope_content_hash=envelope_hash,
         runtime_policy_fingerprint=policy_fingerprint,
         payload={
-            "capture_contract_version": 3,
-            "stage_e_code_identity": stage_e_code_identity,
+            "capture_contract_version": 4,
+            "stage_e_contract_identity": stage_e_contract_identity,
             "media_compatibility_generation": media_generation,
         },
     )
@@ -380,7 +381,7 @@ def test_meter_campaign_rejects_runtime_policy_change_between_candidate_blocks(t
         db.close()
 
 
-def test_net_benefit_campaign_rejects_stage_e_code_change_between_blocks(tmp_path: Path):
+def test_net_benefit_campaign_rejects_stage_e_contract_change_between_blocks(tmp_path: Path):
     db = Database(tmp_path / "db.sqlite3")
     try:
         context = {
@@ -392,7 +393,7 @@ def test_net_benefit_campaign_rejects_stage_e_code_change_between_blocks(tmp_pat
             "envelope": "INTERACTIVE_EFFICIENT",
             "envelope_content_hash": "fixed-hash",
             "runtime_policy_fingerprint": "dynamic-policy",
-            "stage_e_code_identity": "code-a",
+            "stage_e_contract_identity": "contract-a",
             "media_compatibility_generation": "media-a",
         }
         campaign = _prepare_campaign(
@@ -402,14 +403,14 @@ def test_net_benefit_campaign_rejects_stage_e_code_change_between_blocks(tmp_pat
             context=context,
             max_campaign_span_seconds=86400.0,
         )
-        assert campaign["payload"]["stage_e_code_identity"] == "code-a"
+        assert campaign["payload"]["stage_e_contract_identity"] == "contract-a"
 
-        with pytest.raises(RuntimeError, match="Stage E code identity changed"):
+        with pytest.raises(RuntimeError, match="Stage E contract identity changed"):
             _prepare_campaign(
                 db,
                 campaign_id="campaign-code",
                 mode="DYNAMIC_CONTROLLER",
-                context={**context, "stage_e_code_identity": "code-b"},
+                context={**context, "stage_e_contract_identity": "contract-b"},
                 max_campaign_span_seconds=86400.0,
             )
         assert db.net_benefit_campaign("campaign-code")["status"] == "INVALID"
@@ -426,7 +427,7 @@ def test_dynamic_capture_allows_verified_envelope_changes_but_fixed_capture_does
         "calibration_version": 1,
         "evidence_semantics_version": 8,
         "runtime_policy_fingerprint": "policy-a",
-        "stage_e_code_identity": "code-a",
+        "stage_e_contract_identity": "contract-a",
         "media_compatibility_generation": "media-a",
         "envelope": "INTERACTIVE_EFFICIENT",
         "envelope_content_hash": "fixed",
@@ -467,6 +468,8 @@ def test_service_mode_status_verifies_runtime_mode(project_root: Path, monkeypat
         assert fixed["service_unit_state"] == "inactive"
 
         service_state["value"] = "active"
+        runtime_code = meter_cli_module.dynamic_runtime_code_identity(config)["aggregate_sha256"]
+        runtime_config = meter_cli_module.dynamic_runtime_config_identity(config)["identity"]
         db.set_meta(
             "service_heartbeat",
             {
@@ -474,13 +477,43 @@ def test_service_mode_status_verifies_runtime_mode(project_root: Path, monkeypat
                 "automation_level": 0,
                 "control_state": "READ_ONLY",
                 "current_envelope": "INTERACTIVE_EFFICIENT",
+                "runtime_code_identity": runtime_code,
+                "runtime_config_identity": runtime_config,
             },
         )
         with pytest.raises(RuntimeError, match="service to be stopped"):
             _service_mode_status(config, db, "FIXED_GOOD")
         assert _service_mode_status(config, db, "MONITORING")["runtime_automation_level"] == 0
 
+        db.set_meta(
+            "service_heartbeat",
+            {
+                "ts": time.time(),
+                "automation_level": 0,
+                "control_state": "READ_ONLY",
+                "runtime_code_identity": "stale-code",
+                "runtime_config_identity": runtime_config,
+            },
+        )
+        with pytest.raises(RuntimeError, match="runtime implementation stale"):
+            _service_mode_status(config, db, "MONITORING")
+
+        db.set_meta(
+            "service_heartbeat",
+            {
+                "ts": time.time(),
+                "automation_level": 0,
+                "control_state": "READ_ONLY",
+                "telemetry_mode": "DIAGNOSTIC_BURST",
+                "runtime_code_identity": runtime_code,
+                "runtime_config_identity": runtime_config,
+            },
+        )
+        with pytest.raises(RuntimeError, match="diagnostic burst"):
+            _service_mode_status(config, db, "MONITORING")
+
         config.data["automation"]["level"] = 1
+        runtime_config = meter_cli_module.dynamic_runtime_config_identity(config)["identity"]
         db.set_meta(
             "service_heartbeat",
             {
@@ -488,11 +521,75 @@ def test_service_mode_status_verifies_runtime_mode(project_root: Path, monkeypat
                 "automation_level": 1,
                 "control_state": "CONTROL_ALLOWED",
                 "current_envelope": "INTERACTIVE_EFFICIENT",
+                "runtime_code_identity": runtime_code,
+                "runtime_config_identity": runtime_config,
             },
         )
         assert (
             _service_mode_status(config, db, "DYNAMIC_CONTROLLER")["runtime_automation_level"] == 1
         )
+    finally:
+        db.close()
+
+
+def test_fixed_apply_uses_verified_envelope_without_setting_override(
+    project_root: Path, monkeypatch
+):
+    monkeypatch.setattr(cli_module, "ROOT", project_root)
+    db = Database(project_root / "runtime/powerlab.sqlite3")
+    registry = cli_module.EnvelopeRegistry(project_root, db)
+    registry.load()
+    envelope = db.envelope("INTERACTIVE_EFFICIENT")
+    assert envelope is not None
+    envelope["status"] = "VERIFIED"
+    db.upsert_envelope(envelope)
+    db.close()
+
+    snapshot = {
+        "epp": {"policy0": envelope["epp"]},
+        "max_perf_pct": envelope["max_perf_pct"],
+        "turbo": envelope["turbo"],
+    }
+
+    class Actuator:
+        def apply_envelope(self, _envelope):
+            return {"after": snapshot}
+
+        def snapshot(self):
+            return snapshot
+
+    monkeypatch.setattr(cli_module, "systemd_user_unit_state", lambda _unit: "inactive")
+    monkeypatch.setattr(
+        cli_module,
+        "inspect_hardware",
+        lambda **_kwargs: SimpleNamespace(writable=True),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_actuator",
+        lambda _config: (Actuator(), True, "root-helper"),
+    )
+
+    assert cli_module.cmd_fixed_apply(SimpleNamespace(config=None, name=envelope["name"])) == 0
+    verify = Database(project_root / "runtime/powerlab.sqlite3")
+    try:
+        assert verify.get_meta("current_envelope") == envelope["name"]
+        assert verify.get_meta("manual_override") is None
+    finally:
+        verify.close()
+
+
+def test_control_safety_activity_keeps_thermal_as_outcome_but_rejects_other_interruptions(
+    tmp_path: Path,
+):
+    db = Database(tmp_path / "db.sqlite3")
+    try:
+        start_ts = time.time()
+        db.add_runtime_state("control", "EMERGENCY", "thermal emergency", {})
+        db.add_runtime_state("control", "READ_ONLY", "actuator probe is unavailable", {})
+        activity = _control_safety_activity(db, start_ts)
+        assert [row["state"] for row in activity["thermal"]] == ["EMERGENCY"]
+        assert [row["state"] for row in activity["invalid"]] == ["READ_ONLY"]
     finally:
         db.close()
 
@@ -549,7 +646,7 @@ def test_fixed_good_rejects_stale_heartbeat_if_service_is_actually_active(
 
 def test_service_run_returns_non_restartable_exit_for_legacy_schema(monkeypatch, capsys):
     def fail_service(*_args, **_kwargs):
-        raise LegacyDatabaseError("database schema 8 is not supported by schema 9")
+        raise LegacyDatabaseError("database schema 9 is not supported by schema 10")
 
     monkeypatch.setattr(cli_module, "PowerLabService", fail_service)
     result = cli_module.cmd_service_run(SimpleNamespace(config=None, iterations=None))

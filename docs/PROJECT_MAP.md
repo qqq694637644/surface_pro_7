@@ -380,6 +380,9 @@ root helper。
 
 只暴露有限 HWP inspect/snapshot/apply/restore。
 
+`inspect` 同时返回 protocol version 和 `helper.py + actuators/hwp.py` implementation identity。主 runtime
+发现 root-owned helper wheel 与当前实现不一致时直接撤销写权限，不回退兼容旧 helper。
+
 不是 root shell。
 
 ### src/sp7_powerlab/thermal.py
@@ -436,10 +439,10 @@ UnexpectedPower detector。
 - DriftDetector
 - runtime policy fingerprint
 - explicit Level-1 Dynamic runtime code identity
-- separate Stage E measurement-contract code identity
+- separate Stage E measurement-contract identity（相关比较代码 + config/threshold 子集）
 - actual runtime mode validation
 - MinimalMeter A1-B1-B2-A2 paired comparison
-- brightness/active/media/remote/network/temperature comparability veto
+- brightness/active/media/remote/network comparability veto；temperature 作为 treatment outcome
 - fixed baseline content hash / campaign coherence gate
 - Net Benefit campaign OPEN/COMPLETE/INVALID lifecycle + max span
 - recommendation -> selected policy fingerprint mapping；STABLE 校验 selected policy 仍是当前 runtime
@@ -461,9 +464,13 @@ Stage E 的低开销 capture 入口。
 - MONITORING：可选诊断模式，live service + Automation Level 0 + fixed HWP
 
 同时采集 brightness、active/media/remote fraction 所需信号、basic network、package temperature 和
-actual HWP snapshot，并冻结 runtime policy fingerprint。trial/calibration、hard context 或 policy 变化会让
-run INVALID。每个正式 block 还必须是一段连续 Discharging observation；若遗留 scheduled-review unit
-仍存在，它们必须保持 inactive。campaign 有独立 DB lifecycle，不允许跨周复用裸字符串拼结果。
+actual HWP snapshot，并冻结 runtime policy fingerprint 与 Stage-E contract identity。live service block 还会
+核对 daemon 启动时冻结的 runtime code/config identity；旧 daemon 必须 restart 后才能进入正式 capture。
+trial/calibration/investigation、UnexpectedPower、Diagnostic Burst、hard context/policy/contract/media 变化会让
+run INVALID。capture 结束会查询 control-safety history；helper/ownership/sensor 等非 thermal interruption
+会使 Dynamic block INVALID，thermal intervention 作为 outcome 保留。每个正式 block 还必须是一段连续
+Discharging observation；若遗留 scheduled-review unit 仍存在，它们必须保持 inactive。campaign 有独立
+DB lifecycle，不允许跨周复用裸字符串拼结果。
 
 正式 STABLE evidence 只要求 Dynamic vs Fixed-good；MONITORING 不参与 readiness。Level 2+ 的
 Scheduler/Agent/自动学习是按需能力，不是 formal Stage E treatment。
@@ -497,11 +504,18 @@ GPT-5.6 Sol 直接通过 Bash 使用主 CLI、SQLite、日志、sysfs 和源码�
 ### src/sp7_powerlab/runtime_audit.py
 
 FIXED_GOOD 的 one-shot 物理事实审计：main service、legacy scheduled units、thermald、ownership、live hard
-identity、verified fixed baseline 和 actual HWP snapshot。
+identity、现场 media compatibility、verified fixed baseline 和 actual HWP snapshot。用于 STABLE selected
+fixed policy 时还验证 main daemon 已 disabled、`sp7-powerlab-fixed.service` 已 enabled、持久选择与当前
+evidence epoch/baseline 一致。
 
 ### src/sp7_powerlab/cli.py
 
 人类和 Agent 的主 CLI 入口。
+
+`sp7-powerlab fixed apply <VERIFIED envelope>` 是 Stage E A1/A2 的物理 baseline 恢复原语：要求 main
+service 停止、restricted helper/hardware contract 正常，transactional apply + read-back，并且不设置
+manual override。`envelope activate-fixed-good` / `activate-dynamic` 用于把 Stage E recommendation 落成
+跨 login/reboot 的 selected runtime。
 
 ## 5. 配置地图
 

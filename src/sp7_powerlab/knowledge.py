@@ -7,7 +7,7 @@ from .analytics import battery_usage_summary
 from .config import Config, load_machine
 from .envelopes import EnvelopeRegistry
 from .lifecycle import LifecycleManager
-from .longterm import UsageCoverage, assess_net_benefit
+from .longterm import UsageCoverage, assess_current_net_benefit
 from .storage import Database
 
 
@@ -64,18 +64,7 @@ def build_review_pack(
         evidence_epoch_id=evidence_epoch_id,
     )
     net_benefit_results = db.net_benefit_results(50)
-    complete_campaign_ids = {
-        str(item["campaign_id"]) for item in db.net_benefit_campaigns(status="COMPLETE", limit=100)
-    }
-    net_benefit = assess_net_benefit(
-        net_benefit_results,
-        practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
-        evidence_epoch_id=evidence_epoch_id,
-        complete_campaign_ids=complete_campaign_ids,
-        max_campaign_span_seconds=float(
-            config.get("net_benefit.max_campaign_span_seconds", 86400.0)
-        ),
-    )
+    net_benefit = assess_current_net_benefit(config, db, limit=100)
     noise_rows = (
         [
             dict(row)

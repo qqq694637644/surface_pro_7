@@ -17,7 +17,7 @@ from sp7_powerlab.longterm import (
     negative_feedback_blocks_current_policy,
     runtime_mode_status,
     runtime_policy_snapshot,
-    stage_e_code_identity,
+    stage_e_contract_identity,
     summarize_minimal_meter_samples,
 )
 from sp7_powerlab.runtime_audit import fixed_runtime_identity
@@ -230,6 +230,11 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
     from sp7_powerlab.config import load_config
 
     config = load_config(project_root)
+    stage_e_identity = stage_e_contract_identity(config)["identity"]
+    monkeypatch.setattr(
+        "sp7_powerlab.longterm.live_media_compatibility",
+        lambda *_args, **_kwargs: {"media_compatibility_generation": "media-test"},
+    )
     fixed_audit = {"ready": True, "reasons": []}
     monkeypatch.setattr(
         "sp7_powerlab.longterm.audit_fixed_runtime",
@@ -290,6 +295,11 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
             evidence_semantics_version=1,
             fixed_baseline_envelope="INTERACTIVE_EFFICIENT",
             fixed_baseline_content_hash=fixed_hash,
+            payload={
+                "comparisons": {},
+                "stage_e_contract_identity": stage_e_identity,
+                "media_compatibility_generation": "media-test",
+            },
         )
         mode_results = {
             "MONITORING_OVERHEAD": (0.18, "monitoring-policy"),
@@ -309,6 +319,8 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
                     "fixed_baseline_content_hash": fixed_hash,
                     "runtime_policy_fingerprint": run_policy_fingerprint,
                     "candidate_block_deltas_w": [delta_w, delta_w],
+                    "stage_e_contract_identity": stage_e_identity,
+                    "media_compatibility_generation": "media-test",
                 },
             )
             if mode == "DYNAMIC_CONTROLLER":
@@ -756,7 +768,25 @@ def test_runtime_policy_snapshot_ignores_scheduler_code_for_level_one_runtime(pr
         db.close()
 
 
-def test_stage_e_code_identity_includes_cli_contract(project_root: Path):
+def test_runtime_policy_snapshot_includes_level_one_evidence_path(project_root: Path):
+    from sp7_powerlab.config import load_config
+
+    package_root = project_root / "src" / "sp7_powerlab"
+    package_root.mkdir(parents=True)
+    evidence = package_root / "evidence.py"
+    evidence.write_text("NOISE_VERSION = 1\n", encoding="utf-8")
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/policy-evidence.sqlite3")
+    try:
+        first = runtime_policy_snapshot(config, db)
+        evidence.write_text("NOISE_VERSION = 2\n", encoding="utf-8")
+        second = runtime_policy_snapshot(config, db)
+        assert first["fingerprint"] != second["fingerprint"]
+    finally:
+        db.close()
+
+
+def test_stage_e_contract_identity_includes_cli_and_threshold_contract(project_root: Path):
     from sp7_powerlab.config import load_config
 
     package_root = project_root / "src" / "sp7_powerlab"
@@ -764,10 +794,14 @@ def test_stage_e_code_identity_includes_cli_contract(project_root: Path):
     cli = package_root / "cli.py"
     cli.write_text("STAGE_E_VERSION = 1\n", encoding="utf-8")
     config = load_config(project_root)
-    first = stage_e_code_identity(config)
+    first = stage_e_contract_identity(config)
     cli.write_text("STAGE_E_VERSION = 2\n", encoding="utf-8")
-    second = stage_e_code_identity(config)
-    assert first["aggregate_sha256"] != second["aggregate_sha256"]
+    second = stage_e_contract_identity(config)
+    assert first["identity"] != second["identity"]
+
+    config.data["net_benefit"]["max_reference_drift_w"] = 0.31
+    third = stage_e_contract_identity(config)
+    assert second["identity"] != third["identity"]
 
 
 def test_runtime_mode_status_is_independent_of_policy_fingerprint(project_root: Path):
@@ -927,3 +961,58 @@ def test_paired_meter_comparison_requires_comparable_a_b_b_a_blocks():
     assert incomparable["comparison_quality"] == "DATA_QUALITY_FAILURE"
     assert "candidate_first_brightness_not_comparable" in incomparable["comparison_quality_reasons"]
     assert incomparable["candidate_minus_reference_w"] is None
+
+
+def test_paired_meter_temperature_is_outcome_not_comparability_gate():
+    before = paired_meter_rows(5.0, temp_c=50.0)
+    first = paired_meter_rows(4.8, temp_c=40.0)
+    second = paired_meter_rows(4.85, temp_c=41.0)
+    after = paired_meter_rows(5.0, temp_c=50.0)
+
+    result = compare_paired_meter_runs(
+        before,
+        first,
+        second,
+        after,
+        minimum_block_seconds=300.0,
+    )
+    assert result["comparison_quality"] == "OK"
+    assert result["candidate_mean_temp_deltas_c"] == [-10.0, -9.0]
+    assert not any("temperature" in reason for reason in result["comparison_quality_reasons"])
+
+
+def test_net_benefit_blocks_dynamic_selection_on_material_thermal_worsening():
+    run = _completed_run(
+        "DYNAMIC_CONTROLLER",
+        -0.30,
+        110,
+        policy_fingerprint="dynamic",
+    )
+    run["result"]["candidate_mean_temp_deltas_c"] = [6.0, 6.5]
+    result = assess_net_benefit(
+        [run],
+        practical_threshold_w=0.10,
+        max_candidate_temp_worsening_c=5.0,
+    )
+    assert result["complete"] is False
+    assert result["recommendation"] == "NEED_MORE_DATA"
+    assert "thermal worsening" in result["reasons"][0]
+
+
+def test_net_benefit_rejects_stale_stage_e_or_media_contract():
+    run = _completed_run("DYNAMIC_CONTROLLER", -0.30, 110, policy_fingerprint="dynamic")
+    run["result"].update(
+        {
+            "stage_e_contract_identity": "contract-old",
+            "media_compatibility_generation": "media-old",
+        }
+    )
+    result = assess_net_benefit(
+        [run],
+        practical_threshold_w=0.10,
+        current_stage_e_contract_identity="contract-current",
+        current_media_compatibility_generation="media-current",
+    )
+    assert result["complete"] is False
+    assert "stage_e_contract_identity_stale" in result["reasons"]
+    assert "media_compatibility_generation_stale" in result["reasons"]

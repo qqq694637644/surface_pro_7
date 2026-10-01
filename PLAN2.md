@@ -962,14 +962,22 @@ Net Benefit 直接来自 end-to-end paired comparison，而不是两个任意历
 MinimalMeter capture 的 provenance 必须在**采集开始时**固定并持久化，至少包括 run/campaign、
 capture mode、battery identity/epoch、hard evidence epoch/fingerprint、calibration version、evidence
 semantics、起始 verified envelope、media compatibility generation、runtime policy fingerprint 和 Stage E
-measurement-contract code identity。比较时只能读取 capture-time provenance；
+measurement-contract identity。该 identity 同时 hash 正式比较代码和直接决定 Stage E 有效性的 config/
+threshold 子集。比较时只能读取 capture-time provenance；
 禁止读取“当前 epoch”后给旧采集文件事后贴标签。
 
 Dynamic runtime policy fingerprint 使用**显式 allowlist**，只覆盖 Level-1 长期 runtime 真正使用的
-controller/service/telemetry/demand/thermal/HWP 等代码、相关 config、VERIFIED envelope names/content
-hashes 和 manual override。Scheduler/Trial/Agent 代码不应因为与 Level-1 无关而迫使重做长期 Dynamic
-验证。Stage E 的测量合同另有独立 code identity，明确包含 `cli.py`、`minimal_meter_cli.py`、
-`measurement.py`、`longterm.py` 等比较路径代码。
+controller/service/telemetry/demand/thermal/HWP 以及 Level-1 hot/slow path 实际执行的
+evidence/evaluation/longterm/calibration 等代码、相关 config、VERIFIED envelope names/content hashes 和
+manual override。Scheduler/Agent search code 不应因为与 Level-1 无关而迫使重做长期 Dynamic 验证；
+runtime 确实执行的 TrialManager path 可以保守纳入。Stage E 的测量合同使用独立 contract identity，
+明确包含 `cli.py`、`minimal_meter_cli.py`、`measurement.py`、`longterm.py` 等比较路径代码以及相关合同
+config。
+
+main daemon 启动时必须冻结自己**实际加载**的 runtime code/config identity，并放进 heartbeat。正式
+DYNAMIC_CONTROLLER/MONITORING capture 重新计算当前 expected identity；heartbeat 与当前源码/config
+不一致时 fail-closed，并要求先 restart `sp7-powerlab.service`。这与 runtime policy fingerprint 是两条
+独立检查：一个证明“当前进程真在跑哪份实现”，一个定义“被验证的长期 policy 是什么”。
 
 Net Benefit 使用 gap-aware integrated BAT energy / valid discharge duration 计算 time-weighted mean
 power，但**一个正式 block 必须恰好是一段连续 Discharging observation**。block 中出现 Charging/AC、
@@ -991,19 +999,23 @@ battery/hard/calibration/campaign context，
 两个 delta 的 median，并要求方向一致、spread 不超过配置上限。
 
 MinimalMeter 同时记录低成本 comparability covariates：brightness、active fraction、media fraction、
-remote fraction、basic network 和 package temperature。它们只用于 veto 明显不可比的 block，不用于
-建立高维统计模型。
+remote fraction 和 basic network。它们只用于 veto 明显不可比的 block，不用于建立高维统计模型。
+package temperature 不作为 comparability covariate；它是 treatment outcome。Dynamic 更凉不得因为
+“温度不同”被过滤，明显更热或触发 thermal intervention 则阻止直接保留 Dynamic，转为 NEED_MORE_DATA。
 
 capture mode 不能只是用户标签。正式 capture 必须验证：
 
 - FIXED_GOOD：live systemd state 证明 PowerLab service inactive，且每个 sample 的实际 HWP 都匹配同一个 VERIFIED envelope
-- DYNAMIC_CONTROLLER：service 正在运行、Automation Level 1、ControlSafety=CONTROL_ALLOWED
+- DYNAMIC_CONTROLLER：service 正在运行、Automation Level 1，capture 开始时 ControlSafety=CONTROL_ALLOWED；
+  capture 内 thermal safety intervention 作为 outcome，其他 READ_ONLY/DEGRADED/EMERGENCY transition 使 block INVALID
 
 当前版本不再部署 scheduled Agent review unit；installer 会移除旧 hourly unit。正式 capture 仍 fail-closed
 检查遗留 `sp7-powerlab-hourly.timer/service`，防止旧部署污染 treatment。
 
-capture 中发生 trial/calibration、hard context 改变、media compatibility generation 改变、fixed-mode HWP
-改变、service mode 失真、短 suspend/resume 或遗留 scheduled-review unit 运行时，整个 run 标记 INVALID。
+formal capture 开始时不得有 active investigation、unresolved UnexpectedPower 或 Diagnostic Burst。capture 中
+发生 trial/calibration/investigation/UnexpectedPower、hard context 改变、media compatibility generation
+改变、Stage-E contract 改变、fixed-mode HWP 改变、service mode 失真、非 thermal Control Safety interruption、
+短 suspend/resume 或遗留 scheduled-review unit 运行时，整个 run 标记 INVALID。
 
 用于 STABLE readiness 的 Dynamic 结果必须来自一个显式 bounded validation campaign、同一个 hard
 evidence epoch、同一个 fixed baseline content hash，并通过完整 A1-B1-B2-A2 comparability gate。不能把
@@ -1011,8 +1023,12 @@ evidence epoch、同一个 fixed baseline content hash，并通过完整 A1-B1-B
 
 validation campaign 是有生命周期的 DB entity，不是可无限复用的字符串。campaign 从 OPEN 开始，
 固定 hard/battery/calibration/semantics context 与 fixed baseline identity；超过 `max_campaign_span_seconds`
-或 context/baseline/media generation/Stage-E-code identity 变化时 INVALID。一个有效 Dynamic comparison
+或 context/baseline/media generation/Stage-E-contract identity 变化时 INVALID。一个有效 Dynamic comparison
 完成后自动 COMPLETE/CLOSED，禁止继续往旧 campaign 塞新结果。
+
+campaign COMPLETE 不是永久证书。每次 Net Benefit summary / StableReadiness 都必须把 tested Stage-E
+contract identity 与**当前** contract identity 比较，并现场刷新 browser/Mesa media generation；任一变化，
+旧结果只保留作历史，不继续背书 STABLE。
 
 最终复杂度选择只问一个问题：
 
@@ -1030,7 +1046,10 @@ Dynamic Controller 的两个独立 paired block 是否都至少节省一个 prac
 STABLE 对 Dynamic 必须同时验证 selected policy fingerprint 与实际 Level-1 runtime mode。对 FIXED_GOOD
 不使用 stale heartbeat 推断物理状态，而是在每次 `agent-context` / `lifecycle readiness` / `freeze` 运行
 one-shot audit：main service inactive、thermald active、无 ownership conflict、live hard identity 与当前
-evidence epoch 一致、fixed baseline 仍 VERIFIED/hash 匹配、actual HWP snapshot 匹配 envelope。
+evidence epoch 一致、现场 media compatibility 仍匹配、fixed baseline 仍 VERIFIED/hash 匹配、actual HWP
+snapshot 匹配 envelope。若 FIXED_GOOD 是最终 selected runtime，还必须证明 main service 已 disabled、
+`sp7-powerlab-fixed.service` 已 enabled，并且持久 selection 绑定当前 epoch/baseline；login/reboot 时由该
+oneshot 重应用 fixed envelope 后退出。
 
 允许结论：
 

@@ -6,8 +6,9 @@
 bash scripts/install-user-services.sh
 ~~~
 
-安装用户级 `sp7-powerlab.service`。旧的 scheduled review hourly service/timer 已删除；installer 会停止并
-移除遗留 unit。
+安装用户级 `sp7-powerlab.service` 和最小 `sp7-powerlab-fixed.service` oneshot。旧的 scheduled review
+hourly service/timer 已删除；installer 会停止并移除遗留 unit。fixed oneshot 只有 selected runtime 已经
+切到 FIXED_GOOD 时才 enable；重新运行 installer 会保留此前 Dynamic/Fixed 选择，不会无条件重新启用主 daemon。
 
 主 service 负责 telemetry、demand、thermal、controller、trial tick、UnexpectedPower
 detection，以及在 automation level 3+ 下受 gate 约束的 Candidate Scheduler。
@@ -28,9 +29,21 @@ bash scripts/install-root-helper.sh
 3. systemd root service 只执行该副本。
 4. Unix socket 只允许安装时的目标 UID。
 5. helper 只暴露 inspect/snapshot/apply/restore HWP 操作。
-6. helper 不保留 CAP_SYS_ADMIN，CapabilityBoundingSet 和 AmbientCapabilities 均为空。
+6. `inspect` 暴露 protocol version 和当前 `helper.py + actuators/hwp.py` implementation identity。
+7. helper 不保留 CAP_SYS_ADMIN，CapabilityBoundingSet 和 AmbientCapabilities 均为空。
 
 日常 Git checkout 的修改不会自动变成 root 代码。
+
+因此修改 `helper.py` / `actuators/hwp.py` 或升级包含它们的新提交后，必须重新运行：
+
+~~~bash
+bash scripts/install-root-helper.sh
+~~~
+
+主 runtime 会把 socket helper 的 protocol/implementation identity 与当前源码计算值比较。两边不一致时
+直接保持 READ_ONLY / `root-helper-mismatch`；不兼容旧 root wheel，也不会把旧 helper 当成当前 actuator。
+`install-root-helper.sh` 完成更新后，如果 persistent fixed-good oneshot 已启用，会自动 restart 该 user unit，
+确保新的 matching helper 真正重新应用 selected fixed envelope。
 
 主 service 每次 hardware-contract refresh 都会重新 discovery/bind actuator。若 user service 启动时
 root helper 尚未就绪，PowerLab 会先保持 READ_ONLY；helper 稍后恢复后不需要重启 user service，
@@ -50,10 +63,12 @@ status 78，user systemd unit 的 `RestartPreventExitStatus=78` 会阻止 5 秒�
 
 ~~~bash
 sp7-powerlab reset-runtime --yes
-systemctl --user restart sp7-powerlab.service
+systemctl --user disable --now sp7-powerlab-fixed.service 2>/dev/null || true
+systemctl --user enable --now sp7-powerlab.service
 ~~~
 
-这是破坏式 reset；不要自动兜底删除 runtime。
+这是破坏式 reset；不要自动兜底删除 runtime。旧 DB 中的 fixed-good selection 也会被删除，因此必须显式
+关闭 fixed oneshot 并回到 main service，重新从新 schema/current evidence 建立验证后再选择最终 runtime。
 
 在非 SP7 开发机或纯仓库工程任务中，本地 runtime DB 过旧不等于必须 reset。只有任务确实针对该
 runtime，且用户明确允许丢弃旧数据时，才执行上述破坏式操作。不要为了让开发环境的

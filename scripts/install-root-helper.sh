@@ -32,4 +32,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now sp7-powerlab-root-helper.service
 sudo systemctl --no-pager status sp7-powerlab-root-helper.service || true
 
+# If fixed-good is the selected persistent user runtime, a helper wheel update may
+# have made the previous oneshot attempt fail its implementation-identity gate.
+# Re-run the enabled oneshot now that the matching root helper is live.
+if systemctl --user is-enabled --quiet sp7-powerlab-fixed.service 2>/dev/null; then
+  systemctl --user restart sp7-powerlab-fixed.service
+fi
+
 echo "Installed root-owned restricted HWP helper at $HELPER_ROOT"

@@ -61,7 +61,7 @@ DEFAULTS: dict[str, Any] = {
         "max_sustained_compute_delta": 0.10,
     },
     "evidence": {
-        "semantics_version": 8,
+        "semantics_version": 9,
         "practical_threshold_w": 0.10,
         "min_crossover_episodes": 2,
         "medium_effect_min_crossover_episodes": 3,
@@ -83,7 +83,7 @@ DEFAULTS: dict[str, Any] = {
         "max_media_fraction_delta": 0.10,
         "max_remote_fraction_delta": 0.10,
         "max_network_mbps_delta": 5.0,
-        "max_mean_temp_delta_c": 5.0,
+        "max_candidate_temp_worsening_c": 5.0,
         "max_reference_drift_w": 0.30,
         "max_candidate_delta_spread_w": 0.30,
         "max_interblock_gap_seconds": 900.0,
@@ -117,9 +117,6 @@ DEFAULTS: dict[str, Any] = {
     "helper": {
         "socket": "/run/sp7-powerlab/helper.sock",
         "enabled": True,
-    },
-    "minimal_meter": {
-        "sample_seconds": 60.0,
     },
     "scheduler": {
         "min_noise_windows": 8,
