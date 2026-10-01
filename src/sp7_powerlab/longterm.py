@@ -7,7 +7,11 @@ from typing import Any
 
 from .config import Config
 from .evidence import reference_strata_key
-from .measurement import measurement_energy_summary, measurement_trust_matches_epoch
+from .measurement import (
+    contiguous_discharge_segments,
+    measurement_energy_summary,
+    measurement_trust_matches_epoch,
+)
 from .storage import Database
 
 NET_BENEFIT_MODES = (
@@ -111,6 +115,7 @@ def assess_net_benefit(
         run
         for run in runs
         if run.get("end_ts") is not None
+        and (run.get("result") or {}).get("comparison_quality") == "OK"
         and (
             evidence_epoch_id is None
             or str(((run.get("result") or {}).get("evidence_epoch_id")) or "")
@@ -375,24 +380,66 @@ def summarize_minimal_meter_samples(
     rows: list[dict[str, Any]],
     *,
     max_gap_seconds: float = 90.0,
+    max_consistency_ratio: float = 0.35,
+    max_consistency_abs_wh: float = 0.05,
 ) -> dict[str, Any]:
     summary = measurement_energy_summary(
         rows,
         max_gap_seconds=max_gap_seconds,
-        max_consistency_ratio=1.0,
-        max_consistency_abs_wh=999.0,
+        max_consistency_ratio=max_consistency_ratio,
+        max_consistency_abs_wh=max_consistency_abs_wh,
     )
+    segment_summaries = [
+        measurement_energy_summary(
+            segment,
+            max_gap_seconds=max_gap_seconds,
+            max_consistency_ratio=max_consistency_ratio,
+            max_consistency_abs_wh=max_consistency_abs_wh,
+        )
+        for segment in contiguous_discharge_segments(
+            rows,
+            max_gap_seconds=max_gap_seconds,
+        )
+    ]
+    consistency_reasons: list[str] = []
+    if summary.get("integrated_energy_wh") is None or float(summary.get("energy_valid_seconds") or 0) <= 0:
+        consistency_reasons.append("no_valid_discharging_energy")
+    if any(item.get("consistency_status") == "MISMATCH" for item in segment_summaries):
+        consistency_reasons.append("battery_energy_consistency_mismatch")
+    if any(
+        item.get("consistency_status") == "ENERGY_DELTA_UNAVAILABLE" for item in segment_summaries
+    ):
+        consistency_reasons.append("battery_energy_delta_unavailable")
+    consistent_segments = [
+        item for item in segment_summaries if item.get("consistency_status") == "CONSISTENT"
+    ]
+    if not consistent_segments:
+        consistency_reasons.append("no_consistent_energy_segment")
+
     powers = [
         float(row["battery_power_w"])
         for row in rows
         if row.get("battery_status") == "Discharging"
         and isinstance(row.get("battery_power_w"), (int, float))
+        and not row.get("resume_grace")
     ]
+    integrated = summary.get("integrated_energy_wh")
+    valid_seconds = float(summary.get("energy_valid_seconds") or 0.0)
+    mean_power = (
+        float(integrated) * 3600.0 / valid_seconds
+        if isinstance(integrated, (int, float)) and valid_seconds > 0
+        else None
+    )
     summary.update(
         {
             "sample_count": len(rows),
             "median_power_w": statistics.median(powers) if powers else None,
-            "mean_power_w": statistics.fmean(powers) if powers else None,
+            "mean_power_w": mean_power,
+            "data_quality": "OK" if not consistency_reasons else "DATA_QUALITY_FAILURE",
+            "data_quality_reasons": consistency_reasons,
+            "consistency_segment_count": len(segment_summaries),
+            "consistent_segment_count": len(consistent_segments),
+            "consistency_segments": segment_summaries,
         }
     )
     return summary
@@ -404,21 +451,34 @@ def compare_meter_runs(
     *,
     usable_battery_wh: float | None = None,
     max_gap_seconds: float = 90.0,
+    max_consistency_ratio: float = 0.35,
+    max_consistency_abs_wh: float = 0.05,
 ) -> dict[str, Any]:
     reference = summarize_minimal_meter_samples(
         reference_rows,
         max_gap_seconds=max_gap_seconds,
+        max_consistency_ratio=max_consistency_ratio,
+        max_consistency_abs_wh=max_consistency_abs_wh,
     )
     candidate = summarize_minimal_meter_samples(
         candidate_rows,
         max_gap_seconds=max_gap_seconds,
+        max_consistency_ratio=max_consistency_ratio,
+        max_consistency_abs_wh=max_consistency_abs_wh,
     )
+    quality_reasons: list[str] = []
+    if reference.get("data_quality") != "OK":
+        quality_reasons.append("reference_data_quality_failed")
+    if candidate.get("data_quality") != "OK":
+        quality_reasons.append("candidate_data_quality_failed")
     ref_power = reference.get("mean_power_w")
     cand_power = candidate.get("mean_power_w")
     delta_w = None
     delta_pct = None
     minutes = None
-    if isinstance(ref_power, (int, float)) and isinstance(cand_power, (int, float)):
+    if not quality_reasons and isinstance(ref_power, (int, float)) and isinstance(
+        cand_power, (int, float)
+    ):
         delta_w = float(cand_power) - float(ref_power)
         delta_pct = delta_w / float(ref_power) * 100.0 if ref_power else None
         if isinstance(usable_battery_wh, (int, float)):
@@ -433,4 +493,6 @@ def compare_meter_runs(
         "candidate_minus_reference_w": delta_w,
         "candidate_minus_reference_percent": delta_pct,
         "minutes_gained_per_charge": minutes,
+        "comparison_quality": "OK" if not quality_reasons else "DATA_QUALITY_FAILURE",
+        "comparison_quality_reasons": quality_reasons,
     }

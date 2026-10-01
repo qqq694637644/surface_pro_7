@@ -127,7 +127,9 @@ sp7-powerlab evidence noise
 - recent decisions
 
 自然 reference/noise 只接受当前 evidence epoch 且同一分钟内 brightness bucket、envelope、
-media/active/remote 状态稳定的 rollup；混合分钟不会进入 frozen reference。
+media/active/remote 状态稳定的 rollup。整个窗口还必须保持 Discharging、无 resume grace、无超限
+sample gap、battery epoch 单一，并达到 minimum valid-discharge fraction；transitional/mixed 分钟
+不会进入 frozen reference/noise。
 
 如果旧 epoch 与当前环境不兼容，不要把历史 winner 直接当当前 winner。
 
@@ -295,6 +297,26 @@ sp7-powerlab lifecycle reopen --reason "confirmed regression"
 ~~~
 
 ## 17. Net Benefit
+
+正式 Net Benefit capture 不再接受任意旧 JSONL 后补 epoch/campaign 标签。每次采集开始时就绑定
+current evidence epoch、battery identity/epoch、hard fingerprint、calibration、campaign 和 mode：
+
+~~~bash
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FULL_POWERLAB --count 60
+~~~
+
+每次 capture 会输出 `meter-...` run id。比较使用 run id，并要求 provenance 匹配：
+
+~~~bash
+sp7-powerlab overhead compare meter-fixed meter-monitoring
+sp7-powerlab overhead compare meter-fixed meter-dynamic
+sp7-powerlab overhead compare meter-fixed meter-full
+~~~
+
+任一 run 的 BAT consistency/data quality 失败时不会产生可用于 STABLE 的有效 delta。
 
 历史：
 

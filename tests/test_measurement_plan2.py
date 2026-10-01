@@ -55,7 +55,7 @@ def test_static_energy_gauge_is_recorded_as_quantized_not_fake_mismatch():
     ]
     summary = measurement_energy_summary(rows, max_gap_seconds=45)
     assert summary["data_quality"] == "OK"
-    assert summary["consistency_status"] == "UNAVAILABLE_OR_QUANTIZED"
+    assert summary["consistency_status"] == "UNAVAILABLE_QUANTIZED"
 
 
 def test_gauge_characterization_derives_minimum_arm_duration():
@@ -88,12 +88,7 @@ def test_gauge_characterization_records_power_quantization_and_cadence():
 
 
 def test_measurement_trust_derives_go_no_go_and_recommended_arm_duration():
-    rows = [
-        row(0, 5.0, 30.0),
-        row(60, 5.0, 29.9),
-        row(120, 5.0, 29.9),
-        row(180, 5.0, 29.8),
-    ]
+    rows = [row(ts, 5.0, 30.0 - 5.0 * ts / 3600.0) for ts in range(0, 1201, 60)]
     result = assess_measurement_trust(
         rows,
         min_samples=3,
@@ -103,7 +98,11 @@ def test_measurement_trust_derives_go_no_go_and_recommended_arm_duration():
         max_gap_seconds=90,
     )
     assert result["status"] == "READY"
-    assert abs(result["recommended_min_arm_seconds"] - 576.0) < 1e-9
+    assert abs(result["recommended_min_arm_seconds"] - 480.0) < 1e-9
+    assert len(result["consistency_windows"]) >= 2
+    assert all(
+        item["consistency_status"] == "CONSISTENT" for item in result["consistency_windows"]
+    )
 
     blocked = assess_measurement_trust(
         rows[:2],
@@ -155,6 +154,32 @@ def test_measurement_trust_does_not_reconnect_across_resume_grace():
     assert result["observation_seconds"] == 0.0
 
 
+def test_measurement_trust_requires_segment_level_battery_consistency():
+    rows = [
+        row(0, 5.0, 30.00),
+        row(60, 5.0, 29.99),
+        row(120, 5.0, 29.99, status="Charging"),
+        row(180, 5.0, 29.98),
+        row(240, 5.0, 29.97),
+    ]
+    result = assess_measurement_trust(
+        rows,
+        min_samples=4,
+        min_observation_seconds=120,
+        configured_min_arm_seconds=60,
+        energy_quantum_multiplier=1.0,
+        max_gap_seconds=90,
+        max_consistency_ratio=0.35,
+        max_consistency_abs_wh=0.01,
+        min_consistency_windows=2,
+    )
+    assert result["status"] == "BLOCKED"
+    assert "battery_energy_consistency_failed" in result["reasons"]
+    assert result["energy_quality"]["consistency_status"] == "DISCONTINUOUS_OBSERVATION"
+    assert len(result["consistency_windows"]) == 2
+    assert all(item["consistency_status"] == "MISMATCH" for item in result["consistency_windows"])
+
+
 def test_gauge_quantum_uses_robust_repeated_step_not_single_jitter():
     rows = [
         row(0, 5.0, 30.000),
@@ -181,5 +206,5 @@ def test_long_trusted_arm_requires_energy_endpoint_delta():
         max_gap_seconds=90,
         require_energy_delta=True,
     )
-    assert summary["consistency_status"] == "UNAVAILABLE_OR_QUANTIZED"
+    assert summary["consistency_status"] == "UNAVAILABLE_QUANTIZED"
     assert summary["data_quality"] == "DATA_QUALITY_FAILURE"

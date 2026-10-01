@@ -239,6 +239,7 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
                 run_id,
                 {
                     "candidate_minus_reference_w": -0.1,
+                    "comparison_quality": "OK",
                     "evidence_epoch_id": epoch,
                     "campaign_id": "stable-campaign",
                 },
@@ -257,7 +258,7 @@ def _completed_run(mode: str, delta_w: float, ts: float) -> dict:
         "start_ts": ts - 60,
         "end_ts": ts,
         "mode": mode,
-        "result": {"candidate_minus_reference_w": delta_w},
+        "result": {"candidate_minus_reference_w": delta_w, "comparison_quality": "OK"},
     }
 
 
@@ -359,6 +360,7 @@ def test_net_benefit_filters_runs_by_current_evidence_epoch():
             **_completed_run("MONITORING_OVERHEAD", 0.01, 100),
             "result": {
                 "candidate_minus_reference_w": 0.01,
+                "comparison_quality": "OK",
                 "evidence_epoch_id": "old",
             },
         },
@@ -366,6 +368,7 @@ def test_net_benefit_filters_runs_by_current_evidence_epoch():
             **_completed_run("DYNAMIC_CONTROLLER", -0.2, 110),
             "result": {
                 "candidate_minus_reference_w": -0.2,
+                "comparison_quality": "OK",
                 "evidence_epoch_id": "old",
             },
         },
@@ -373,6 +376,7 @@ def test_net_benefit_filters_runs_by_current_evidence_epoch():
             **_completed_run("FULL_POWERLAB", -0.2, 120),
             "result": {
                 "candidate_minus_reference_w": -0.2,
+                "comparison_quality": "OK",
                 "evidence_epoch_id": "old",
             },
         },
@@ -392,6 +396,7 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
             **_completed_run("MONITORING_OVERHEAD", 0.01, 100),
             "result": {
                 "candidate_minus_reference_w": 0.01,
+                "comparison_quality": "OK",
                 "evidence_epoch_id": "current",
                 "campaign_id": "a",
             },
@@ -400,6 +405,7 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
             **_completed_run("DYNAMIC_CONTROLLER", -0.2, 110),
             "result": {
                 "candidate_minus_reference_w": -0.2,
+                "comparison_quality": "OK",
                 "evidence_epoch_id": "current",
                 "campaign_id": "b",
             },
@@ -408,6 +414,7 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
             **_completed_run("FULL_POWERLAB", -0.2, 120),
             "result": {
                 "candidate_minus_reference_w": -0.2,
+                "comparison_quality": "OK",
                 "evidence_epoch_id": "current",
                 "campaign_id": "c",
             },
@@ -420,3 +427,29 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
     )
     assert result["complete"] is False
     assert result["campaign_id"] is None
+
+
+def test_meter_comparison_uses_time_weighted_power_and_fails_closed_on_mismatch():
+    reference = [
+        meter_row(0, 4.0, 40.0),
+        meter_row(30, 4.0, 40.0 - 4.0 * 30 / 3600.0),
+        meter_row(120, 8.0, 40.0 - (4.0 * 30 + 8.0 * 90) / 3600.0),
+    ]
+    candidate = [
+        meter_row(0, 5.0, 40.0),
+        meter_row(30, 5.0, 40.0 - 5.0 * 30 / 3600.0),
+        meter_row(120, 5.0, 40.0 - 5.0 * 120 / 3600.0),
+    ]
+    result = compare_meter_runs(reference, candidate, max_gap_seconds=120.0)
+    assert result["comparison_quality"] == "OK"
+    assert abs(result["reference"]["mean_power_w"] - 5.5) < 1e-9
+    assert abs(result["candidate_minus_reference_w"] + 0.5) < 1e-9
+
+    mismatched = [
+        meter_row(0, 5.0, 40.0),
+        meter_row(60, 5.0, 39.99),
+        meter_row(120, 5.0, 39.98),
+    ]
+    failed = compare_meter_runs(reference, mismatched, max_gap_seconds=120.0)
+    assert failed["comparison_quality"] == "DATA_QUALITY_FAILURE"
+    assert failed["candidate_minus_reference_w"] is None

@@ -65,7 +65,7 @@ def test_agent_context_is_compact_runtime_truth_entrypoint(
         after_runs = db.conn.execute("SELECT COUNT(*) FROM llm_runs").fetchone()[0]
 
         assert before_runs == after_runs
-        assert context["project"]["runtime_schema"] == 5
+        assert context["project"]["runtime_schema"] == 6
         assert context["project"]["git"]["commit"] == "abc123"
         assert context["documentation"]["ai_entry"] == "AGENTS.md"
         assert context["documentation"]["design_contract"] == "PLAN2.md"

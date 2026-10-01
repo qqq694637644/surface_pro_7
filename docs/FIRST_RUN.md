@@ -124,8 +124,11 @@ Measurement Trust = READY
 - power_now cadence/quantization
 - BAT integration
 - energy delta
-- consistency
+- contiguous valid-discharge window consistency
 - minimum arm duration
+
+长时间观察可以被 Charging/suspend/resume 打断，但 READY 必须来自足够长的连续 Discharging
+window 的真实 integration-vs-energy consistency；多个短放电片段累计够时长不能替代这个检查。
 
 如果仍 BLOCKED：
 
@@ -327,7 +330,8 @@ sp7-powerlab lifecycle freeze --reason "real usage coverage and net benefit vali
 
 ## 14. PowerLab 本身的 Net Benefit
 
-用 sp7-powerlab-meter 分别记录可比较条件。
+用 sp7-powerlab-meter 分别记录可比较条件。capture 开始时就固定 battery/evidence epoch、hard
+fingerprint、calibration、campaign 和 mode；旧 JSONL 不能在比较时补贴成当前 epoch。
 
 至少比较：
 
@@ -336,23 +340,27 @@ sp7-powerlab lifecycle freeze --reason "real usage coverage and net benefit vali
 - dynamic controller
 - full PowerLab
 
-然后：
+例如同一个 campaign 下分别 capture：
 
 ~~~bash
-sp7-powerlab overhead compare reference.jsonl monitoring.jsonl \
-  --mode MONITORING_OVERHEAD --campaign sp7-net-benefit-01
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FULL_POWERLAB --count 60
+~~~
 
-sp7-powerlab overhead compare reference.jsonl dynamic.jsonl \
-  --mode DYNAMIC_CONTROLLER --campaign sp7-net-benefit-01
+记录四次输出的 `meter-...` run id，然后：
 
-sp7-powerlab overhead compare reference.jsonl full.jsonl \
-  --mode FULL_POWERLAB --campaign sp7-net-benefit-01
+~~~bash
+sp7-powerlab overhead compare meter-fixed meter-monitoring
+sp7-powerlab overhead compare meter-fixed meter-dynamic
+sp7-powerlab overhead compare meter-fixed meter-full
 
 sp7-powerlab overhead summary
 ~~~
 
-三个 mode 必须来自同一个 current evidence epoch，并使用同一个 campaign 名称；否则不会作为
-一组完整 Net Benefit evidence 让 STABLE readiness 通过。
+三个 comparison 必须来自同一个 current evidence epoch、同一个 battery/hard/calibration context，
+并使用同一个 campaign 名称；否则不会作为一组完整 Net Benefit evidence 让 STABLE readiness 通过。
 
 如果结果建议 FIXED_GOOD_ENVELOPE，就不要因为项目已经复杂而强行保留动态系统。
 

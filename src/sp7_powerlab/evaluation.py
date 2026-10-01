@@ -3,7 +3,7 @@ from __future__ import annotations
 import statistics
 from typing import Any
 
-from .measurement import measurement_energy_summary
+from .measurement import measurement_energy_summary, valid_discharge_interval_seconds
 
 
 def percentile(values: list[float], p: float) -> float | None:
@@ -24,17 +24,13 @@ def valid_duration(rows: list[dict[str, Any]], max_gap_seconds: float) -> float:
         return 0.0
     total = 0.0
     for previous, current in zip(rows, rows[1:], strict=False):
-        dt = float(current["ts"]) - float(previous["ts"])
-        if not (0 < dt <= max_gap_seconds):
-            continue
-        if (
-            previous.get("battery_status") != "Discharging"
-            or current.get("battery_status") != "Discharging"
-            or previous.get("resume_grace")
-            or current.get("resume_grace")
-        ):
-            continue
-        total += dt
+        dt = valid_discharge_interval_seconds(
+            previous,
+            current,
+            max_gap_seconds=max_gap_seconds,
+        )
+        if dt is not None:
+            total += dt
     return total
 
 

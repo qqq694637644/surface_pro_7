@@ -642,6 +642,15 @@ def cmd_evidence_trust(args: argparse.Namespace) -> int:
             configured_min_arm_seconds=float(config.get("experiments.min_block_seconds", 300.0)),
             energy_quantum_multiplier=float(config.get("evidence.gauge_quantum_multiplier", 8.0)),
             max_gap_seconds=float(config.get("collector.max_gap_seconds", 45.0)),
+            max_consistency_ratio=float(
+                config.get("evidence.max_energy_consistency_ratio", 0.35)
+            ),
+            max_consistency_abs_wh=float(
+                config.get("evidence.max_energy_consistency_abs_wh", 0.05)
+            ),
+            min_consistency_windows=int(
+                config.get("evidence.measurement_min_consistency_windows", 2)
+            ),
         )
         machine = load_machine(ROOT)
         calibration = machine.get("calibration") or {}
@@ -682,49 +691,92 @@ def cmd_evidence_trust(args: argparse.Namespace) -> int:
     return 0
 
 
-def _read_meter_jsonl(path: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    source = Path(path).expanduser()
-    for line_number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"{source}:{line_number}: invalid JSON: {exc}") from exc
-        if not isinstance(value, dict):
-            raise SystemExit(f"{source}:{line_number}: expected JSON object")
-        rows.append(value)
-    return rows
+NET_BENEFIT_CAPTURE_MODES = {
+    "MONITORING": "MONITORING_OVERHEAD",
+    "DYNAMIC_CONTROLLER": "DYNAMIC_CONTROLLER",
+    "FULL_POWERLAB": "FULL_POWERLAB",
+}
+
+
+def _meter_pair(db: Database, reference_id: str, candidate_id: str) -> tuple[dict[str, Any], dict[str, Any], str]:
+    reference = db.minimal_meter_run(reference_id)
+    candidate = db.minimal_meter_run(candidate_id)
+    if not reference:
+        raise SystemExit(f"unknown MinimalMeter reference run: {reference_id}")
+    if not candidate:
+        raise SystemExit(f"unknown MinimalMeter candidate run: {candidate_id}")
+    if reference.get("status") != "COMPLETE" or candidate.get("status") != "COMPLETE":
+        raise SystemExit("Net Benefit comparison requires two COMPLETE MinimalMeter runs")
+    if reference.get("capture_mode") != "FIXED_GOOD":
+        raise SystemExit("reference MinimalMeter run must use capture mode FIXED_GOOD")
+    candidate_mode = str(candidate.get("capture_mode") or "")
+    result_mode = NET_BENEFIT_CAPTURE_MODES.get(candidate_mode)
+    if result_mode is None:
+        raise SystemExit(
+            "candidate MinimalMeter run must use MONITORING, DYNAMIC_CONTROLLER, or FULL_POWERLAB"
+        )
+
+    provenance_fields = (
+        "campaign_id",
+        "evidence_epoch_id",
+        "battery_epoch",
+        "battery_identity_hash",
+        "hard_identity_hash",
+        "calibration_version",
+        "evidence_semantics_version",
+    )
+    mismatched = [field for field in provenance_fields if reference.get(field) != candidate.get(field)]
+    if mismatched:
+        raise SystemExit(
+            "MinimalMeter provenance mismatch: " + ", ".join(sorted(mismatched))
+        )
+    if candidate_mode == "MONITORING" and reference.get("envelope") != candidate.get("envelope"):
+        raise SystemExit("monitoring overhead comparison requires the same fixed verified envelope")
+
+    active_epoch = db.active_evidence_epoch()
+    if not active_epoch or str(active_epoch.get("epoch_id") or "") != str(
+        candidate.get("evidence_epoch_id") or ""
+    ):
+        raise SystemExit("MinimalMeter runs are not from the current evidence epoch")
+    return reference, candidate, result_mode
 
 
 def cmd_overhead_compare(args: argparse.Namespace) -> int:
     config, db = db_from_args(args)
     try:
-        reference_rows = _read_meter_jsonl(args.reference)
-        candidate_rows = _read_meter_jsonl(args.candidate)
+        reference, candidate, result_mode = _meter_pair(db, args.reference_run, args.candidate_run)
         result = compare_meter_runs(
-            reference_rows,
-            candidate_rows,
+            reference.get("samples") or [],
+            candidate.get("samples") or [],
             usable_battery_wh=args.usable_battery_wh,
             max_gap_seconds=float(args.max_gap_seconds),
+            max_consistency_ratio=float(
+                config.get("evidence.max_energy_consistency_ratio", 0.35)
+            ),
+            max_consistency_abs_wh=float(
+                config.get("evidence.max_energy_consistency_abs_wh", 0.05)
+            ),
         )
-        epoch = db.active_evidence_epoch()
         result = {
             **result,
-            "campaign_id": args.campaign,
-            "evidence_epoch_id": (epoch or {}).get("epoch_id"),
-            "battery_epoch": (epoch or {}).get("battery_epoch"),
-            "calibration_version": (epoch or {}).get("calibration_version"),
+            "reference_run_id": reference["run_id"],
+            "candidate_run_id": candidate["run_id"],
+            "campaign_id": candidate["campaign_id"],
+            "evidence_epoch_id": candidate["evidence_epoch_id"],
+            "battery_epoch": candidate["battery_epoch"],
+            "battery_identity_hash": candidate["battery_identity_hash"],
+            "hard_identity_hash": candidate["hard_identity_hash"],
+            "calibration_version": candidate["calibration_version"],
+            "evidence_semantics_version": candidate["evidence_semantics_version"],
         }
         run_id = db.start_monitoring_overhead_run(
-            mode=args.mode,
+            mode=result_mode,
             payload={
-                "reference": str(Path(args.reference).expanduser()),
-                "candidate": str(Path(args.candidate).expanduser()),
+                "reference_run_id": reference["run_id"],
+                "candidate_run_id": candidate["run_id"],
                 "usable_battery_wh": args.usable_battery_wh,
-                "mode": args.mode,
-                "campaign_id": args.campaign,
+                "mode": result_mode,
+                "campaign_id": candidate["campaign_id"],
             },
         )
         db.finish_monitoring_overhead_run(run_id, result)
@@ -1220,16 +1272,10 @@ def parser() -> argparse.ArgumentParser:
     overhead = sub.add_parser("overhead")
     overhead_sub = overhead.add_subparsers(dest="overhead_command", required=True)
     overhead_compare = overhead_sub.add_parser("compare")
-    overhead_compare.add_argument("reference")
-    overhead_compare.add_argument("candidate")
+    overhead_compare.add_argument("reference_run")
+    overhead_compare.add_argument("candidate_run")
     overhead_compare.add_argument("--usable-battery-wh", type=float)
     overhead_compare.add_argument("--max-gap-seconds", type=float, default=90.0)
-    overhead_compare.add_argument("--campaign", required=True)
-    overhead_compare.add_argument(
-        "--mode",
-        choices=("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB"),
-        default="MONITORING_OVERHEAD",
-    )
     overhead_compare.set_defaults(func=cmd_overhead_compare)
     overhead_history = overhead_sub.add_parser("history")
     overhead_history.add_argument("--limit", type=int, default=20)

@@ -392,6 +392,74 @@ def test_rollup_with_mixed_envelope_and_brightness_is_not_reference_eligible(
         db.close()
 
 
+def test_rollup_with_charging_transition_is_not_reference_eligible(project_root: Path):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/charging-rollup.sqlite3")
+    lifecycle = LifecycleManager(db)
+    epoch = db.ensure_evidence_epoch(
+        hard_identity_hash="fp",
+        battery_epoch=1,
+        calibration_version=1,
+        evidence_semantics_version=1,
+        payload={},
+    )
+    service = object.__new__(PowerLabService)
+    service.root = project_root
+    service.config = config
+    service.db = db
+    service.stack = {
+        "fingerprint": "fp",
+        "noise": SimpleNamespace(observe_rollup=lambda *_args, **_kwargs: None),
+        "drift": SimpleNamespace(detect=lambda *_args, **_kwargs: None),
+        "unexpected_power": SimpleNamespace(detect=lambda *_args, **_kwargs: None),
+        "lifecycle": lifecycle,
+        "collector": SimpleNamespace(trigger_diagnostic_burst=lambda: None),
+    }
+    try:
+        common = {
+            "wall_ts": "x",
+            "battery_pct": 80,
+            "battery_power_w": 5.0,
+            "battery_energy_wh": 30.0,
+            "battery_epoch": 1,
+            "brightness_pct": 40,
+            "cpu_psi": 0.1,
+            "io_psi": 0.1,
+            "rapl_power_60s_w": 2.0,
+            "thermal_pressure": 0.1,
+            "thermal_state": "COOL",
+            "demand_region": "ACTIVE|LAT_MEDIUM|CPU_LOW|NO_MEDIA|NET_LOW|LOCAL",
+            "local_compute_pressure": "LOW",
+            "media_playing": False,
+            "user_active": True,
+            "remote_hint": 0.0,
+            "network_rx_mbps": 0.0,
+            "network_tx_mbps": 0.0,
+            "evidence_epoch": epoch,
+            "resume_grace": False,
+            "current_envelope": "INTERACTIVE_EFFICIENT",
+        }
+        for ts, status in (
+            (0, "Discharging"),
+            (10, "Discharging"),
+            (20, "Charging"),
+            (30, "Charging"),
+            (40, "Discharging"),
+            (50, "Discharging"),
+        ):
+            db.add_sample({**common, "ts": float(ts), "battery_status": status})
+
+        result = service._rollup(0.0, 50.0)
+        assert result is not None
+        assert result["reference_eligible"] is False
+        assert result["valid_seconds"] == 20.0
+        assert abs(result["valid_fraction"] - (20.0 / 60.0)) < 1e-9
+        assert "power_source_not_all_discharging" in result["reference_ineligible_reasons"]
+        assert "insufficient_valid_discharge_fraction" in result["reference_ineligible_reasons"]
+    finally:
+        db.close()
+
+
 def test_hard_epoch_change_invalidates_trust_and_exits_stable(project_root: Path):
     config = load_config(project_root)
     db = Database(project_root / "runtime/epoch-transition.sqlite3")

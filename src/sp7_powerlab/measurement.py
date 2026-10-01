@@ -9,7 +9,7 @@ from typing import Any
 from .hardware import battery_directory
 
 
-def _valid_interval(
+def valid_discharge_interval_seconds(
     previous: dict[str, Any],
     current: dict[str, Any],
     *,
@@ -43,6 +43,55 @@ def _valid_interval(
     return dt
 
 
+def contiguous_discharge_segments(
+    rows: list[dict[str, Any]],
+    *,
+    max_gap_seconds: float,
+) -> list[list[dict[str, Any]]]:
+    segments: list[list[dict[str, Any]]] = []
+    current_segment: list[dict[str, Any]] = []
+    for previous, current in zip(rows, rows[1:], strict=False):
+        valid = valid_discharge_interval_seconds(
+            previous,
+            current,
+            max_gap_seconds=max_gap_seconds,
+        )
+        if valid is None:
+            if len(current_segment) >= 2:
+                segments.append(current_segment)
+            current_segment = []
+            continue
+        if not current_segment:
+            current_segment = [previous, current]
+        elif current_segment[-1] is previous:
+            current_segment.append(current)
+        else:
+            segments.append(current_segment)
+            current_segment = [previous, current]
+    if len(current_segment) >= 2:
+        segments.append(current_segment)
+    return segments
+
+
+def consistency_windows(
+    rows: list[dict[str, Any]],
+    *,
+    max_gap_seconds: float,
+    minimum_seconds: float,
+) -> list[list[dict[str, Any]]]:
+    windows: list[list[dict[str, Any]]] = []
+    required = max(float(minimum_seconds), 0.0)
+    for segment in contiguous_discharge_segments(rows, max_gap_seconds=max_gap_seconds):
+        start = 0
+        for index in range(1, len(segment)):
+            elapsed = float(segment[index]["ts"]) - float(segment[start]["ts"])
+            if elapsed + 1e-9 < required:
+                continue
+            windows.append(segment[start : index + 1])
+            start = index
+    return windows
+
+
 def integrate_battery_energy_wh(
     rows: list[dict[str, Any]],
     *,
@@ -51,7 +100,11 @@ def integrate_battery_energy_wh(
     energy_ws = 0.0
     valid_seconds = 0.0
     for previous, current in zip(rows, rows[1:], strict=False):
-        dt = _valid_interval(previous, current, max_gap_seconds=max_gap_seconds)
+        dt = valid_discharge_interval_seconds(
+            previous,
+            current,
+            max_gap_seconds=max_gap_seconds,
+        )
         if dt is None:
             continue
         left = previous.get("battery_power_w")
@@ -75,7 +128,14 @@ def battery_energy_delta_wh(
     if len(rows) < 2:
         return None
     for previous, current in zip(rows, rows[1:], strict=False):
-        if _valid_interval(previous, current, max_gap_seconds=max_gap_seconds) is None:
+        if (
+            valid_discharge_interval_seconds(
+                previous,
+                current,
+                max_gap_seconds=max_gap_seconds,
+            )
+            is None
+        ):
             return None
     first = rows[0].get("battery_energy_wh")
     last = rows[-1].get("battery_energy_wh")
@@ -103,15 +163,28 @@ def measurement_energy_summary(
     consistency_status = "UNAVAILABLE"
     quality = "OK"
 
+    discontinuous = any(
+        valid_discharge_interval_seconds(
+            previous,
+            current,
+            max_gap_seconds=max_gap_seconds,
+        )
+        is None
+        for previous, current in zip(rows, rows[1:], strict=False)
+    )
+
     if integrated is None:
         quality = "DATA_QUALITY_FAILURE"
         consistency_status = "NO_INTEGRATED_ENERGY"
-    elif delta is None or delta == 0:
+    elif delta is None:
+        consistency_status = (
+            "DISCONTINUOUS_OBSERVATION" if discontinuous else "ENERGY_DELTA_UNAVAILABLE"
+        )
+        if require_energy_delta:
+            quality = "DATA_QUALITY_FAILURE"
+    elif delta == 0:
         # A coarse fuel gauge can legitimately stay flat during a short arm.
-        # Treat power integration as usable but record that endpoint consistency
-        # could not be checked. Stage A gauge characterization determines how
-        # long future arms must be before endpoint delta is required.
-        consistency_status = "UNAVAILABLE_OR_QUANTIZED"
+        consistency_status = "UNAVAILABLE_QUANTIZED"
         if require_energy_delta:
             quality = "DATA_QUALITY_FAILURE"
     else:
@@ -148,7 +221,12 @@ def _positive_steps(
     for previous, current in zip(rows, rows[1:], strict=False):
         if (
             max_gap_seconds is not None
-            and _valid_interval(previous, current, max_gap_seconds=max_gap_seconds) is None
+            and valid_discharge_interval_seconds(
+                previous,
+                current,
+                max_gap_seconds=max_gap_seconds,
+            )
+            is None
         ):
             continue
         left = previous.get(key)
@@ -181,7 +259,7 @@ def _median_change_cadence(
         if (
             max_gap_seconds is not None
             and previous_row is not None
-            and _valid_interval(
+            and valid_discharge_interval_seconds(
                 previous_row,
                 row,
                 max_gap_seconds=max_gap_seconds,
@@ -271,6 +349,9 @@ def assess_measurement_trust(
     configured_min_arm_seconds: float,
     energy_quantum_multiplier: float,
     max_gap_seconds: float,
+    max_consistency_ratio: float = 0.35,
+    max_consistency_abs_wh: float = 0.05,
+    min_consistency_windows: int = 2,
 ) -> dict[str, Any]:
     discharge = [
         row
@@ -280,27 +361,53 @@ def assess_measurement_trust(
         and isinstance(row.get("battery_energy_wh"), (int, float))
         and not row.get("resume_grace")
     ]
-    powers = [float(row["battery_power_w"]) for row in discharge]
-    expected_power = statistics.fmean(powers) if powers else None
+    integrated, observed_seconds = integrate_battery_energy_wh(
+        rows,
+        max_gap_seconds=max_gap_seconds,
+    )
+    expected_power = (
+        float(integrated) * 3600.0 / observed_seconds
+        if isinstance(integrated, (int, float)) and observed_seconds > 0
+        else None
+    )
     gauge = characterize_battery_gauge(
         rows,
         expected_power_w=expected_power,
         energy_quantum_multiplier=energy_quantum_multiplier,
         max_gap_seconds=max_gap_seconds,
     )
-    _integrated, observed_seconds = integrate_battery_energy_wh(
-        rows,
-        max_gap_seconds=max_gap_seconds,
-    )
     energy_summary = measurement_energy_summary(
         rows,
         max_gap_seconds=max_gap_seconds,
+        max_consistency_ratio=max_consistency_ratio,
+        max_consistency_abs_wh=max_consistency_abs_wh,
     )
     quantum_arm = gauge.get("minimum_arm_seconds_from_quantum")
     recommended_min_arm_seconds = max(
         configured_min_arm_seconds,
         float(quantum_arm) if isinstance(quantum_arm, (int, float)) else 0.0,
     )
+    windows = consistency_windows(
+        rows,
+        max_gap_seconds=max_gap_seconds,
+        minimum_seconds=recommended_min_arm_seconds,
+    )
+    consistency_checks: list[dict[str, Any]] = []
+    for window in windows:
+        summary = measurement_energy_summary(
+            window,
+            max_gap_seconds=max_gap_seconds,
+            max_consistency_ratio=max_consistency_ratio,
+            max_consistency_abs_wh=max_consistency_abs_wh,
+            require_energy_delta=True,
+        )
+        consistency_checks.append(
+            {
+                "start_ts": float(window[0]["ts"]),
+                "end_ts": float(window[-1]["ts"]),
+                **summary,
+            }
+        )
 
     reasons: list[str] = []
     if len(discharge) < min_samples:
@@ -313,8 +420,10 @@ def assess_measurement_trust(
         reasons.append("battery_energy_quantum_not_observed")
     if gauge.get("minimum_arm_seconds_from_quantum") is None:
         reasons.append("minimum_arm_duration_not_resolved")
-    if energy_summary.get("data_quality") != "OK":
-        reasons.append("battery_energy_measurement_quality_failed")
+    if len(consistency_checks) < max(int(min_consistency_windows), 1):
+        reasons.append("insufficient_battery_consistency_windows")
+    if any(check.get("data_quality") != "OK" for check in consistency_checks):
+        reasons.append("battery_energy_consistency_failed")
 
     return {
         "status": "READY" if not reasons else "BLOCKED",
@@ -326,6 +435,9 @@ def assess_measurement_trust(
         "recommended_min_arm_seconds": recommended_min_arm_seconds,
         "gauge": gauge,
         "energy_quality": energy_summary,
+        "consistency_window_seconds": recommended_min_arm_seconds,
+        "required_consistency_windows": max(int(min_consistency_windows), 1),
+        "consistency_windows": consistency_checks,
     }
 
 

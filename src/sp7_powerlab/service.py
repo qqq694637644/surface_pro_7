@@ -422,9 +422,11 @@ class PowerLabService:
         rows = self.db.samples_between(bucket, end_ts)
         if len(rows) < 2:
             return None
+        max_gap_seconds = float(self.config.get("collector.max_gap_seconds", 45.0))
+        rollup_seconds = float(self.config.get("collector.rollup_seconds", 60.0))
         summary = self.db.summarize_samples(
             rows,
-            max_gap_seconds=float(self.config.get("collector.max_gap_seconds", 45.0)),
+            max_gap_seconds=max_gap_seconds,
         )
         demand_regions = {str(row.get("demand_region")) for row in rows if row.get("demand_region")}
         local_compute = {
@@ -467,6 +469,8 @@ class PowerLabService:
         evidence_epochs = {
             str(row.get("evidence_epoch")) if row.get("evidence_epoch") else None for row in rows
         }
+        battery_epochs = {row.get("battery_epoch") for row in rows}
+        battery_statuses = {row.get("battery_status") for row in rows}
         mixed_dimensions: list[str] = []
         for name, values in (
             ("brightness", brightness_buckets),
@@ -478,6 +482,27 @@ class PowerLabService:
         ):
             if len(values) != 1 or None in values:
                 mixed_dimensions.append(name)
+        valid_seconds = valid_duration(rows, max_gap_seconds)
+        valid_fraction = valid_seconds / rollup_seconds if rollup_seconds > 0 else 0.0
+        reference_ineligible_reasons: list[str] = []
+        if mixed_dimensions:
+            reference_ineligible_reasons.extend(f"mixed_{name}" for name in mixed_dimensions)
+        if battery_statuses != {"Discharging"}:
+            reference_ineligible_reasons.append("power_source_not_all_discharging")
+        if any(bool(row.get("resume_grace")) for row in rows):
+            reference_ineligible_reasons.append("resume_grace_present")
+        if len(battery_epochs) != 1 or None in battery_epochs:
+            reference_ineligible_reasons.append("mixed_battery_epoch")
+        if any(
+            not (0 < float(current["ts"]) - float(previous["ts"]) <= max_gap_seconds)
+            for previous, current in zip(rows, rows[1:], strict=False)
+        ):
+            reference_ineligible_reasons.append("sample_gap")
+        minimum_valid_fraction = float(
+            self.config.get("evidence.reference_min_valid_fraction", 0.80)
+        )
+        if valid_fraction + 1e-9 < minimum_valid_fraction:
+            reference_ineligible_reasons.append("insufficient_valid_discharge_fraction")
         first = rows[0]
         last = rows[-1]
         rollup = {
@@ -514,16 +539,15 @@ class PowerLabService:
                 if len(evidence_epochs) == 1 and None not in evidence_epochs
                 else None
             ),
-            "reference_eligible": not mixed_dimensions,
+            "reference_eligible": not reference_ineligible_reasons,
+            "reference_ineligible_reasons": reference_ineligible_reasons,
             "mixed_dimensions": mixed_dimensions,
             "trial_id": next(
                 (row.get("trial_id") for row in rows if row.get("trial_id")),
                 None,
             ),
-            "valid_seconds": valid_duration(
-                rows,
-                float(self.config.get("collector.max_gap_seconds", 45.0)),
-            ),
+            "valid_seconds": valid_seconds,
+            "valid_fraction": valid_fraction,
             "local_compute_pressure": (
                 next(iter(local_compute)) if len(local_compute) == 1 else "MIXED"
             ),

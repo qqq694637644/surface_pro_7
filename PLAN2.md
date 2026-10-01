@@ -143,6 +143,17 @@ UnexpectedPower / Drift
 
 `energy_now` endpoint delta 用于一致性检查。短窗口因 gauge 量化不变化时，不制造虚假精度。
 
+长时间 Stage A 观察可以包含 Charging、suspend/resume 或采样 gap，但这些边界必须把数据切成
+独立的 contiguous valid-discharge window。每个达到 gauge/config 最小时长的 window 单独比较：
+
+~~~
+integral(power_now)  vs  energy_now(first) - energy_now(last)
+~~~
+
+不能因为全局 observation 被打断、全局 endpoint delta 不可用，就只累计多个短 Discharging
+片段的 valid seconds 后宣布 Measurement Trust READY。READY 至少要求配置数量的可检查 window，
+且已检查 window 不得出现 consistency mismatch。
+
 Measurement Trust 输出：
 
 - READY
@@ -198,6 +209,11 @@ bounded_burst 用于短时 thermal inertia / RAPL / throttling 观察，不是 s
 > 最近自然波动有多大？
 
 用于 MUE、drift 和 experiment budget，可维护例如 24h / 7d / 30d。
+
+自然 Frozen Reference / Recent Noise 的输入必须比普通 usage telemetry 更干净：整个 rollup 内
+power source 保持 Discharging、没有 resume grace、没有超限 sample gap、battery/evidence epoch
+单一，并达到 minimum valid-discharge fraction。被 Charging/resume/gap 切碎的 transitional
+rollup 可以保留作普通 telemetry，但不能作为一个完整 reference/noise observation。
 
 ### 3.5 避免 bucket explosion
 
@@ -883,6 +899,15 @@ MinimalMeter + full PowerLab
 
 Net Benefit 直接来自 end-to-end comparison。
 
+MinimalMeter capture 的 provenance 必须在**采集开始时**固定并持久化，至少包括 run/campaign、
+capture mode、battery identity/epoch、hard evidence epoch/fingerprint、calibration version、evidence
+semantics 和起始 verified envelope。比较时只能读取 capture-time provenance；禁止读取“当前 epoch”
+后给旧采集文件事后贴标签。
+
+Net Benefit 使用 gap-aware integrated BAT energy / valid discharge duration 计算 time-weighted mean
+power。reference 或 candidate 的 BAT consistency / provenance / data-quality gate 失败时，不产生可供
+STABLE 使用的 `candidate_minus_reference_w`。
+
 用于 STABLE readiness 的 monitoring / dynamic / full 三种结果必须来自同一个 hard evidence
 epoch 和同一个显式 validation campaign，不能把不同周或不同系统条件下各自最新的一次结果拼成
 “完整比较”。
@@ -933,6 +958,7 @@ fixed-good 与复杂系统实际续航/UX 等价时，删掉复杂度是成功�
 - control/learning history
 - UnexpectedPower / investigation
 - monitoring / MinimalMeter runs
+- MinimalMeter capture provenance
 
 详细字段属于实现，不复制进 PLAN2。
 

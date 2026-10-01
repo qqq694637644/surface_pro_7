@@ -16,8 +16,8 @@ sp7-powerlab agent-context
 
 当前 runtime：
 
-- SQLite schema v5
-- evidence semantics v3
+- SQLite schema v6
+- evidence semantics v4
 - 旧 runtime schema fail-fast，不维护兼容迁移
 - AI 入口：AGENTS.md + sp7-powerlab agent-context
 - 设计合同：PLAN2.md
@@ -44,6 +44,8 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - energy_now delta
 - power/energy cadence 与 quantization
 - consistency gate
+- contiguous valid-discharge consistency windows
+- interrupted Stage A observation 不会用累计 valid seconds 绕过 BAT consistency
 - Measurement Trust READY/BLOCKED
 - gauge + empirical noise 约束 minimum arm duration
 - Scheduler 在 Measurement Trust 未准备好时禁止探索
@@ -84,6 +86,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 
 - FrozenReferenceBaseline
 - RecentNoiseDistribution
+- reference/noise rollup 要求 clean Discharging、无 resume/gap 且 valid fraction 达标
 - hard strata + comparison constraints
 - Minimum Useful Effect
 - ArmMeasurement
@@ -259,6 +262,8 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - trial/calibration 高密度采样
 - diagnostic burst
 - MinimalMeter end-to-end comparison
+- MinimalMeter capture-time provenance（epoch/battery/fingerprint/calibration/campaign/mode）
+- Net Benefit 使用 time-weighted integrated BAT power，并对 data quality fail-closed
 - KEEP_FULL_POWERLAB
 - KEEP_DYNAMIC_REDUCE_MONITORING
 - FIXED_GOOD_ENVELOPE

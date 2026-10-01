@@ -8,7 +8,9 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+from .measurement import valid_discharge_interval_seconds
+
+SCHEMA_VERSION = 6
 
 ACTIVE_TRIAL_STATES = {
     "PROPOSED",
@@ -87,7 +89,9 @@ DDL = [
         system_fingerprint TEXT,
         current_envelope TEXT,
         reference_eligible INTEGER NOT NULL,
+        reference_ineligible_reasons_json TEXT NOT NULL,
         valid_seconds REAL NOT NULL,
+        valid_fraction REAL NOT NULL,
         avg_power_w REAL,
         median_power_w REAL,
         p90_power_w REAL,
@@ -412,6 +416,16 @@ DDL = [
         run_id TEXT PRIMARY KEY,
         start_ts REAL NOT NULL,
         end_ts REAL,
+        status TEXT NOT NULL,
+        capture_mode TEXT NOT NULL,
+        campaign_id TEXT NOT NULL,
+        evidence_epoch_id TEXT NOT NULL,
+        battery_epoch INTEGER NOT NULL,
+        battery_identity_hash TEXT NOT NULL,
+        hard_identity_hash TEXT NOT NULL,
+        calibration_version INTEGER NOT NULL,
+        evidence_semantics_version INTEGER NOT NULL,
+        envelope TEXT,
         payload_json TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS minimal_meter_samples (
@@ -689,9 +703,10 @@ class Database:
                 """INSERT OR REPLACE INTO power_rollups(
                     bucket_ts,evidence_epoch_id,battery_epoch,brightness_bucket,demand_region,
                     media_playing,remote_bucket,thermal_start,system_fingerprint,current_envelope,
-                    reference_eligible,valid_seconds,avg_power_w,median_power_w,p90_power_w,
-                    p95_power_w,avg_rapl_w,avg_cpu_psi,avg_io_psi,max_thermal_pressure,payload_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    reference_eligible,reference_ineligible_reasons_json,valid_seconds,valid_fraction,
+                    avg_power_w,median_power_w,p90_power_w,p95_power_w,avg_rapl_w,avg_cpu_psi,
+                    avg_io_psi,max_thermal_pressure,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rollup["bucket_ts"],
                     rollup.get("evidence_epoch_id"),
@@ -704,7 +719,9 @@ class Database:
                     rollup.get("system_fingerprint"),
                     rollup.get("current_envelope"),
                     int(bool(rollup.get("reference_eligible", False))),
+                    _json(rollup.get("reference_ineligible_reasons") or []),
                     rollup.get("valid_seconds", 0.0),
+                    rollup.get("valid_fraction", 0.0),
                     rollup.get("avg_power_w"),
                     rollup.get("median_power_w"),
                     rollup.get("p90_power_w"),
@@ -1528,13 +1545,42 @@ class Database:
             result.append(item)
         return result
 
-    def start_minimal_meter_run(self, payload: dict[str, Any] | None = None) -> str:
+    def start_minimal_meter_run(
+        self,
+        *,
+        capture_mode: str,
+        campaign_id: str,
+        evidence_epoch_id: str,
+        battery_epoch: int,
+        battery_identity_hash: str,
+        hard_identity_hash: str,
+        calibration_version: int,
+        evidence_semantics_version: int,
+        envelope: str | None,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
         run_id = f"meter-{uuid.uuid4().hex[:12]}"
         with self.conn:
             self.conn.execute(
-                """INSERT INTO minimal_meter_runs(run_id,start_ts,payload_json)
-                VALUES(?,?,?)""",
-                (run_id, time.time(), _json(payload or {})),
+                """INSERT INTO minimal_meter_runs(
+                    run_id,start_ts,status,capture_mode,campaign_id,evidence_epoch_id,
+                    battery_epoch,battery_identity_hash,hard_identity_hash,calibration_version,
+                    evidence_semantics_version,envelope,payload_json
+                ) VALUES(?,?,'RUNNING',?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    time.time(),
+                    capture_mode,
+                    campaign_id,
+                    evidence_epoch_id,
+                    battery_epoch,
+                    battery_identity_hash,
+                    hard_identity_hash,
+                    calibration_version,
+                    evidence_semantics_version,
+                    envelope,
+                    _json(payload or {}),
+                ),
             )
         return run_id
 
@@ -1554,11 +1600,20 @@ class Database:
                 ),
             )
 
-    def finish_minimal_meter_run(self, run_id: str, payload: dict[str, Any]) -> None:
+    def finish_minimal_meter_run(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        *,
+        status: str = "COMPLETE",
+    ) -> None:
+        if status not in {"COMPLETE", "INVALID"}:
+            raise ValueError(f"invalid minimal meter terminal status: {status}")
         with self.conn:
             self.conn.execute(
-                """UPDATE minimal_meter_runs SET end_ts=?,payload_json=? WHERE run_id=?""",
-                (time.time(), _json(payload), run_id),
+                """UPDATE minimal_meter_runs
+                SET end_ts=?,status=?,payload_json=? WHERE run_id=?""",
+                (time.time(), status, _json(payload), run_id),
             )
 
     def minimal_meter_run(self, run_id: str) -> dict[str, Any] | None:
@@ -1698,6 +1753,16 @@ class Database:
         row = self.conn.execute("SELECT epoch FROM battery_epochs WHERE active=1").fetchone()
         return int(row[0]) if row else None
 
+    def active_battery_epoch_record(self) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM battery_epochs WHERE active=1 ORDER BY epoch DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
     def start_calibration(self, phase: str) -> dict[str, Any]:
         active = self.conn.execute(
             "SELECT * FROM calibration_runs WHERE status='RUNNING'"
@@ -1822,6 +1887,7 @@ class Database:
             for row in rows
             if isinstance(row.get("battery_power_w"), (int, float))
             and row.get("battery_status") == "Discharging"
+            and not row.get("resume_grace")
         ]
         thermal = [
             float(row["thermal_pressure"])
@@ -1848,11 +1914,15 @@ class Database:
                 dt = float(current["ts"]) - float(previous["ts"])
                 if not (0 < dt <= max_gap_seconds):
                     continue
-                if discharge_only and not (
-                    previous.get("battery_status") == "Discharging"
-                    and current.get("battery_status") == "Discharging"
-                ):
-                    continue
+                if discharge_only:
+                    valid_dt = valid_discharge_interval_seconds(
+                        previous,
+                        current,
+                        max_gap_seconds=max_gap_seconds,
+                    )
+                    if valid_dt is None:
+                        continue
+                    dt = valid_dt
                 left = previous.get(key)
                 right = current.get(key)
                 if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
