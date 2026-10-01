@@ -11,6 +11,7 @@ from .envelopes import EnvelopeRegistry
 from .hardware import inspect_hardware
 from .lifecycle import LifecycleManager
 from .longterm import StableReadiness, UsageCoverage, assess_net_benefit
+from .measurement import measurement_trust_matches_epoch
 from .scheduler import CandidateScheduler
 from .storage import SCHEMA_VERSION, Database
 
@@ -344,7 +345,7 @@ def _stage_and_actions(
         )
         return stage, actions
 
-    if measurement_trust.get("status") != "READY":
+    if not measurement_trust_matches_epoch(measurement_trust, evidence_epoch):
         stage = {
             "name": "STAGE_A_MEASUREMENT_TRUST",
             "status": "BLOCKED",
@@ -386,6 +387,28 @@ def _stage_and_actions(
         )
         return stage, actions
 
+    learning = str(lifecycle.get("learning_lifecycle") or "")
+    if learning == "STABLE" and not stable_readiness.get("ready"):
+        return (
+            {
+                "name": "STABLE_STALE",
+                "status": "BLOCKED",
+                "reason": (
+                    "learning lifecycle still says STABLE but current-epoch "
+                    "readiness requirements are no longer satisfied"
+                ),
+            },
+            [
+                {
+                    "action": "rebuild_current_epoch_evidence",
+                    "reason": ", ".join(
+                        stable_readiness.get("reasons")
+                        or ["current-epoch STABLE readiness is not satisfied"]
+                    ),
+                }
+            ],
+        )
+
     if evidence_epoch is None or frozen_reference_count <= 0:
         stage = {
             "name": "STAGE_B_BASELINE_AND_NOISE",
@@ -400,7 +423,6 @@ def _stage_and_actions(
         )
         return stage, actions
 
-    learning = str(lifecycle.get("learning_lifecycle") or "")
     if learning in {"COARSE_OPTIMIZATION", "REOPENED"}:
         stage = {
             "name": "STAGE_C_COARSE_SEARCH",
@@ -504,6 +526,25 @@ def build_agent_context(
     measurement_trust = db.get_meta("measurement_trust", {})
     if not isinstance(measurement_trust, dict):
         measurement_trust = {}
+    if not measurement_trust_matches_epoch(measurement_trust, evidence_epoch):
+        measurement_trust = {
+            **measurement_trust,
+            "status": "BLOCKED",
+            "valid_for_active_evidence_epoch": False,
+            "reasons": list(
+                dict.fromkeys(
+                    [
+                        *(measurement_trust.get("reasons") or []),
+                        "measurement_trust_not_bound_to_active_evidence_epoch",
+                    ]
+                )
+            ),
+        }
+    else:
+        measurement_trust = {
+            **measurement_trust,
+            "valid_for_active_evidence_epoch": True,
+        }
 
     coverage_days = int(config.get("stable.coverage_days", 30))
     usage_coverage = UsageCoverage(db).summarize(
@@ -515,6 +556,7 @@ def build_agent_context(
     net_benefit = assess_net_benefit(
         monitoring_runs,
         practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
+        evidence_epoch_id=(evidence_epoch or {}).get("epoch_id"),
     )
 
     latest = db.latest_sample()
@@ -541,11 +583,25 @@ def build_agent_context(
             "potential_neighbor_count": 0,
         }
 
-    frozen_reference_count = _count(
-        db,
-        "SELECT COUNT(*) FROM reference_baselines WHERE frozen=1",
+    active_epoch_id = (evidence_epoch or {}).get("epoch_id")
+    frozen_reference_count = (
+        _count(
+            db,
+            "SELECT COUNT(*) FROM reference_baselines WHERE frozen=1 AND evidence_epoch_id=?",
+            (active_epoch_id,),
+        )
+        if active_epoch_id
+        else 0
     )
-    recent_noise_count = _count(db, "SELECT COUNT(*) FROM recent_noise_distributions")
+    recent_noise_count = (
+        _count(
+            db,
+            "SELECT COUNT(*) FROM recent_noise_distributions WHERE evidence_epoch_id=?",
+            (active_epoch_id,),
+        )
+        if active_epoch_id
+        else 0
+    )
     active_investigation = db.active_investigation()
 
     stage, actions = _stage_and_actions(
@@ -615,7 +671,11 @@ def build_agent_context(
             "frozen_reference_count": frozen_reference_count,
             "recent_noise_distribution_count": recent_noise_count,
             "recent_decisions": [
-                _compact_decision(value) for value in db.evidence_decisions(limit=5)
+                _compact_decision(value)
+                for value in db.evidence_decisions(
+                    evidence_epoch_id=active_epoch_id,
+                    limit=5,
+                )
             ],
         },
         "verified_envelopes": [

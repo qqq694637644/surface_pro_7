@@ -11,7 +11,12 @@ from jsonschema import Draft202012Validator
 from .config import Config, load_machine
 from .envelopes import EnvelopeRegistry, snapshot_matches_envelope
 from .evaluation import compare_arm_constraints, summarize_block
-from .evidence import EvidenceEngine, build_crossover_episode, hard_strata_key
+from .evidence import (
+    EvidenceEngine,
+    build_crossover_episode,
+    reference_strata_key,
+)
+from .measurement import measurement_trust_matches_epoch
 from .storage import Database
 from .unexpected_power import brightness_bucket, remote_bucket
 
@@ -39,21 +44,28 @@ class TrialManager:
     def _default_validation(self, current_sample: dict[str, Any]) -> dict[str, Any]:
         configured_min = float(self.config.get("experiments.min_block_seconds", 300.0))
         measurement_trust = self.db.get_meta("measurement_trust", {})
+        evidence_epoch = self.db.active_evidence_epoch()
+        trust_ready = measurement_trust_matches_epoch(measurement_trust, evidence_epoch)
         gauge_min = (
             float(measurement_trust.get("recommended_min_arm_seconds") or 0.0)
-            if isinstance(measurement_trust, dict)
+            if trust_ready
             else 0.0
         )
-        evidence_epoch = self.db.active_evidence_epoch()
         arm = self.evidence.recommended_arm_seconds(
             evidence_epoch_id=(evidence_epoch or {}).get("epoch_id"),
-            strata_key=hard_strata_key(current_sample),
+            strata_key=reference_strata_key(
+                {
+                    **current_sample,
+                    "brightness_bucket": brightness_bucket(current_sample.get("brightness_pct")),
+                }
+            ),
             configured_min_seconds=configured_min,
             gauge_min_seconds=gauge_min,
         )
         return {
             "min_block_seconds": float(arm["recommended_min_arm_seconds"]),
             "min_block_components": arm,
+            "require_energy_delta": trust_ready,
             "settle_min_seconds": float(self.config.get("experiments.settle_min_seconds", 30.0)),
             "settle_max_seconds": float(self.config.get("experiments.settle_max_seconds", 300.0)),
             "settle_min_samples": int(self.config.get("experiments.settle_min_samples", 3)),
@@ -121,6 +133,7 @@ class TrialManager:
             sample.get(key) is not None
             for key in (
                 "battery_power_w",
+                "battery_energy_wh",
                 "package_temp_c",
                 "rapl_power_60s_w",
                 "epp",
@@ -177,6 +190,22 @@ class TrialManager:
         machine = load_machine(self.config.root)
         if not bool((machine.get("calibration") or {}).get("valid", False)):
             raise TrialError("machine calibration must be valid before starting a trial")
+        evidence_epoch = self.db.active_evidence_epoch()
+        measurement_trust = self.db.get_meta("measurement_trust", {})
+        calibration = machine.get("calibration") or {}
+        battery = machine.get("battery") or {}
+        if not evidence_epoch:
+            raise TrialError("active evidence epoch is required before starting a trial")
+        if int(evidence_epoch.get("calibration_version") or 0) != int(
+            calibration.get("version") or 0
+        ):
+            raise TrialError("active evidence epoch does not match current calibration")
+        if int(evidence_epoch.get("battery_epoch") or 0) != int(battery.get("active_epoch") or 0):
+            raise TrialError("active evidence epoch does not match current battery epoch")
+        if not measurement_trust_matches_epoch(measurement_trust, evidence_epoch):
+            raise TrialError(
+                "current evidence epoch requires Measurement Trust READY before starting a trial"
+            )
         errors = self.validate_proposal(proposal)
         if errors:
             raise TrialError("; ".join(errors))
@@ -194,7 +223,6 @@ class TrialManager:
             raise TrialError("trial cannot start during resume grace period")
         if not current_sample.get("thermald_active"):
             raise TrialError("thermald must be active")
-
         baseline = str(proposal["baseline_envelope"])
         if current_sample.get("current_envelope") != baseline:
             raise TrialError(
@@ -210,6 +238,19 @@ class TrialManager:
             raise TrialError(
                 "actual HWP state does not match baseline_envelope before starting a trial"
             )
+        strata = reference_strata_key(
+            {
+                **current_sample,
+                "brightness_bucket": brightness_bucket(current_sample.get("brightness_pct")),
+            }
+        )
+        noise = self.db.noise_distribution(
+            str((evidence_epoch or {}).get("epoch_id") or ""),
+            strata,
+        )
+        minimum_noise_windows = int(self.config.get("scheduler.min_noise_windows", 8))
+        if not noise or int(noise.get("sample_count") or 0) < minimum_noise_windows:
+            raise TrialError("current workload/brightness stratum lacks a trusted noise baseline")
         if proposal.get("candidate_envelope"):
             candidate = self.registry.candidate_from_named(str(proposal["candidate_envelope"]))
         else:
@@ -374,6 +415,23 @@ class TrialManager:
         )
         return self.db.get_trial(trial["trial_id"]) or trial
 
+    def _latch_rollback_fault(self, trial: dict[str, Any], reason: str) -> None:
+        fault = {
+            "active": True,
+            "ts": time.time(),
+            "source": "trial",
+            "trial_id": trial.get("trial_id"),
+            "reason": reason,
+        }
+        self.db.set_meta("rollback_integrity_fault", fault)
+        self.db.set_meta("current_envelope", None)
+        self.db.add_runtime_state(
+            "control",
+            "EMERGENCY",
+            "trial rollback integrity is not trusted",
+            fault,
+        )
+
     def _record_frontier_status(
         self,
         trial: dict[str, Any],
@@ -418,6 +476,7 @@ class TrialManager:
             reason = f"candidate apply failed: {exc}"
             if recovery_error:
                 reason += f"; recovery failed: {recovery_error}"
+                self._latch_rollback_fault(trial, reason)
             self.db.add_control_action(
                 action="TRIAL_APPLY_CANDIDATE",
                 envelope=trial["candidate"].get("name"),
@@ -450,6 +509,7 @@ class TrialManager:
                 success=False,
                 reason="trial snapshot missing",
             )
+            self._latch_rollback_fault(trial, "trial baseline snapshot is missing")
             return False
         before = None
         try:
@@ -462,6 +522,25 @@ class TrialManager:
                 success=False,
                 reason=str(exc),
                 before=before,
+            )
+            self._latch_rollback_fault(trial, f"trial baseline restore failed: {exc}")
+            return False
+        try:
+            verify = self.actuator.snapshot()
+        except Exception as exc:
+            self._latch_rollback_fault(
+                trial,
+                f"trial baseline restore could not be verified: {exc}",
+            )
+            return False
+        if (
+            verify.get("max_perf_pct") != snapshot.get("max_perf_pct")
+            or verify.get("turbo") != snapshot.get("turbo")
+            or (verify.get("epp") or {}) != (snapshot.get("epp") or {})
+        ):
+            self._latch_rollback_fault(
+                trial,
+                "trial baseline restore does not match captured snapshot",
             )
             return False
         self.db.add_control_action(
@@ -568,6 +647,7 @@ class TrialManager:
             max_consistency_abs_wh=float(
                 self.config.get("evidence.max_energy_consistency_abs_wh", 0.05)
             ),
+            require_energy_delta=bool(validation.get("require_energy_delta", False)),
         )
         if float(summary.get("valid_seconds") or 0.0) < float(
             validation.get("min_block_seconds", 300.0)
@@ -632,7 +712,7 @@ class TrialManager:
         }
         useful_effect = self.evidence.minimum_useful_effect(
             evidence_epoch_id=episode.get("evidence_epoch_id"),
-            strata_key=hard_strata_key(strata_source),
+            strata_key=reference_strata_key(strata_source),
         )
         minimum_useful_effect_w = float(useful_effect["minimum_useful_effect_w"])
         if stage == "initial":

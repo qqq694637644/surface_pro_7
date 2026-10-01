@@ -103,7 +103,7 @@ def cmd_agent_context(args: argparse.Namespace) -> int:
     config = config_from_args(args)
     try:
         db = Database(config.path("storage.database"))
-    except LegacyDatabaseError as exc:
+    except (LegacyDatabaseError, sqlite3.DatabaseError) as exc:
         emit(build_agent_context_without_runtime(config, error=str(exc)))
         return 0
     registry = EnvelopeRegistry(ROOT, db)
@@ -176,6 +176,17 @@ def cmd_calibrate_new_battery(args: argparse.Namespace) -> int:
         manager = CalibrationManager(ROOT, db, config)
         manager.set_active_battery_epoch(epoch)
         manager.invalidate("manual new battery epoch")
+        previous_trust = db.get_meta("measurement_trust", {})
+        db.set_meta(
+            "measurement_trust",
+            {
+                **(previous_trust if isinstance(previous_trust, dict) else {}),
+                "status": "BLOCKED",
+                "reasons": ["battery_epoch_changed"],
+                "invalidated_ts": time.time(),
+                "invalidated_by_battery_epoch": epoch,
+            },
+        )
         emit({"battery_epoch": epoch, "calibration_valid": False})
     finally:
         db.close()
@@ -405,6 +416,35 @@ def cmd_safety_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_safety_recover_rollback(args: argparse.Namespace) -> int:
+    stack = prepare_stack(
+        ROOT,
+        Path(args.config).expanduser() if args.config else None,
+    )
+    try:
+        matched = stack["controller"].recover_rollback_integrity_fault(args.reason)
+        stack["lifecycle"].set_control(
+            "READ_ONLY",
+            "rollback integrity fault cleared after verified HWP reconcile; "
+            "awaiting normal runtime safety synchronization",
+            {"verified_envelope": matched, "reason": args.reason},
+        )
+        emit(
+            {
+                "recovered": True,
+                "verified_envelope": matched,
+                "rollback_integrity_fault": stack["db"].get_meta(
+                    "rollback_integrity_fault",
+                    {},
+                ),
+                "control_safety_state": stack["lifecycle"].control_state(),
+            }
+        )
+    finally:
+        stack["db"].close()
+    return 0
+
+
 def cmd_investigation_list(args: argparse.Namespace) -> int:
     _config, db = db_from_args(args)
     try:
@@ -488,20 +528,35 @@ def cmd_evidence_status(args: argparse.Namespace) -> int:
     _config, db = db_from_args(args)
     try:
         epoch = db.active_evidence_epoch()
+        epoch_id = (epoch or {}).get("epoch_id")
         emit(
             {
                 "active_evidence_epoch": epoch,
                 "compatibility_tags": db.active_compatibility_tags(),
-                "recent_decisions": db.evidence_decisions(limit=args.limit),
-                "arm_measurements": db.conn.execute(
+                "recent_decisions": db.evidence_decisions(
+                    evidence_epoch_id=epoch_id,
+                    limit=args.limit,
+                ),
+                "arm_measurements_total": db.conn.execute(
                     "SELECT COUNT(*) FROM arm_measurements"
                 ).fetchone()[0],
-                "crossover_episodes": db.conn.execute(
-                    "SELECT COUNT(*) FROM crossover_episodes"
-                ).fetchone()[0],
-                "frozen_references": db.conn.execute(
-                    "SELECT COUNT(*) FROM reference_baselines WHERE frozen=1"
-                ).fetchone()[0],
+                "crossover_episodes": (
+                    db.conn.execute(
+                        "SELECT COUNT(*) FROM crossover_episodes WHERE evidence_epoch_id=?",
+                        (epoch_id,),
+                    ).fetchone()[0]
+                    if epoch_id
+                    else 0
+                ),
+                "frozen_references": (
+                    db.conn.execute(
+                        """SELECT COUNT(*) FROM reference_baselines
+                        WHERE frozen=1 AND evidence_epoch_id=?""",
+                        (epoch_id,),
+                    ).fetchone()[0]
+                    if epoch_id
+                    else 0
+                ),
             }
         )
     finally:
@@ -512,17 +567,24 @@ def cmd_evidence_status(args: argparse.Namespace) -> int:
 def cmd_evidence_noise(args: argparse.Namespace) -> int:
     _config, db = db_from_args(args)
     try:
-        rows = [
-            dict(row)
-            for row in db.conn.execute(
-                """SELECT updated_ts,evidence_epoch_id,strata_key,window_seconds,
-                median_power_w,mad_power_w,noise_floor_w,sample_count
-                FROM recent_noise_distributions
-                ORDER BY updated_ts DESC LIMIT ?""",
-                (args.limit,),
-            )
-        ]
-        emit({"noise": rows})
+        epoch = db.active_evidence_epoch()
+        epoch_id = (epoch or {}).get("epoch_id")
+        rows = (
+            [
+                dict(row)
+                for row in db.conn.execute(
+                    """SELECT updated_ts,evidence_epoch_id,strata_key,window_seconds,
+                    median_power_w,mad_power_w,noise_floor_w,sample_count
+                    FROM recent_noise_distributions
+                    WHERE evidence_epoch_id=?
+                    ORDER BY updated_ts DESC LIMIT ?""",
+                    (epoch_id, args.limit),
+                )
+            ]
+            if epoch_id
+            else []
+        )
+        emit({"active_evidence_epoch": epoch, "noise": rows})
     finally:
         db.close()
     return 0
@@ -531,7 +593,10 @@ def cmd_evidence_noise(args: argparse.Namespace) -> int:
 def cmd_evidence_gauge(args: argparse.Namespace) -> int:
     config, db = db_from_args(args)
     try:
+        epoch = db.active_evidence_epoch()
         since = time.time() - float(args.hours) * 3600.0
+        if epoch:
+            since = max(since, float(epoch.get("start_ts") or since))
         rows = db.recent_samples(since)
         discharge_power = [
             float(row["battery_power_w"])
@@ -551,6 +616,7 @@ def cmd_evidence_gauge(args: argparse.Namespace) -> int:
                     energy_quantum_multiplier=float(
                         config.get("evidence.gauge_quantum_multiplier", 8.0)
                     ),
+                    max_gap_seconds=float(config.get("collector.max_gap_seconds", 45.0)),
                 ),
             }
         )
@@ -562,7 +628,10 @@ def cmd_evidence_gauge(args: argparse.Namespace) -> int:
 def cmd_evidence_trust(args: argparse.Namespace) -> int:
     config, db = db_from_args(args)
     try:
+        epoch = db.active_evidence_epoch()
         since = time.time() - float(args.hours) * 3600.0
+        if epoch:
+            since = max(since, float(epoch.get("start_ts") or since))
         rows = db.recent_samples(since)
         result = assess_measurement_trust(
             rows,
@@ -574,10 +643,37 @@ def cmd_evidence_trust(args: argparse.Namespace) -> int:
             energy_quantum_multiplier=float(config.get("evidence.gauge_quantum_multiplier", 8.0)),
             max_gap_seconds=float(config.get("collector.max_gap_seconds", 45.0)),
         )
+        machine = load_machine(ROOT)
+        calibration = machine.get("calibration") or {}
+        battery = machine.get("battery") or {}
+        if not epoch:
+            result = {
+                **result,
+                "status": "BLOCKED",
+                "reasons": [
+                    *(result.get("reasons") or []),
+                    "missing_active_evidence_epoch",
+                ],
+            }
+        elif int(epoch.get("calibration_version") or 0) != int(
+            calibration.get("version") or 0
+        ) or int(epoch.get("battery_epoch") or 0) != int(battery.get("active_epoch") or 0):
+            result = {
+                **result,
+                "status": "BLOCKED",
+                "reasons": [
+                    *(result.get("reasons") or []),
+                    "active_evidence_epoch_context_stale",
+                ],
+            }
         record = {
             **result,
             "assessed_ts": time.time(),
             "history_hours": float(args.hours),
+            "evidence_epoch_id": (epoch or {}).get("epoch_id"),
+            "battery_epoch": (epoch or {}).get("battery_epoch"),
+            "calibration_version": (epoch or {}).get("calibration_version"),
+            "evidence_semantics_version": (epoch or {}).get("evidence_semantics_version"),
         }
         db.set_meta("measurement_trust", record)
         emit(record)
@@ -613,6 +709,14 @@ def cmd_overhead_compare(args: argparse.Namespace) -> int:
             usable_battery_wh=args.usable_battery_wh,
             max_gap_seconds=float(args.max_gap_seconds),
         )
+        epoch = db.active_evidence_epoch()
+        result = {
+            **result,
+            "campaign_id": args.campaign,
+            "evidence_epoch_id": (epoch or {}).get("epoch_id"),
+            "battery_epoch": (epoch or {}).get("battery_epoch"),
+            "calibration_version": (epoch or {}).get("calibration_version"),
+        }
         run_id = db.start_monitoring_overhead_run(
             mode=args.mode,
             payload={
@@ -620,6 +724,7 @@ def cmd_overhead_compare(args: argparse.Namespace) -> int:
                 "candidate": str(Path(args.candidate).expanduser()),
                 "usable_battery_wh": args.usable_battery_wh,
                 "mode": args.mode,
+                "campaign_id": args.campaign,
             },
         )
         db.finish_monitoring_overhead_run(run_id, result)
@@ -641,10 +746,12 @@ def cmd_overhead_history(args: argparse.Namespace) -> int:
 def cmd_overhead_summary(args: argparse.Namespace) -> int:
     config, db = db_from_args(args)
     try:
+        epoch = db.active_evidence_epoch()
         emit(
             assess_net_benefit(
                 db.monitoring_overhead_runs(args.limit),
                 practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
+                evidence_epoch_id=(epoch or {}).get("epoch_id"),
             )
         )
     finally:
@@ -1048,6 +1155,9 @@ def parser() -> argparse.ArgumentParser:
     safety_sub = safety.add_subparsers(dest="safety_command", required=True)
     safety_status = safety_sub.add_parser("status")
     safety_status.set_defaults(func=cmd_safety_status)
+    safety_recover = safety_sub.add_parser("recover-rollback")
+    safety_recover.add_argument("--reason", required=True)
+    safety_recover.set_defaults(func=cmd_safety_recover_rollback)
 
     investigation = sub.add_parser("investigation")
     investigation_sub = investigation.add_subparsers(
@@ -1114,6 +1224,7 @@ def parser() -> argparse.ArgumentParser:
     overhead_compare.add_argument("candidate")
     overhead_compare.add_argument("--usable-battery-wh", type=float)
     overhead_compare.add_argument("--max-gap-seconds", type=float, default=90.0)
+    overhead_compare.add_argument("--campaign", required=True)
     overhead_compare.add_argument(
         "--mode",
         choices=("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB"),

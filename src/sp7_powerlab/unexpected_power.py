@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Config
-from .evidence import hard_strata_key, robust_distribution
+from .evidence import reference_strata_key, robust_distribution
 from .storage import Database
 
 
@@ -26,15 +26,15 @@ class UnexpectedPowerDetector:
 
     def _baseline(self, rollup: dict[str, Any]) -> dict[str, Any] | None:
         active_epoch = self.db.active_evidence_epoch()
-        strata = hard_strata_key(rollup)
+        strata = reference_strata_key(rollup)
         if active_epoch:
             frozen = self.db.reference_baseline(str(active_epoch["epoch_id"]), strata)
             if frozen:
                 return {
                     "source": "frozen_reference",
                     "median_power_w": frozen.get("median_power_w"),
-                    "p90_power_w": frozen.get("p75_power_w"),
-                    "noise_floor_w": frozen.get("mad_power_w"),
+                    "p90_power_w": frozen.get("p90_power_w"),
+                    "noise_floor_w": frozen.get("noise_floor_w"),
                     "sample_count": frozen.get("sample_count"),
                 }
         min_baselines = int(self.config.get("unexpected_power.min_baselines", 8))
@@ -43,17 +43,27 @@ class UnexpectedPowerDetector:
             60.0,
             float(self.config.get("unexpected_power.window_minutes", 5)) * 60.0,
         )
-        current_brightness = int(rollup.get("brightness_bucket") or -1)
+        current_brightness = (
+            int(rollup["brightness_bucket"])
+            if isinstance(rollup.get("brightness_bucket"), (int, float))
+            else -1
+        )
         candidates = [
             item
-            for item in self.db.recent_rollups(now - 30 * 86400, limit=5000)
+            for item in self.db.recent_rollups(
+                now - 30 * 86400,
+                limit=5000,
+                evidence_epoch_id=str((active_epoch or {}).get("epoch_id") or ""),
+            )
             if float(item.get("bucket_ts") or 0.0) < now - window_seconds
-            and hard_strata_key(item) == strata
+            and str(item.get("evidence_epoch_id") or "")
+            == str((active_epoch or {}).get("epoch_id") or "")
+            and reference_strata_key(item) == strata
             and isinstance(item.get("avg_power_w"), (int, float))
             and (
                 current_brightness < 0
-                or int(item.get("brightness_bucket") or -1) < 0
-                or abs(int(item.get("brightness_bucket") or -1) - current_brightness) <= 10
+                or not isinstance(item.get("brightness_bucket"), (int, float))
+                or abs(int(item["brightness_bucket"]) - current_brightness) <= 10
             )
         ]
         if len(candidates) < min_baselines:
@@ -63,6 +73,8 @@ class UnexpectedPowerDetector:
 
     def detect(self, rollup: dict[str, Any]) -> dict[str, Any] | None:
         if rollup.get("avg_power_w") is None:
+            return None
+        if not bool(rollup.get("reference_eligible", True)):
             return None
         if rollup.get("local_compute_pressure") not in {None, "LOW"}:
             return None
@@ -94,12 +106,18 @@ class UnexpectedPowerDetector:
             60.0,
             float(self.config.get("unexpected_power.window_minutes", 5)) * 60.0,
         )
-        strata = hard_strata_key(rollup)
+        strata = reference_strata_key(rollup)
+        active_epoch_id = str((self.db.active_evidence_epoch() or {}).get("epoch_id") or "")
         recent = [
             item
-            for item in self.db.recent_rollups(current_ts - window_seconds, limit=100)
+            for item in self.db.recent_rollups(
+                current_ts - window_seconds,
+                limit=100,
+                evidence_epoch_id=active_epoch_id,
+            )
             if float(item.get("bucket_ts") or 0.0) >= current_ts - window_seconds
-            and hard_strata_key(item) == strata
+            and str(item.get("evidence_epoch_id") or "") == active_epoch_id
+            and reference_strata_key(item) == strata
             and isinstance(item.get("avg_power_w"), (int, float))
         ]
         if not any(item.get("bucket_ts") == rollup.get("bucket_ts") for item in recent):

@@ -4,8 +4,8 @@ import pytest
 
 from sp7_powerlab.config import load_config
 from sp7_powerlab.envelopes import EnvelopeRegistry
-from sp7_powerlab.evidence import hard_strata_key
-from sp7_powerlab.experiments import TrialManager
+from sp7_powerlab.evidence import reference_strata_key
+from sp7_powerlab.experiments import TrialError, TrialManager
 from sp7_powerlab.storage import Database
 from sp7_powerlab.unexpected_power import brightness_bucket
 
@@ -117,6 +117,41 @@ def make_manager(project_root: Path):
     db = Database(project_root / "runtime/db.sqlite3")
     registry = EnvelopeRegistry(project_root, db)
     registry.load()
+    epoch = db.ensure_evidence_epoch(
+        hard_identity_hash="hard",
+        battery_epoch=1,
+        calibration_version=1,
+        evidence_semantics_version=1,
+        payload={},
+    )
+    db.set_meta(
+        "measurement_trust",
+        {
+            "status": "READY",
+            "recommended_min_arm_seconds": 20.0,
+            "evidence_epoch_id": epoch,
+            "battery_epoch": 1,
+            "calibration_version": 1,
+            "evidence_semantics_version": 1,
+        },
+    )
+    baseline = base_sample(0)
+    baseline["brightness_bucket"] = brightness_bucket(baseline["brightness_pct"])
+    db.upsert_noise_distribution(
+        {
+            "evidence_epoch_id": epoch,
+            "strata_key": reference_strata_key(baseline),
+            "window_seconds": 7 * 86400,
+            "median_power_w": 5.5,
+            "mad_power_w": 0.04,
+            "p25_power_w": 5.45,
+            "p75_power_w": 5.55,
+            "p10_power_w": 5.4,
+            "p90_power_w": 5.6,
+            "noise_floor_w": 0.0,
+            "sample_count": 10,
+        }
+    )
     actuator = FakeActuator()
     return db, registry, actuator, TrialManager(config, db, registry, actuator)
 
@@ -129,6 +164,7 @@ def add_arm(db, trial_id, arm, start, power, **changes):
             trial_id=trial_id,
             trial_arm=arm,
         )
+        row["battery_energy_wh"] = 30.0 - power * offset / 3600.0
         row.update(changes)
         db.add_sample(row)
 
@@ -186,11 +222,16 @@ def test_named_envelope_trial_uses_stricter_minimum_block(project_root):
 def test_trial_minimum_block_honors_measurement_derived_duration(project_root):
     db, _registry, _actuator, manager = make_manager(project_root)
     try:
+        epoch = db.active_evidence_epoch() or {}
         db.set_meta(
             "measurement_trust",
             {
                 "status": "READY",
                 "recommended_min_arm_seconds": 75.0,
+                "evidence_epoch_id": epoch.get("epoch_id"),
+                "battery_epoch": epoch.get("battery_epoch"),
+                "calibration_version": epoch.get("calibration_version"),
+                "evidence_semantics_version": epoch.get("evidence_semantics_version"),
             },
         )
         trial = manager.start(proposal(), base_sample(100))
@@ -210,7 +251,8 @@ def test_trial_minimum_block_honors_empirical_noise_duration(project_root):
             evidence_semantics_version=1,
             payload={},
         )
-        strata = hard_strata_key(sample)
+        sample["brightness_bucket"] = brightness_bucket(sample["brightness_pct"])
+        strata = reference_strata_key(sample)
         db.upsert_noise_distribution(
             {
                 "evidence_epoch_id": epoch,
@@ -229,6 +271,51 @@ def test_trial_minimum_block_honors_empirical_noise_duration(project_root):
         trial = manager.start(proposal(), sample)
         assert trial["validation"]["min_block_seconds"] == 960.0
         assert trial["validation"]["min_block_components"]["noise_min_arm_seconds"] == 960.0
+    finally:
+        db.close()
+
+
+def test_trial_rejects_measurement_trust_from_old_evidence_epoch(project_root):
+    db, _registry, _actuator, manager = make_manager(project_root)
+    try:
+        trust = db.get_meta("measurement_trust")
+        db.set_meta("measurement_trust", {**trust, "evidence_epoch_id": "ee-old"})
+        with pytest.raises(TrialError, match="Measurement Trust READY"):
+            manager.start(proposal(), base_sample(100))
+    finally:
+        db.close()
+
+
+def test_manual_trial_requires_current_noise_baseline(project_root):
+    db, _registry, _actuator, manager = make_manager(project_root)
+    try:
+        db.conn.execute("DELETE FROM recent_noise_distributions")
+        db.conn.commit()
+        with pytest.raises(TrialError, match="trusted noise baseline"):
+            manager.start(proposal(), base_sample(100))
+    finally:
+        db.close()
+
+
+def test_trial_block_requires_energy_delta_when_trust_is_ready(project_root):
+    db, _registry, _actuator, manager = make_manager(project_root)
+    try:
+        trial = manager.start(proposal(), base_sample(100))
+        trial_id = trial["trial_id"]
+        manager.tick(base_sample(100))
+        for offset in (0, 10, 20):
+            row = base_sample(
+                100 + offset,
+                power=5.5,
+                trial_id=trial_id,
+                trial_arm="A1",
+            )
+            row["battery_energy_wh"] = 30.0
+            db.add_sample(row)
+        manager.tick(base_sample(121))
+        measurement = db.arm_measurements(trial_id)[0]
+        assert measurement["arm"] == "A1"
+        assert measurement["data_quality"] == "DATA_QUALITY_FAILURE"
     finally:
         db.close()
 

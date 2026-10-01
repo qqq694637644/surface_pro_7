@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from sp7_powerlab.envelopes import EnvelopeRegistry
-from sp7_powerlab.evidence import hard_strata_key
+from sp7_powerlab.evidence import reference_strata_key
 from sp7_powerlab.longterm import (
     DriftDetector,
     StableReadiness,
@@ -58,6 +58,8 @@ def test_usage_coverage_requires_verified_policy_and_frozen_reference(project_ro
         )
         now = time.time()
         item = rollup(now - 60, 5.0)
+        item["evidence_epoch_id"] = epoch
+        item["reference_eligible"] = True
         db.add_rollup(item)
 
         before = UsageCoverage(db).summarize(
@@ -67,7 +69,7 @@ def test_usage_coverage_requires_verified_policy_and_frozen_reference(project_ro
         assert before["verified_fraction"] == 1.0
         assert before["trusted_fraction"] == 0.0
 
-        strata = hard_strata_key(item)
+        strata = reference_strata_key(item)
         db.upsert_reference_baseline(
             {
                 "reference_id": "ref-1",
@@ -103,7 +105,9 @@ def test_drift_detector_compares_recent_distribution_to_frozen_reference(tmp_pat
             payload={},
         )
         item = rollup(time.time(), 5.8)
-        strata = hard_strata_key(item)
+        item["evidence_epoch_id"] = epoch
+        item["reference_eligible"] = True
+        strata = reference_strata_key(item)
         db.upsert_reference_baseline(
             {
                 "reference_id": "ref-1",
@@ -199,16 +203,27 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
         assert blocked["ready"] is False
         assert "measurement_trust_not_ready" in blocked["reasons"]
 
-        db.set_meta("measurement_trust", {"status": "READY"})
+        db.set_meta(
+            "measurement_trust",
+            {
+                "status": "READY",
+                "evidence_epoch_id": epoch,
+                "battery_epoch": 1,
+                "calibration_version": 1,
+                "evidence_semantics_version": 1,
+            },
+        )
         now = time.time()
         item = rollup(now - 60, 5.0)
+        item["evidence_epoch_id"] = epoch
+        item["reference_eligible"] = True
         db.add_rollup(item)
         db.upsert_reference_baseline(
             {
                 "reference_id": "ref-ready",
                 "created_ts": now,
                 "evidence_epoch_id": epoch,
-                "strata_key": hard_strata_key(item),
+                "strata_key": reference_strata_key(item),
                 "envelope": "INTERACTIVE_EFFICIENT",
                 "median_power_w": 5.0,
                 "mad_power_w": 0.05,
@@ -220,7 +235,14 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
         )
         for mode in ("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB"):
             run_id = db.start_monitoring_overhead_run(mode=mode)
-            db.finish_monitoring_overhead_run(run_id, {"candidate_minus_reference_w": -0.1})
+            db.finish_monitoring_overhead_run(
+                run_id,
+                {
+                    "candidate_minus_reference_w": -0.1,
+                    "evidence_epoch_id": epoch,
+                    "campaign_id": "stable-campaign",
+                },
+            )
 
         ready = StableReadiness(config, db).assess(now=now)
         assert ready["ready"] is True
@@ -275,3 +297,126 @@ def test_net_benefit_prefers_fixed_good_when_complexity_has_no_practical_gain():
         practical_threshold_w=0.10,
     )
     assert result["recommendation"] == "FIXED_GOOD_ENVELOPE"
+
+
+def test_usage_coverage_ignores_rollups_from_other_evidence_epochs(project_root: Path):
+    db = Database(project_root / "runtime/coverage-epoch.sqlite3")
+    registry = EnvelopeRegistry(project_root, db)
+    registry.load()
+    try:
+        old_epoch = db.ensure_evidence_epoch(
+            hard_identity_hash="old",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=1,
+            payload={},
+        )
+        now = time.time()
+        old = rollup(now - 120, 5.0)
+        old["evidence_epoch_id"] = old_epoch
+        old["reference_eligible"] = True
+        db.add_rollup(old)
+
+        new_epoch = db.ensure_evidence_epoch(
+            hard_identity_hash="new",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=1,
+            payload={},
+        )
+        new = rollup(now - 60, 6.0)
+        new["evidence_epoch_id"] = new_epoch
+        new["reference_eligible"] = True
+        db.add_rollup(new)
+        db.upsert_reference_baseline(
+            {
+                "reference_id": "ref-new",
+                "created_ts": now,
+                "evidence_epoch_id": new_epoch,
+                "strata_key": reference_strata_key(new),
+                "envelope": "INTERACTIVE_EFFICIENT",
+                "median_power_w": 6.0,
+                "mad_power_w": 0.05,
+                "p25_power_w": 5.95,
+                "p75_power_w": 6.05,
+                "sample_count": 10,
+                "frozen": True,
+            }
+        )
+        coverage = UsageCoverage(db).summarize(
+            since_ts=now - 3600,
+            evidence_epoch_id=new_epoch,
+        )
+        assert coverage["total_valid_seconds"] == 60.0
+        assert coverage["trusted_seconds"] == 60.0
+    finally:
+        db.close()
+
+
+def test_net_benefit_filters_runs_by_current_evidence_epoch():
+    runs = [
+        {
+            **_completed_run("MONITORING_OVERHEAD", 0.01, 100),
+            "result": {
+                "candidate_minus_reference_w": 0.01,
+                "evidence_epoch_id": "old",
+            },
+        },
+        {
+            **_completed_run("DYNAMIC_CONTROLLER", -0.2, 110),
+            "result": {
+                "candidate_minus_reference_w": -0.2,
+                "evidence_epoch_id": "old",
+            },
+        },
+        {
+            **_completed_run("FULL_POWERLAB", -0.2, 120),
+            "result": {
+                "candidate_minus_reference_w": -0.2,
+                "evidence_epoch_id": "old",
+            },
+        },
+    ]
+    result = assess_net_benefit(
+        runs,
+        practical_threshold_w=0.1,
+        evidence_epoch_id="current",
+    )
+    assert result["complete"] is False
+    assert result["recommendation"] == "NEED_MORE_DATA"
+
+
+def test_net_benefit_requires_one_complete_campaign_within_epoch():
+    runs = [
+        {
+            **_completed_run("MONITORING_OVERHEAD", 0.01, 100),
+            "result": {
+                "candidate_minus_reference_w": 0.01,
+                "evidence_epoch_id": "current",
+                "campaign_id": "a",
+            },
+        },
+        {
+            **_completed_run("DYNAMIC_CONTROLLER", -0.2, 110),
+            "result": {
+                "candidate_minus_reference_w": -0.2,
+                "evidence_epoch_id": "current",
+                "campaign_id": "b",
+            },
+        },
+        {
+            **_completed_run("FULL_POWERLAB", -0.2, 120),
+            "result": {
+                "candidate_minus_reference_w": -0.2,
+                "evidence_epoch_id": "current",
+                "campaign_id": "c",
+            },
+        },
+    ]
+    result = assess_net_benefit(
+        runs,
+        practical_threshold_w=0.1,
+        evidence_epoch_id="current",
+    )
+    assert result["complete"] is False
+    assert result["campaign_id"] is None

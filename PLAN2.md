@@ -156,8 +156,10 @@ Scheduler 在 BLOCKED 时不探索。
 
 ~~~
 battery epoch
-  -> Measurement Trust
+  -> preliminary Measurement Trust
   -> calibration
+  -> new/current hard evidence epoch
+  -> Measurement Trust again
   -> verified baseline
   -> natural reference/noise
 ~~~
@@ -207,7 +209,9 @@ bounded_burst 用于短时 thermal inertia / RAPL / throttling 观察，不是 s
 - media/non-media
 - remote/local
 
-brightness、thermal start、network/workload、data quality、compatibility 等优先作为 comparison constraints/covariates，而不是建立笛卡尔积 bucket。
+自然 Frozen Reference / Recent Noise 必须按稳定的 brightness bucket 隔离，因为屏幕功耗可能大于 CPU candidate effect。
+trial 自身仍把 brightness 当 comparison constraint，而不是把所有连续变量都加入 hard trial strata。
+thermal start、network/workload、data quality、compatibility 等继续优先作为 comparison constraints/covariates，避免笛卡尔积 bucket。
 
 ### 3.6 Minimum Useful Effect
 
@@ -581,6 +585,9 @@ UX 正常：
 - PSI/latency 显示 envelope 过紧
 - evidence 支持 race-to-idle 可降低整机能耗
 
+另外允许在 local compute pressure 明确为 MODERATE 时做有限、低风险的 race-to-idle probe，
+用于产生这类 evidence；LOW/idle 场景不默认向更高性能方向探索。
+
 ### 7.3 Eligibility
 
 至少检查：
@@ -867,6 +874,10 @@ MinimalMeter + full PowerLab
 ~~~
 
 Net Benefit 直接来自 end-to-end comparison。
+
+用于 STABLE readiness 的 monitoring / dynamic / full 三种结果必须来自同一个 hard evidence
+epoch 和同一个显式 validation campaign，不能把不同周或不同系统条件下各自最新的一次结果拼成
+“完整比较”。
 
 MonitoringOverhead 只用于解释，不从已经包含 monitoring 的结果中重复扣除。
 

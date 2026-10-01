@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Config
-from .evidence import hard_strata_key
-from .measurement import measurement_energy_summary
+from .evidence import reference_strata_key
+from .measurement import measurement_energy_summary, measurement_trust_matches_epoch
 from .storage import Database
 
 NET_BENEFIT_MODES = (
@@ -40,7 +40,11 @@ class UsageCoverage:
         since_ts: float,
         evidence_epoch_id: str | None = None,
     ) -> dict[str, Any]:
-        rows = self.db.recent_rollups(since_ts, limit=10000)
+        rows = self.db.recent_rollups(
+            since_ts,
+            limit=10000,
+            evidence_epoch_id=evidence_epoch_id,
+        )
         rows = sorted(rows, key=lambda item: float(item.get("bucket_ts") or 0.0))
         total_seconds = 0.0
         verified_seconds = 0.0
@@ -49,6 +53,10 @@ class UsageCoverage:
         uncovered: dict[str, float] = {}
 
         for row in rows:
+            if evidence_epoch_id and str(row.get("evidence_epoch_id") or "") != str(
+                evidence_epoch_id
+            ):
+                continue
             seconds = float(row.get("valid_seconds") or 0.0)
             if seconds <= 0 or row.get("trial_id"):
                 continue
@@ -64,7 +72,7 @@ class UsageCoverage:
             if verified and evidence_epoch_id and row.get("demand_region") != "MIXED":
                 reference = self.db.reference_baseline(
                     evidence_epoch_id,
-                    hard_strata_key(row),
+                    reference_strata_key(row),
                 )
                 trusted = reference is not None
             if trusted:
@@ -96,10 +104,43 @@ def assess_net_benefit(
     runs: list[dict[str, Any]],
     *,
     practical_threshold_w: float,
+    evidence_epoch_id: str | None = None,
 ) -> dict[str, Any]:
+    selected_campaign: str | None = None
+    filtered_runs = [
+        run
+        for run in runs
+        if run.get("end_ts") is not None
+        and (
+            evidence_epoch_id is None
+            or str(((run.get("result") or {}).get("evidence_epoch_id")) or "")
+            == str(evidence_epoch_id)
+        )
+    ]
+    if evidence_epoch_id is not None:
+        campaigns: dict[str, list[dict[str, Any]]] = {}
+        for run in filtered_runs:
+            campaign = str(((run.get("result") or {}).get("campaign_id")) or "")
+            if campaign:
+                campaigns.setdefault(campaign, []).append(run)
+        complete_campaigns = [
+            (campaign, campaign_runs)
+            for campaign, campaign_runs in campaigns.items()
+            if set(NET_BENEFIT_MODES) <= {str(run.get("mode") or "") for run in campaign_runs}
+        ]
+        if complete_campaigns:
+            selected_campaign, filtered_runs = max(
+                complete_campaigns,
+                key=lambda item: max(
+                    float(run.get("end_ts") or run.get("start_ts") or 0.0) for run in item[1]
+                ),
+            )
+        else:
+            filtered_runs = []
+
     latest: dict[str, dict[str, Any]] = {}
     for run in sorted(
-        runs,
+        filtered_runs,
         key=lambda item: float(item.get("end_ts") or item.get("start_ts") or 0.0),
         reverse=True,
     ):
@@ -121,7 +162,15 @@ def assess_net_benefit(
             "practical_threshold_w": practical_threshold_w,
             "deltas_w": deltas,
             "recommendation": "NEED_MORE_DATA",
-            "reasons": ["complete fixed-good crossover comparison is unavailable"],
+            "reasons": [
+                (
+                    "complete same-epoch same-campaign fixed-good crossover comparison "
+                    "is unavailable"
+                    if evidence_epoch_id is not None
+                    else "complete fixed-good crossover comparison is unavailable"
+                )
+            ],
+            "campaign_id": selected_campaign,
             "latest_runs": latest,
         }
 
@@ -154,6 +203,7 @@ def assess_net_benefit(
         "full_net_saving_w": -full_delta,
         "recommendation": recommendation,
         "reasons": reasons,
+        "campaign_id": selected_campaign,
         "latest_runs": latest,
     }
 
@@ -171,7 +221,7 @@ class StableReadiness:
             reasons.append("missing_evidence_epoch")
 
         measurement_trust = self.db.get_meta("measurement_trust", {})
-        if not isinstance(measurement_trust, dict) or measurement_trust.get("status") != "READY":
+        if not measurement_trust_matches_epoch(measurement_trust, epoch):
             reasons.append("measurement_trust_not_ready")
 
         coverage_days = int(self.config.get("stable.coverage_days", 30))
@@ -217,6 +267,7 @@ class StableReadiness:
         net_benefit = assess_net_benefit(
             overhead_runs,
             practical_threshold_w=float(self.config.get("evidence.practical_threshold_w", 0.10)),
+            evidence_epoch_id=(epoch or {}).get("epoch_id"),
         )
         if not net_benefit["complete"]:
             reasons.append("net_benefit_validation_incomplete")
@@ -261,9 +312,14 @@ class DriftDetector:
         *,
         evidence_epoch_id: str,
     ) -> dict[str, Any] | None:
-        if rollup.get("trial_id") or rollup.get("demand_region") == "MIXED":
+        if (
+            rollup.get("trial_id")
+            or rollup.get("demand_region") == "MIXED"
+            or not bool(rollup.get("reference_eligible", True))
+            or str(rollup.get("evidence_epoch_id") or "") != str(evidence_epoch_id)
+        ):
             return None
-        strata = hard_strata_key(rollup)
+        strata = reference_strata_key(rollup)
         reference = self.db.reference_baseline(evidence_epoch_id, strata)
         recent = self.db.noise_distribution(
             evidence_epoch_id,

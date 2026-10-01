@@ -108,6 +108,9 @@ sp7-powerlab evidence trust --hours 6
 - 不手工绕开 Scheduler gate；
 - 先增加有效 Discharging 数据或修 telemetry。
 
+Measurement Trust 绑定当前 battery/calibration/evidence epoch。换电池、重新 calibration 或 hard epoch
+变化后，旧 READY 自动失效，必须重新评估。
+
 ## 6. Evidence / Noise
 
 ~~~bash
@@ -122,6 +125,9 @@ sp7-powerlab evidence noise
 - recent noise
 - MUE
 - recent decisions
+
+自然 reference/noise 只接受当前 evidence epoch 且同一分钟内 brightness bucket、envelope、
+media/active/remote 状态稳定的 rollup；混合分钟不会进入 frozen reference。
 
 如果旧 epoch 与当前环境不兼容，不要把历史 winner 直接当当前 winner。
 
@@ -218,7 +224,21 @@ THERMAL_PRESSURE / THROTTLING 时：
 - 先检查 workload 是否异常；
 - 持续高本地负载优先考虑远程执行，而不是放宽热安全。
 
-## 12. Suspend / Resume
+## 12. Rollback integrity recovery
+
+如果 HWP apply 后无法精确恢复并验证 baseline，PowerLab 会把
+`rollback_integrity_fault` 持久锁存为 EMERGENCY。helper/sysfs 后续重新可写不会自动清除它。
+
+先人工确认机器状态，再执行：
+
+~~~bash
+sp7-powerlab safety recover-rollback --reason "verified actual HWP state after manual inspection"
+~~~
+
+只有实际 HWP snapshot 能唯一匹配一个 VERIFIED envelope 时 recovery 才成功。命令成功后先进入
+READ_ONLY，下一轮正常 runtime safety synchronization 再决定是否恢复 CONTROL_ALLOWED。
+
+## 13. Suspend / Resume
 
 Resume 后：
 
@@ -229,7 +249,7 @@ Resume 后：
 
 如果 resume 后当前 envelope 和真实 HWP 不一致，应以真实 HWP snapshot/reconcile 为准。
 
-## 13. Service restart
+## 14. Service restart
 
 重启时不继续跨重启 active trial。
 
@@ -239,7 +259,7 @@ Resume 后：
 - 标记 rolled back/failed；
 - rollback integrity 不可信时 Control 进入 EMERGENCY/READ_ONLY。
 
-## 14. Drift
+## 15. Drift
 
 慢性 drift 看 FrozenReferenceBaseline 对 recent distribution。
 
@@ -251,7 +271,7 @@ Resume 后：
 - diagnostic burst；
 - 不直接开始参数搜索。
 
-## 15. STABLE
+## 16. STABLE
 
 检查：
 
@@ -274,7 +294,7 @@ STABLE 下：
 sp7-powerlab lifecycle reopen --reason "confirmed regression"
 ~~~
 
-## 16. Net Benefit
+## 17. Net Benefit
 
 历史：
 
@@ -297,7 +317,7 @@ sp7-powerlab overhead summary
 
 Full PowerLab 没有 practical net gain 时，应简化。
 
-## 17. Git / Knowledge
+## 18. Git / Knowledge
 
 高频 SQLite 不提交 Git。
 
@@ -312,7 +332,7 @@ bash scripts/commit-knowledge.sh
 
 默认不自动 push。
 
-## 18. 常见排查入口
+## 19. 常见排查入口
 
 代码/文件不知道在哪：
 

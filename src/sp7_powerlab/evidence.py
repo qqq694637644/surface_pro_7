@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Config
+from .measurement import measurement_trust_matches_epoch
 from .storage import Database
 
 NON_EVALUABLE_REASONS = {
@@ -48,6 +49,13 @@ def hard_strata_key(value: dict[str, Any]) -> str:
         value.get("remote_bucket") or (1 if float(value.get("remote_hint") or 0.0) >= 0.5 else 0)
     )
     return f"bat={epoch}|env={envelope}|active={active}|media={media}|remote={remote}"
+
+
+def reference_strata_key(value: dict[str, Any]) -> str:
+    brightness = int(
+        value.get("brightness_bucket") if value.get("brightness_bucket") is not None else -1
+    )
+    return f"{hard_strata_key(value)}|brightness={brightness}"
 
 
 def robust_distribution(values: list[float]) -> dict[str, Any]:
@@ -95,6 +103,14 @@ class NoiseTracker:
         *,
         evidence_epoch_id: str,
     ) -> dict[str, Any] | None:
+        active_epoch = self.db.active_evidence_epoch()
+        if not active_epoch or str(active_epoch.get("epoch_id")) != str(evidence_epoch_id):
+            return None
+        trust = self.db.get_meta("measurement_trust", {})
+        if not measurement_trust_matches_epoch(trust, active_epoch):
+            return None
+        if str(rollup.get("evidence_epoch_id") or "") != str(evidence_epoch_id):
+            return None
         power = rollup.get("avg_power_w")
         if not isinstance(power, (int, float)):
             return None
@@ -105,23 +121,42 @@ class NoiseTracker:
             return None
         if rollup.get("demand_region") == "MIXED":
             return None
+        if rollup.get("current_envelope") in {None, "", "MIXED"}:
+            return None
+        if not bool(rollup.get("reference_eligible", True)):
+            return None
+        if (
+            int(
+                rollup.get("brightness_bucket")
+                if rollup.get("brightness_bucket") is not None
+                else -1
+            )
+            < 0
+        ):
+            return None
         if rollup.get("thermal_start") in {"THERMAL_PRESSURE", "THROTTLING"}:
             return None
 
-        strata = hard_strata_key(rollup)
+        strata = reference_strata_key(rollup)
         now = float(rollup.get("bucket_ts") or time.time())
         windows = (
             24.0 * 3600.0,
             7.0 * 86400.0,
             30.0 * 86400.0,
         )
-        recent = self.db.recent_rollups(now - max(windows), limit=5000)
+        recent = self.db.recent_rollups(
+            now - max(windows),
+            limit=5000,
+            evidence_epoch_id=evidence_epoch_id,
+        )
         comparable = [
             item
             for item in recent
-            if hard_strata_key(item) == strata
+            if str(item.get("evidence_epoch_id") or "") == str(evidence_epoch_id)
+            and reference_strata_key(item) == strata
             and not item.get("trial_id")
             and item.get("demand_region") != "MIXED"
+            and bool(item.get("reference_eligible", True))
             and isinstance(item.get("avg_power_w"), (int, float))
         ]
 

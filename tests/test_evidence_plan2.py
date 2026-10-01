@@ -8,6 +8,7 @@ from sp7_powerlab.evidence import (
     NoiseTracker,
     build_crossover_episode,
     hard_strata_key,
+    reference_strata_key,
 )
 from sp7_powerlab.storage import Database
 
@@ -64,19 +65,37 @@ def make_epoch(db: Database) -> str:
     )
 
 
+def bind_measurement_trust(db: Database, epoch: str) -> None:
+    active = db.active_evidence_epoch() or {}
+    db.set_meta(
+        "measurement_trust",
+        {
+            "status": "READY",
+            "recommended_min_arm_seconds": 20.0,
+            "evidence_epoch_id": epoch,
+            "battery_epoch": active.get("battery_epoch"),
+            "calibration_version": active.get("calibration_version"),
+            "evidence_semantics_version": active.get("evidence_semantics_version"),
+        },
+    )
+
+
 def test_noise_tracker_freezes_reference_and_keeps_recent_distribution(project_root: Path):
     config = load_config(project_root)
     db = Database(project_root / "runtime/evidence.sqlite3")
     try:
         epoch = make_epoch(db)
+        bind_measurement_trust(db, epoch)
         tracker = NoiseTracker(config, db)
         values = (5.0, 5.1, 4.9, 5.0)
         for index, power in enumerate(values):
             item = rollup(100.0 + index * 60.0, power)
+            item["evidence_epoch_id"] = epoch
+            item["reference_eligible"] = True
             db.add_rollup(item)
             tracker.observe_rollup(item, evidence_epoch_id=epoch)
 
-        strata = hard_strata_key(rollup(999, 5.0))
+        strata = reference_strata_key(rollup(999, 5.0))
         frozen = db.reference_baseline(epoch, strata)
         recent = db.noise_distribution(epoch, strata, window_seconds=7 * 86400)
         assert frozen is not None
@@ -88,6 +107,8 @@ def test_noise_tracker_freezes_reference_and_keeps_recent_distribution(project_r
         frozen_median = frozen["median_power_w"]
         for index in range(5):
             item = rollup(1000.0 + index * 60.0, 6.0)
+            item["evidence_epoch_id"] = epoch
+            item["reference_eligible"] = True
             db.add_rollup(item)
             tracker.observe_rollup(item, evidence_epoch_id=epoch)
         assert db.reference_baseline(epoch, strata)["median_power_w"] == frozen_median
@@ -95,6 +116,95 @@ def test_noise_tracker_freezes_reference_and_keeps_recent_distribution(project_r
             db.noise_distribution(epoch, strata, window_seconds=7 * 86400)["median_power_w"]
             > frozen_median
         )
+    finally:
+        db.close()
+
+
+def test_new_evidence_epoch_does_not_reuse_old_rollups(project_root: Path):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/evidence-epoch-isolation.sqlite3")
+    try:
+        first = make_epoch(db)
+        bind_measurement_trust(db, first)
+        tracker = NoiseTracker(config, db)
+        for index in range(4):
+            item = rollup(100.0 + index * 60.0, 5.0)
+            item["evidence_epoch_id"] = first
+            item["reference_eligible"] = True
+            db.add_rollup(item)
+            tracker.observe_rollup(item, evidence_epoch_id=first)
+
+        second = db.ensure_evidence_epoch(
+            hard_identity_hash="hard-fp-2",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=1,
+            payload={"test": True},
+        )
+        bind_measurement_trust(db, second)
+        new_item = rollup(1000.0, 9.0)
+        new_item["evidence_epoch_id"] = second
+        new_item["reference_eligible"] = True
+        db.add_rollup(new_item)
+        tracker.observe_rollup(new_item, evidence_epoch_id=second)
+
+        strata = reference_strata_key(new_item)
+        assert db.reference_baseline(second, strata) is None
+        noise = db.noise_distribution(second, strata, window_seconds=7 * 86400)
+        assert noise is not None
+        assert noise["sample_count"] == 1
+    finally:
+        db.close()
+
+
+def test_reference_noise_separates_brightness_buckets(project_root: Path):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/evidence-brightness.sqlite3")
+    try:
+        epoch = make_epoch(db)
+        bind_measurement_trust(db, epoch)
+        tracker = NoiseTracker(config, db)
+        for index, power in enumerate((5.0, 5.1, 4.9)):
+            item = rollup(100.0 + index * 60.0, power)
+            item["brightness_bucket"] = 40
+            item["evidence_epoch_id"] = epoch
+            item["reference_eligible"] = True
+            db.add_rollup(item)
+            tracker.observe_rollup(item, evidence_epoch_id=epoch)
+        bright = rollup(400.0, 8.0)
+        bright["brightness_bucket"] = 80
+        bright["evidence_epoch_id"] = epoch
+        bright["reference_eligible"] = True
+        db.add_rollup(bright)
+        tracker.observe_rollup(bright, evidence_epoch_id=epoch)
+
+        dim_key = reference_strata_key({**rollup(999, 5.0), "brightness_bucket": 40})
+        bright_key = reference_strata_key({**rollup(999, 8.0), "brightness_bucket": 80})
+        dim_ref = db.reference_baseline(epoch, dim_key)
+        assert dim_ref is not None
+        assert abs(dim_ref["median_power_w"] - 5.0) < 1e-9
+        assert db.reference_baseline(epoch, bright_key) is None
+    finally:
+        db.close()
+
+
+def test_noise_tracker_does_not_freeze_reference_before_measurement_trust(
+    project_root: Path,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/evidence-no-trust.sqlite3")
+    try:
+        epoch = make_epoch(db)
+        tracker = NoiseTracker(config, db)
+        last = None
+        for index, power in enumerate((5.0, 5.1, 4.9, 5.0)):
+            item = rollup(100.0 + index * 60.0, power)
+            item["evidence_epoch_id"] = epoch
+            item["reference_eligible"] = True
+            db.add_rollup(item)
+            last = tracker.observe_rollup(item, evidence_epoch_id=epoch)
+        assert last is None
+        assert db.reference_baseline(epoch, reference_strata_key(item)) is None
     finally:
         db.close()
 

@@ -61,7 +61,9 @@ NO_CHANGE
 - 优先解决 gauge cadence、quantization、energy delta、integration consistency 和 minimum arm duration；
 - 不用一个看起来漂亮的平均 W 覆盖 data-quality failure。
 
-新 battery epoch 先重新建立 Measurement Trust，再依赖这些测量完成 calibration。
+新 battery epoch 先建立 preliminary Measurement Trust，证明 gauge/积分路径可用；完成 calibration 后，
+因为 hard evidence context 已变化，必须再建立一次绑定当前 evidence epoch 的 Measurement Trust，
+之后才能积累 Frozen Reference / Recent Noise 或开始 trial。
 
 ## 5. Evidence 纪律
 

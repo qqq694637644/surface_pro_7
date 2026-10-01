@@ -305,3 +305,130 @@ def test_level_four_auto_promotion_requires_explicit_flag(project_root: Path):
         assert service.stack["trials"].promotions == ["verified-auto"]
     finally:
         service.db.close()
+
+
+def test_rollup_with_mixed_envelope_and_brightness_is_not_reference_eligible(
+    project_root: Path,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/mixed-rollup.sqlite3")
+    lifecycle = LifecycleManager(db)
+    epoch = db.ensure_evidence_epoch(
+        hard_identity_hash="fp",
+        battery_epoch=1,
+        calibration_version=1,
+        evidence_semantics_version=1,
+        payload={},
+    )
+    service = object.__new__(PowerLabService)
+    service.root = project_root
+    service.config = config
+    service.db = db
+    service.stack = {
+        "fingerprint": "fp",
+        "noise": SimpleNamespace(observe_rollup=lambda *_args, **_kwargs: None),
+        "drift": SimpleNamespace(detect=lambda *_args, **_kwargs: None),
+        "unexpected_power": SimpleNamespace(detect=lambda *_args, **_kwargs: None),
+        "lifecycle": lifecycle,
+        "collector": SimpleNamespace(trigger_diagnostic_burst=lambda: None),
+    }
+    db.set_meta(
+        "measurement_trust",
+        {
+            "status": "READY",
+            "evidence_epoch_id": epoch,
+            "battery_epoch": 1,
+            "calibration_version": 1,
+            "evidence_semantics_version": 1,
+        },
+    )
+    try:
+        common = {
+            "wall_ts": "x",
+            "battery_status": "Discharging",
+            "battery_pct": 80,
+            "battery_power_w": 5.0,
+            "battery_energy_wh": 30.0,
+            "battery_epoch": 1,
+            "cpu_psi": 0.1,
+            "io_psi": 0.1,
+            "rapl_power_60s_w": 2.0,
+            "thermal_pressure": 0.1,
+            "thermal_state": "COOL",
+            "demand_region": "ACTIVE|LAT_MEDIUM|CPU_LOW|NO_MEDIA|NET_LOW|LOCAL",
+            "local_compute_pressure": "LOW",
+            "media_playing": False,
+            "user_active": True,
+            "remote_hint": 0.0,
+            "network_rx_mbps": 0.0,
+            "network_tx_mbps": 0.0,
+            "evidence_epoch": epoch,
+            "resume_grace": False,
+        }
+        db.add_sample(
+            {
+                **common,
+                "ts": 100.0,
+                "brightness_pct": 40,
+                "current_envelope": "INTERACTIVE_EFFICIENT",
+            }
+        )
+        db.add_sample(
+            {
+                **common,
+                "ts": 120.0,
+                "brightness_pct": 80,
+                "current_envelope": "REMOTE_EFFICIENT",
+            }
+        )
+        result = service._rollup(100.0, 120.0)
+        assert result is not None
+        assert result["reference_eligible"] is False
+        assert result["current_envelope"] == "MIXED"
+        assert result["brightness_bucket"] == -1
+        assert "envelope" in result["mixed_dimensions"]
+        assert "brightness" in result["mixed_dimensions"]
+    finally:
+        db.close()
+
+
+def test_hard_epoch_change_invalidates_trust_and_exits_stable(project_root: Path):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/epoch-transition.sqlite3")
+    lifecycle = LifecycleManager(db)
+    old_epoch = db.ensure_evidence_epoch(
+        hard_identity_hash="old-fp",
+        battery_epoch=1,
+        calibration_version=1,
+        evidence_semantics_version=int(config.get("evidence.semantics_version", 1)),
+        payload={},
+    )
+    db.set_meta(
+        "measurement_trust",
+        {
+            "status": "READY",
+            "evidence_epoch_id": old_epoch,
+            "battery_epoch": 1,
+            "calibration_version": 1,
+            "evidence_semantics_version": int(config.get("evidence.semantics_version", 1)),
+        },
+    )
+    lifecycle.synchronize_learning(calibration_valid=True)
+    lifecycle.freeze("test stable")
+    service = object.__new__(PowerLabService)
+    service.root = project_root
+    service.config = config
+    service.db = db
+    service.stack = {
+        "machine": load_machine(project_root),
+        "fingerprint": "new-fp",
+        "lifecycle": lifecycle,
+    }
+    try:
+        new_epoch = service._sync_evidence_epoch(1)
+        assert new_epoch != old_epoch
+        assert db.get_meta("measurement_trust")["status"] == "BLOCKED"
+        assert db.get_meta("measurement_trust")["reasons"] == ["evidence_epoch_changed"]
+        assert lifecycle.learning_state() == "BASELINE_OBSERVATION"
+    finally:
+        db.close()

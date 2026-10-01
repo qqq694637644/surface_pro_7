@@ -16,8 +16,8 @@ sp7-powerlab agent-context
 
 当前 runtime：
 
-- SQLite schema v4
-- evidence semantics v1
+- SQLite schema v5
+- evidence semantics v2
 - 旧 runtime schema fail-fast，不维护兼容迁移
 - AI 入口：AGENTS.md + sp7-powerlab agent-context
 - 设计合同：PLAN2.md
@@ -70,7 +70,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 
 正确顺序：
 
-battery epoch -> Measurement Trust -> calibration
+battery epoch -> preliminary Measurement Trust -> calibration -> current-epoch Measurement Trust
 
 bounded_burst 只看热惯性和短时行为，不用于证明持续满载性能。
 
@@ -282,13 +282,15 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 1. 正常电池 + 新 battery epoch
 2. hardware/thermald/ownership 只读检查
 3. 记录真实 gauge cadence / quantization
-4. Measurement Trust READY
+4. preliminary Measurement Trust READY，证明 gauge/积分路径可用
 5. 完成四阶段 calibration
-6. adopt 当前真实 HWP state 为首个 verified baseline
-7. 收集自然 baseline/noise
-8. coarse optimization
-9. STABLE burn-in
-10. fixed-good / monitoring / dynamic / full Net Benefit comparison
+6. calibration 产生新的 hard evidence epoch 后重新运行 Measurement Trust
+7. current-epoch Measurement Trust READY
+8. adopt 当前真实 HWP state 为首个 verified baseline
+9. 收集只属于当前 evidence epoch、稳定 brightness/envelope 的自然 baseline/noise
+10. coarse optimization
+11. STABLE burn-in
+12. fixed-good / monitoring / dynamic / full Net Benefit comparison
 
 ## 当前不能声称
 

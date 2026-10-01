@@ -184,14 +184,14 @@ root helper 只提供有限 HWP inspect/snapshot/apply/restore，不提供任意
 sp7-powerlab calibrate new-battery
 ~~~
 
-随后先收集只读 telemetry，建立 Measurement Trust：
+随后先收集只读 telemetry，建立 preliminary Measurement Trust：
 
 ~~~bash
 sp7-powerlab evidence gauge --hours 6
 sp7-powerlab evidence trust --hours 6
 ~~~
 
-Measurement Trust READY 后，再完成 calibration：
+preliminary Measurement Trust READY 后，再完成 calibration：
 
 ~~~bash
 sp7-powerlab calibrate start cold_idle
@@ -206,6 +206,15 @@ sp7-powerlab calibrate finish
 sp7-powerlab calibrate start bounded_burst
 sp7-powerlab calibrate finish
 ~~~
+
+Calibration 改变 hard evidence context，因此完成后必须重新建立当前 epoch 的 Measurement Trust：
+
+~~~bash
+sp7-powerlab evidence gauge --hours 6
+sp7-powerlab evidence trust --hours 6
+~~~
+
+只有这次 current-epoch Measurement Trust READY 后，才开始 frozen reference/noise、trial 或 Scheduler 学习。
 
 具体流程和真机注意事项见 docs/FIRST_RUN.md。
 

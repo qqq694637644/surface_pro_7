@@ -3,6 +3,7 @@ from pathlib import Path
 from sp7_powerlab.config import load_config
 from sp7_powerlab.controller import BatteryLifeController
 from sp7_powerlab.envelopes import EnvelopeRegistry
+from sp7_powerlab.lifecycle import EMERGENCY, LifecycleManager
 from sp7_powerlab.storage import Database
 
 
@@ -27,6 +28,19 @@ class FakeActuator:
     def restore(self, snapshot):
         self.state = dict(snapshot)
         return {"after": dict(self.state)}
+
+
+class FailApplyAndRollbackActuator(FakeActuator):
+    def apply_envelope(self, env):
+        self.state = {
+            "epp": {"policy0": env["epp"]},
+            "max_perf_pct": env["max_perf_pct"],
+            "turbo": env["turbo"],
+        }
+        raise RuntimeError("injected apply failure")
+
+    def restore(self, snapshot):
+        raise RuntimeError("injected rollback failure")
 
 
 def make_controller(project_root: Path, *, writable=True, calibrated=True):
@@ -266,5 +280,50 @@ def test_emergency_state_still_allows_thermal_safe_preemption(project_root):
         assert result.desired_envelope == "THERMAL_SAFE"
         assert result.read_only is False
         assert actuator.applied == ["THERMAL_SAFE"]
+    finally:
+        db.close()
+
+
+def test_rollback_integrity_fault_is_latched_until_verified_recovery(project_root):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/rollback-latch.sqlite3")
+    registry = EnvelopeRegistry(project_root, db)
+    registry.load()
+    actuator = FailApplyAndRollbackActuator()
+    controller = BatteryLifeController(
+        config,
+        db,
+        registry,
+        actuator,
+        hardware_writable=True,
+        calibration_valid=True,
+        clock=lambda: 100.0,
+    )
+    lifecycle = LifecycleManager(db)
+    try:
+        result = controller.step(sample(), demand(), thermal())
+        assert result.action == "FAILED"
+        assert controller.rollback_integrity_ok() is False
+        assert controller.rollback_integrity_fault()["active"] is True
+
+        controller.hardware_writable = True
+        lifecycle.synchronize_control(
+            calibration_valid=True,
+            hardware_writable=True,
+            thermal_provider_healthy=True,
+            core_telemetry_valid=True,
+            rollback_integrity_ok=controller.rollback_integrity_ok(),
+        )
+        assert lifecycle.control_state() == EMERGENCY
+
+        actuator.state = {
+            "epp": {"policy0": "balance_power"},
+            "max_perf_pct": 50,
+            "turbo": True,
+        }
+        matched = controller.recover_rollback_integrity_fault("manual verified recovery")
+        assert matched == "REMOTE_EFFICIENT"
+        assert controller.rollback_integrity_ok() is True
+        assert db.get_meta("rollback_integrity_fault")["active"] is False
     finally:
         db.close()

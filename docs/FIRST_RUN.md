@@ -134,7 +134,7 @@ Measurement Trust = READY
 - 检查 battery telemetry 是否稳定；
 - 不开始自动 candidate search。
 
-## 6. Measurement Trust READY 后再 Calibration
+## 6. preliminary Measurement Trust READY 后再 Calibration
 
 按顺序：
 
@@ -162,6 +162,16 @@ sp7-powerlab agent-context
 bounded_burst 只用于热惯性和短时行为。
 
 不要把它当 sustained benchmark。
+
+Calibration 完成会改变 hard evidence context。此时之前的 preliminary trust 只证明“测量路径可用”，
+不能直接授权当前 epoch 的长期学习。重新运行：
+
+~~~bash
+sp7-powerlab evidence gauge --hours 6
+sp7-powerlab evidence trust --hours 6
+~~~
+
+只有新的 current-epoch Measurement Trust READY 后，才建立 Frozen Reference / Recent Noise 或开始 trial。
 
 ## 7. 收编第一个真实 verified baseline
 
@@ -330,16 +340,19 @@ sp7-powerlab lifecycle freeze --reason "real usage coverage and net benefit vali
 
 ~~~bash
 sp7-powerlab overhead compare reference.jsonl monitoring.jsonl \
-  --mode MONITORING_OVERHEAD
+  --mode MONITORING_OVERHEAD --campaign sp7-net-benefit-01
 
 sp7-powerlab overhead compare reference.jsonl dynamic.jsonl \
-  --mode DYNAMIC_CONTROLLER
+  --mode DYNAMIC_CONTROLLER --campaign sp7-net-benefit-01
 
 sp7-powerlab overhead compare reference.jsonl full.jsonl \
-  --mode FULL_POWERLAB
+  --mode FULL_POWERLAB --campaign sp7-net-benefit-01
 
 sp7-powerlab overhead summary
 ~~~
+
+三个 mode 必须来自同一个 current evidence epoch，并使用同一个 campaign 名称；否则不会作为
+一组完整 Net Benefit evidence 让 STABLE readiness 通过。
 
 如果结果建议 FIXED_GOOD_ENVELOPE，就不要因为项目已经复杂而强行保留动态系统。
 

@@ -106,6 +106,23 @@ class LifecycleManager:
             )
         return current
 
+    def evidence_epoch_changed(
+        self,
+        *,
+        calibration_valid: bool,
+        previous_epoch_id: str | None,
+        current_epoch_id: str,
+    ) -> str:
+        state = BASELINE_OBSERVATION if calibration_valid else CALIBRATING
+        return self.set_learning(
+            state,
+            "hard evidence epoch changed; rebuild current-epoch trust/reference evidence",
+            {
+                "previous_evidence_epoch": previous_epoch_id,
+                "current_evidence_epoch": current_epoch_id,
+            },
+        )
+
     def freeze(self, reason: str = "manual freeze") -> str:
         return self.set_learning(STABLE, reason)
 

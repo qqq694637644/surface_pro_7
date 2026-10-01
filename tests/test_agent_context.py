@@ -8,6 +8,7 @@ from sp7_powerlab.agent_context import (
 )
 from sp7_powerlab.config import load_config
 from sp7_powerlab.envelopes import EnvelopeRegistry
+from sp7_powerlab.lifecycle import LifecycleManager
 from sp7_powerlab.storage import Database
 
 
@@ -64,7 +65,7 @@ def test_agent_context_is_compact_runtime_truth_entrypoint(
         after_runs = db.conn.execute("SELECT COUNT(*) FROM llm_runs").fetchone()[0]
 
         assert before_runs == after_runs
-        assert context["project"]["runtime_schema"] == 4
+        assert context["project"]["runtime_schema"] == 5
         assert context["project"]["git"]["commit"] == "abc123"
         assert context["documentation"]["ai_entry"] == "AGENTS.md"
         assert context["documentation"]["design_contract"] == "PLAN2.md"
@@ -153,5 +154,110 @@ def test_agent_context_does_not_sync_config_envelopes_into_runtime(
         assert db.envelopes() == []
         build_agent_context(config, db, registry)
         assert db.envelopes() == []
+    finally:
+        db.close()
+
+
+def test_agent_context_marks_stale_measurement_trust_blocked(
+    project_root: Path,
+    monkeypatch,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/stale-trust.sqlite3")
+    registry = EnvelopeRegistry(project_root, db)
+    registry.load()
+    db.ensure_battery_epoch(
+        identity_hash="battery",
+        energy_full_wh=40.0,
+        payload={},
+    )
+    first = db.ensure_evidence_epoch(
+        hard_identity_hash="old",
+        battery_epoch=1,
+        calibration_version=1,
+        evidence_semantics_version=1,
+        payload={},
+    )
+    db.set_meta(
+        "measurement_trust",
+        {
+            "status": "READY",
+            "evidence_epoch_id": first,
+            "battery_epoch": 1,
+            "calibration_version": 1,
+            "evidence_semantics_version": 1,
+        },
+    )
+    db.ensure_evidence_epoch(
+        hard_identity_hash="new",
+        battery_epoch=1,
+        calibration_version=1,
+        evidence_semantics_version=1,
+        payload={},
+    )
+    monkeypatch.setattr(
+        "sp7_powerlab.agent_context.inspect_hardware",
+        lambda **_kwargs: FakeHardwareReport(),
+    )
+    monkeypatch.setattr(
+        "sp7_powerlab.agent_context._git_context",
+        lambda _root: {"commit": "abc123", "branch": "test", "dirty": False},
+    )
+    try:
+        context = build_agent_context(config, db, registry)
+        assert context["battery"]["measurement_trust"]["status"] == "BLOCKED"
+        assert context["battery"]["measurement_trust"]["valid_for_active_evidence_epoch"] is False
+        assert context["current_stage"]["name"] == "STAGE_A_MEASUREMENT_TRUST"
+    finally:
+        db.close()
+
+
+def test_agent_context_does_not_call_stale_stable_converged(
+    project_root: Path,
+    monkeypatch,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/stale-stable.sqlite3")
+    registry = EnvelopeRegistry(project_root, db)
+    registry.load()
+    db.ensure_battery_epoch(
+        identity_hash="battery",
+        energy_full_wh=40.0,
+        payload={},
+    )
+    epoch = db.ensure_evidence_epoch(
+        hard_identity_hash="hard",
+        battery_epoch=1,
+        calibration_version=1,
+        evidence_semantics_version=1,
+        payload={},
+    )
+    db.set_meta(
+        "measurement_trust",
+        {
+            "status": "READY",
+            "evidence_epoch_id": epoch,
+            "battery_epoch": 1,
+            "calibration_version": 1,
+            "evidence_semantics_version": 1,
+        },
+    )
+    lifecycle = LifecycleManager(db)
+    lifecycle.synchronize_learning(calibration_valid=True)
+    lifecycle.freeze("test stale stable")
+    monkeypatch.setattr(
+        "sp7_powerlab.agent_context.inspect_hardware",
+        lambda **_kwargs: FakeHardwareReport(),
+    )
+    monkeypatch.setattr(
+        "sp7_powerlab.agent_context._git_context",
+        lambda _root: {"commit": "abc123", "branch": "test", "dirty": False},
+    )
+    try:
+        context = build_agent_context(config, db, registry)
+        assert context["runtime"]["learning_lifecycle"] == "STABLE"
+        assert context["stable_readiness"]["ready"] is False
+        assert context["current_stage"]["name"] == "STABLE_STALE"
+        assert context["current_stage"]["status"] == "BLOCKED"
     finally:
         db.close()

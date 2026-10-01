@@ -25,8 +25,16 @@ def valid_duration(rows: list[dict[str, Any]], max_gap_seconds: float) -> float:
     total = 0.0
     for previous, current in zip(rows, rows[1:], strict=False):
         dt = float(current["ts"]) - float(previous["ts"])
-        if 0 < dt <= max_gap_seconds:
-            total += dt
+        if not (0 < dt <= max_gap_seconds):
+            continue
+        if (
+            previous.get("battery_status") != "Discharging"
+            or current.get("battery_status") != "Discharging"
+            or previous.get("resume_grace")
+            or current.get("resume_grace")
+        ):
+            continue
+        total += dt
     return total
 
 
@@ -57,6 +65,7 @@ def summarize_block(
     max_gap_seconds: float = 45.0,
     max_consistency_ratio: float = 0.35,
     max_consistency_abs_wh: float = 0.05,
+    require_energy_delta: bool = False,
 ) -> dict[str, Any]:
     valid_rows = [
         row
@@ -84,12 +93,13 @@ def summarize_block(
         for row in valid_rows
         if isinstance(row.get("brightness_pct"), (int, float))
     ]
-    duration = valid_duration(valid_rows, max_gap_seconds)
+    duration = valid_duration(rows, max_gap_seconds)
     energy = measurement_energy_summary(
         rows,
         max_gap_seconds=max_gap_seconds,
         max_consistency_ratio=max_consistency_ratio,
         max_consistency_abs_wh=max_consistency_abs_wh,
+        require_energy_delta=require_energy_delta,
     )
     return {
         "sample_count": len(valid_rows),

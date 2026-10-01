@@ -4,10 +4,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .config import Config
+from .config import Config, load_machine
 from .envelopes import EnvelopeRegistry
-from .evidence import EvidenceEngine, hard_strata_key
+from .evidence import EvidenceEngine, reference_strata_key
 from .lifecycle import COARSE_OPTIMIZATION, CONTROL_ALLOWED, REOPENED, LifecycleManager
+from .measurement import measurement_trust_matches_epoch
 from .storage import Database
 
 EPP_ORDER = (
@@ -54,6 +55,21 @@ class CandidateScheduler:
 
         return json.loads(row[0])
 
+    def _candidate_exposure_seconds(self, since_ts: float) -> float:
+        rows = self.db.recent_samples(since_ts)
+        max_gap = float(self.config.get("collector.max_gap_seconds", 45.0))
+        total = 0.0
+        for previous, current in zip(rows, rows[1:], strict=False):
+            if previous.get("trial_id") != current.get("trial_id"):
+                continue
+            arm = str(previous.get("trial_arm") or "")
+            if not arm.startswith("B") or str(current.get("trial_arm") or "") != arm:
+                continue
+            dt = float(current["ts"]) - float(previous["ts"])
+            if 0 < dt <= max_gap:
+                total += dt
+        return total
+
     def _eligibility(
         self,
         *,
@@ -99,14 +115,7 @@ class CandidateScheduler:
         if weekly_trial_count >= weekly_trial_budget:
             reasons.append("weekly_trial_budget_exhausted")
 
-        candidate_seconds = float(
-            self.db.conn.execute(
-                """SELECT COALESCE(SUM(valid_seconds),0) FROM arm_measurements
-                WHERE role='candidate' AND end_ts>=?""",
-                (time.time() - 86400.0,),
-            ).fetchone()[0]
-            or 0.0
-        )
+        candidate_seconds = self._candidate_exposure_seconds(time.time() - 86400.0)
         candidate_minutes = candidate_seconds / 60.0
         daily_candidate_budget = float(
             self.config.get("scheduler.max_candidate_minutes_per_day", 30.0)
@@ -150,23 +159,33 @@ class CandidateScheduler:
 
         measurement_trust = self.db.get_meta("measurement_trust", {})
         details["measurement_trust"] = measurement_trust
-        if not isinstance(measurement_trust, dict) or measurement_trust.get("status") != "READY":
+        epoch = self.db.active_evidence_epoch()
+        if not measurement_trust_matches_epoch(measurement_trust, epoch):
             reasons.append("measurement_trust_not_ready")
 
         baseline = self.db.envelope(baseline_name)
         if not baseline or baseline.get("status") != "VERIFIED":
             reasons.append("baseline_not_verified")
 
-        epoch = self.db.active_evidence_epoch()
         details["evidence_epoch"] = epoch
         if not epoch:
             reasons.append("missing_evidence_epoch")
+        else:
+            machine = load_machine(self.config.root)
+            calibration = machine.get("calibration") or {}
+            battery = machine.get("battery") or {}
+            if int(epoch.get("calibration_version") or 0) != int(calibration.get("version") or 0):
+                reasons.append("evidence_epoch_calibration_mismatch")
+            if int(epoch.get("battery_epoch") or 0) != int(battery.get("active_epoch") or 0):
+                reasons.append("evidence_epoch_battery_mismatch")
 
         if not rollup:
             reasons.append("missing_recent_rollup")
             return not reasons, reasons, details
+        if str(rollup.get("evidence_epoch_id") or "") != str((epoch or {}).get("epoch_id") or ""):
+            reasons.append("rollup_evidence_epoch_mismatch")
 
-        strata = hard_strata_key({**rollup, "current_envelope": baseline_name})
+        strata = reference_strata_key({**rollup, "current_envelope": baseline_name})
         details["strata_key"] = strata
         useful = self.evidence.minimum_useful_effect(
             evidence_epoch_id=(epoch or {}).get("epoch_id"),
@@ -229,6 +248,9 @@ class CandidateScheduler:
                 self._candidate_changes(
                     baseline,
                     ux_regression=ux_regression,
+                    allow_race_to_idle_probe=(
+                        str((rollup or {}).get("local_compute_pressure") or "") == "MODERATE"
+                    ),
                 )
             )
         return {
@@ -243,6 +265,7 @@ class CandidateScheduler:
         baseline: dict[str, Any],
         *,
         ux_regression: bool,
+        allow_race_to_idle_probe: bool = False,
     ) -> list[tuple[str, dict[str, Any]]]:
         result: list[tuple[str, dict[str, Any]]] = []
         step = int(self.config.get("scheduler.max_perf_step_pct", 5))
@@ -274,6 +297,15 @@ class CandidateScheduler:
 
         if bool(baseline["turbo"]) and bool(self.config.get("scheduler.allow_turbo_off", True)):
             result.append(("disable_turbo", {"turbo": False}))
+        if allow_race_to_idle_probe:
+            if current_perf + step <= max_perf:
+                result.append(("race_to_idle_max_perf", {"max_perf_pct": current_perf + step}))
+            try:
+                index = EPP_ORDER.index(current_epp)
+            except ValueError:
+                index = -1
+            if index > 0:
+                result.append(("race_to_idle_epp", {"epp": EPP_ORDER[index - 1]}))
         return result
 
     def candidates(
@@ -308,8 +340,15 @@ class CandidateScheduler:
         }
 
         candidates: list[dict[str, Any]] = []
+        allow_race_to_idle_probe = (
+            str((rollup or {}).get("local_compute_pressure") or "") == "MODERATE"
+        )
         for order, (reason, changes) in enumerate(
-            self._candidate_changes(baseline, ux_regression=ux_regression)
+            self._candidate_changes(
+                baseline,
+                ux_regression=ux_regression,
+                allow_race_to_idle_probe=allow_race_to_idle_probe,
+            )
         ):
             candidate = self.registry.candidate_from_change(baseline_name, changes)
             key = str(candidate["content_hash"])

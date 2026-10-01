@@ -39,7 +39,6 @@ def build_knowledge_pack(
     history_hours = float(config.get("llm.history_hours", 24))
     since = now - history_hours * 3600
     samples = db.recent_samples(since)
-    rollups = db.recent_rollups(since, limit=500)
     incidents = db.recent_incidents(
         since,
         limit=int(config.get("llm.max_incidents", 20)),
@@ -72,6 +71,12 @@ def build_knowledge_pack(
     machine = load_machine(config.root)
     lifecycle = LifecycleManager(db)
     evidence_epoch = db.active_evidence_epoch()
+    evidence_epoch_id = (evidence_epoch or {}).get("epoch_id")
+    rollups = db.recent_rollups(
+        since,
+        limit=500,
+        evidence_epoch_id=evidence_epoch_id,
+    )
     coverage_days = int(config.get("stable.coverage_days", 30))
     usage_coverage = UsageCoverage(db).summarize(
         since_ts=now - coverage_days * 86400.0,
@@ -81,16 +86,23 @@ def build_knowledge_pack(
     net_benefit = assess_net_benefit(
         monitoring_runs,
         practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
+        evidence_epoch_id=evidence_epoch_id,
     )
-    noise_rows = [
-        dict(row)
-        for row in db.conn.execute(
-            """SELECT updated_ts,evidence_epoch_id,strata_key,window_seconds,
-            median_power_w,mad_power_w,noise_floor_w,sample_count
-            FROM recent_noise_distributions
-            ORDER BY updated_ts DESC LIMIT 50"""
-        )
-    ]
+    noise_rows = (
+        [
+            dict(row)
+            for row in db.conn.execute(
+                """SELECT updated_ts,evidence_epoch_id,strata_key,window_seconds,
+                median_power_w,mad_power_w,noise_floor_w,sample_count
+                FROM recent_noise_distributions
+                WHERE evidence_epoch_id=?
+                ORDER BY updated_ts DESC LIMIT 50""",
+                (evidence_epoch_id,),
+            )
+        ]
+        if evidence_epoch_id
+        else []
+    )
     pack = {
         "generated_ts": now,
         "objective": (
@@ -140,11 +152,20 @@ def build_knowledge_pack(
         "evidence": {
             "active_epoch": evidence_epoch,
             "compatibility_tags": db.active_compatibility_tags(),
-            "recent_decisions": db.evidence_decisions(limit=20),
+            "recent_decisions": db.evidence_decisions(
+                evidence_epoch_id=evidence_epoch_id,
+                limit=20,
+            ),
             "recent_noise": noise_rows,
-            "frozen_reference_count": db.conn.execute(
-                "SELECT COUNT(*) FROM reference_baselines WHERE frozen=1"
-            ).fetchone()[0],
+            "frozen_reference_count": (
+                db.conn.execute(
+                    """SELECT COUNT(*) FROM reference_baselines
+                    WHERE frozen=1 AND evidence_epoch_id=?""",
+                    (evidence_epoch_id,),
+                ).fetchone()[0]
+                if evidence_epoch_id
+                else 0
+            ),
         },
         "investigations": db.recent_investigations(20),
         "unexpected_power_events": db.recent_unexpected_power_events(20),

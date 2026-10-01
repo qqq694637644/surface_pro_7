@@ -103,7 +103,7 @@ def test_measurement_trust_derives_go_no_go_and_recommended_arm_duration():
         max_gap_seconds=90,
     )
     assert result["status"] == "READY"
-    assert result["recommended_min_arm_seconds"] == 576.0
+    assert abs(result["recommended_min_arm_seconds"] - 576.0) < 1e-9
 
     blocked = assess_measurement_trust(
         rows[:2],
@@ -115,3 +115,71 @@ def test_measurement_trust_derives_go_no_go_and_recommended_arm_duration():
     )
     assert blocked["status"] == "BLOCKED"
     assert "insufficient_discharging_samples" in blocked["reasons"]
+
+
+def test_measurement_trust_does_not_reconnect_across_charging_gap():
+    rows = [
+        row(0, 5.0, 30.0),
+        row(10, 20.0, 30.1, status="Charging"),
+        row(20, 5.0, 30.0),
+    ]
+    result = assess_measurement_trust(
+        rows,
+        min_samples=2,
+        min_observation_seconds=10,
+        configured_min_arm_seconds=20,
+        energy_quantum_multiplier=8.0,
+        max_gap_seconds=45,
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["observation_seconds"] == 0.0
+    assert result["energy_quality"]["data_quality"] == "DATA_QUALITY_FAILURE"
+    assert result["gauge"]["energy_quantum_wh"] is None
+
+
+def test_measurement_trust_does_not_reconnect_across_resume_grace():
+    rows = [
+        row(0, 5.0, 30.0),
+        row(10, 5.0, 29.99, resume=True),
+        row(20, 5.0, 29.98),
+    ]
+    result = assess_measurement_trust(
+        rows,
+        min_samples=2,
+        min_observation_seconds=10,
+        configured_min_arm_seconds=20,
+        energy_quantum_multiplier=8.0,
+        max_gap_seconds=45,
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["observation_seconds"] == 0.0
+
+
+def test_gauge_quantum_uses_robust_repeated_step_not_single_jitter():
+    rows = [
+        row(0, 5.0, 30.000),
+        row(60, 5.0, 29.999),
+        row(120, 5.0, 29.899),
+        row(180, 5.0, 29.799),
+    ]
+    result = characterize_battery_gauge(
+        rows,
+        expected_power_w=5.0,
+        max_gap_seconds=90,
+    )
+    assert abs(result["energy_quantum_wh"] - 0.1) < 1e-9
+
+
+def test_long_trusted_arm_requires_energy_endpoint_delta():
+    rows = [
+        row(0, 5.0, 30.0),
+        row(60, 5.0, 30.0),
+        row(120, 5.0, 30.0),
+    ]
+    summary = measurement_energy_summary(
+        rows,
+        max_gap_seconds=90,
+        require_energy_delta=True,
+    )
+    assert summary["consistency_status"] == "UNAVAILABLE_OR_QUANTIZED"
+    assert summary["data_quality"] == "DATA_QUALITY_FAILURE"

@@ -90,3 +90,21 @@ def test_unexpected_power_investigation_does_not_reopen_learning(tmp_path: Path)
         assert manager.learning_state() == STABLE
     finally:
         db.close()
+
+
+def test_hard_evidence_epoch_change_exits_stable(tmp_path: Path):
+    db = Database(tmp_path / "state.sqlite3")
+    try:
+        manager = LifecycleManager(db)
+        manager.synchronize_learning(calibration_valid=True)
+        manager.freeze("stable")
+        assert manager.learning_state() == STABLE
+
+        manager.evidence_epoch_changed(
+            calibration_valid=True,
+            previous_epoch_id="ee-old",
+            current_epoch_id="ee-new",
+        )
+        assert manager.learning_state() == BASELINE_OBSERVATION
+    finally:
+        db.close()

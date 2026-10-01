@@ -4,7 +4,7 @@ from pathlib import Path
 
 from sp7_powerlab.config import load_config
 from sp7_powerlab.envelopes import EnvelopeRegistry
-from sp7_powerlab.evidence import hard_strata_key
+from sp7_powerlab.evidence import reference_strata_key
 from sp7_powerlab.lifecycle import LifecycleManager
 from sp7_powerlab.scheduler import CandidateScheduler
 from sp7_powerlab.storage import Database
@@ -44,13 +44,6 @@ def make_scheduler(project_root: Path):
         thermal_provider_healthy=True,
         core_telemetry_valid=True,
     )
-    db.set_meta(
-        "measurement_trust",
-        {
-            "status": "READY",
-            "recommended_min_arm_seconds": 20.0,
-        },
-    )
     epoch = db.ensure_evidence_epoch(
         hard_identity_hash="hard",
         battery_epoch=1,
@@ -58,8 +51,21 @@ def make_scheduler(project_root: Path):
         evidence_semantics_version=1,
         payload={},
     )
+    db.set_meta(
+        "measurement_trust",
+        {
+            "status": "READY",
+            "recommended_min_arm_seconds": 20.0,
+            "evidence_epoch_id": epoch,
+            "battery_epoch": 1,
+            "calibration_version": 1,
+            "evidence_semantics_version": 1,
+        },
+    )
     item = rollup()
-    strata = hard_strata_key(item)
+    item["evidence_epoch_id"] = epoch
+    item["reference_eligible"] = True
+    strata = reference_strata_key(item)
     db.upsert_noise_distribution(
         {
             "evidence_epoch_id": epoch,
@@ -94,7 +100,6 @@ def test_scheduler_requires_assisted_trial_automation_level(project_root: Path):
             thermal_provider_healthy=True,
             core_telemetry_valid=True,
         )
-        db.set_meta("measurement_trust", {"status": "READY"})
         epoch = db.ensure_evidence_epoch(
             hard_identity_hash="hard",
             battery_epoch=1,
@@ -103,10 +108,22 @@ def test_scheduler_requires_assisted_trial_automation_level(project_root: Path):
             payload={},
         )
         item = rollup()
+        item["evidence_epoch_id"] = epoch
+        item["reference_eligible"] = True
+        db.set_meta(
+            "measurement_trust",
+            {
+                "status": "READY",
+                "evidence_epoch_id": epoch,
+                "battery_epoch": 1,
+                "calibration_version": 1,
+                "evidence_semantics_version": 1,
+            },
+        )
         db.upsert_noise_distribution(
             {
                 "evidence_epoch_id": epoch,
-                "strata_key": hard_strata_key(item),
+                "strata_key": reference_strata_key(item),
                 "window_seconds": 7 * 86400,
                 "median_power_w": 5.0,
                 "mad_power_w": 0.04,
@@ -144,6 +161,27 @@ def test_scheduler_energy_first_discrete_neighbors(project_root: Path):
         ]
         assert result["candidates"][0]["changes"] == {"max_perf_pct": 55}
         assert result["candidates"][1]["changes"] == {"epp": "power"}
+        assert {"max_perf_pct": 65} not in [
+            candidate["changes"] for candidate in result["candidates"]
+        ]
+    finally:
+        db.close()
+
+
+def test_scheduler_can_probe_race_to_idle_with_moderate_local_compute_signal(
+    project_root: Path,
+):
+    db, _lifecycle, scheduler, item = make_scheduler(project_root)
+    try:
+        item["local_compute_pressure"] = "MODERATE"
+        result = scheduler.candidates(
+            baseline_name="INTERACTIVE_EFFICIENT",
+            rollup=item,
+        )
+        assert result["eligible"] is True
+        changes = [candidate["changes"] for candidate in result["candidates"]]
+        assert {"max_perf_pct": 65} in changes
+        assert {"epp": "balance_performance"} in changes
     finally:
         db.close()
 
@@ -231,7 +269,7 @@ def test_scheduler_stops_when_noise_limited_arm_exceeds_daily_budget(project_roo
         db.upsert_noise_distribution(
             {
                 "evidence_epoch_id": epoch,
-                "strata_key": hard_strata_key(item),
+                "strata_key": reference_strata_key(item),
                 "window_seconds": 7 * 86400,
                 "median_power_w": 5.0,
                 "mad_power_w": 0.25,
@@ -250,6 +288,30 @@ def test_scheduler_stops_when_noise_limited_arm_exceeds_daily_budget(project_roo
         assert result["eligible"] is False
         assert "minimum_arm_duration_exceeds_daily_candidate_budget" in result["reasons"]
         assert result["details"]["recommended_arm"]["noise_min_arm_seconds"] == 6000.0
+    finally:
+        db.close()
+
+
+def test_scheduler_candidate_exposure_counts_unfinished_settle_time(project_root: Path):
+    db, _lifecycle, scheduler, item = make_scheduler(project_root)
+    try:
+        now = __import__("time").time()
+        for offset in (0, 20, 40, 60):
+            db.add_sample(
+                {
+                    "ts": now - 60 + offset,
+                    "wall_ts": str(now - 60 + offset),
+                    "battery_status": "Discharging",
+                    "battery_epoch": 1,
+                    "trial_id": "trial-settle",
+                    "trial_arm": "B1",
+                }
+            )
+        result = scheduler.candidates(
+            baseline_name="INTERACTIVE_EFFICIENT",
+            rollup=item,
+        )
+        assert result["details"]["candidate_minutes_last_24h"] >= 1.0
     finally:
         db.close()
 

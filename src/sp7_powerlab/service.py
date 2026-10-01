@@ -30,6 +30,7 @@ from .hardware import inspect_hardware, system_fingerprint, thermal_sensor_path
 from .helper import RootHelperClient
 from .lifecycle import CONTROL_ALLOWED, EMERGENCY, STABLE, LifecycleManager
 from .longterm import DriftDetector
+from .measurement import measurement_trust_matches_epoch
 from .scheduler import CandidateScheduler
 from .storage import Database
 from .telemetry import TelemetryCollector
@@ -180,6 +181,7 @@ def prepare_stack(root: Path, config_path: Path | None = None) -> dict[str, Any]
         hardware_writable=bool(report.control_capable and actuator_available),
         thermal_provider_healthy=bool(report.thermald.get("active")),
         core_telemetry_valid=False,
+        rollback_integrity_ok=controller.rollback_integrity_ok(),
     )
     noise = NoiseTracker(config, db)
     unexpected_power = UnexpectedPowerDetector(config, db)
@@ -374,6 +376,7 @@ class PowerLabService:
         return epoch
 
     def _sync_evidence_epoch(self, battery_epoch: int) -> str:
+        previous = self.db.active_evidence_epoch()
         calibration_version = int(
             (self.stack["machine"].get("calibration") or {}).get("version") or 0
         )
@@ -392,6 +395,26 @@ class PowerLabService:
             evidence_semantics_version=semantics_version,
             payload=payload,
         )
+        if previous and str(previous.get("epoch_id")) != str(epoch_id):
+            previous_trust = self.db.get_meta("measurement_trust", {})
+            self.db.set_meta(
+                "measurement_trust",
+                {
+                    **(previous_trust if isinstance(previous_trust, dict) else {}),
+                    "status": "BLOCKED",
+                    "reasons": ["evidence_epoch_changed"],
+                    "invalidated_ts": time.time(),
+                    "invalidated_by_evidence_epoch": epoch_id,
+                },
+            )
+            calibration_valid = bool(
+                (self.stack["machine"].get("calibration") or {}).get("valid", False)
+            )
+            self.stack["lifecycle"].evidence_epoch_changed(
+                calibration_valid=calibration_valid,
+                previous_epoch_id=str(previous.get("epoch_id") or "") or None,
+                current_epoch_id=epoch_id,
+            )
         self.stack["evidence_epoch"] = epoch_id
         return epoch_id
 
@@ -409,24 +432,90 @@ class PowerLabService:
             for row in rows
             if row.get("local_compute_pressure")
         }
-        brightness = [
-            float(row["brightness_pct"])
+        brightness_buckets = {
+            (
+                brightness_bucket(row.get("brightness_pct"))
+                if isinstance(row.get("brightness_pct"), (int, float))
+                else None
+            )
             for row in rows
-            if isinstance(row.get("brightness_pct"), (int, float))
-        ]
+        }
+        envelopes = {
+            str(row.get("current_envelope")) if row.get("current_envelope") else None
+            for row in rows
+        }
+        media_states = {
+            bool(row.get("media_playing"))
+            if isinstance(row.get("media_playing"), (bool, int))
+            else None
+            for row in rows
+        }
+        active_states = {
+            bool(row.get("user_active"))
+            if isinstance(row.get("user_active"), (bool, int))
+            else None
+            for row in rows
+        }
+        remote_buckets = {
+            (
+                remote_bucket(row.get("remote_hint"))
+                if isinstance(row.get("remote_hint"), (int, float))
+                else None
+            )
+            for row in rows
+        }
+        evidence_epochs = {
+            str(row.get("evidence_epoch")) if row.get("evidence_epoch") else None for row in rows
+        }
+        mixed_dimensions: list[str] = []
+        for name, values in (
+            ("brightness", brightness_buckets),
+            ("envelope", envelopes),
+            ("media", media_states),
+            ("user_active", active_states),
+            ("remote", remote_buckets),
+            ("evidence_epoch", evidence_epochs),
+        ):
+            if len(values) != 1 or None in values:
+                mixed_dimensions.append(name)
         first = rows[0]
         last = rows[-1]
         rollup = {
             "bucket_ts": bucket,
             "battery_epoch": last.get("battery_epoch"),
-            "brightness_bucket": brightness_bucket(_median(brightness)),
+            "brightness_bucket": (
+                next(iter(brightness_buckets))
+                if len(brightness_buckets) == 1 and None not in brightness_buckets
+                else -1
+            ),
             "demand_region": (next(iter(demand_regions)) if len(demand_regions) == 1 else "MIXED"),
-            "media_playing": bool(last.get("media_playing")),
-            "user_active": bool(last.get("user_active")),
-            "remote_bucket": remote_bucket(last.get("remote_hint")),
+            "media_playing": (
+                next(iter(media_states))
+                if len(media_states) == 1 and None not in media_states
+                else None
+            ),
+            "user_active": (
+                next(iter(active_states))
+                if len(active_states) == 1 and None not in active_states
+                else None
+            ),
+            "remote_bucket": (
+                next(iter(remote_buckets))
+                if len(remote_buckets) == 1 and None not in remote_buckets
+                else -1
+            ),
             "thermal_start": first.get("thermal_state"),
             "system_fingerprint": self.stack["fingerprint"],
-            "current_envelope": last.get("current_envelope"),
+            "current_envelope": (
+                next(iter(envelopes)) if len(envelopes) == 1 and None not in envelopes else "MIXED"
+            ),
+            "evidence_epoch_id": (
+                next(iter(evidence_epochs))
+                if len(evidence_epochs) == 1 and None not in evidence_epochs
+                else None
+            ),
+            "reference_eligible": not mixed_dimensions,
+            "mixed_dimensions": mixed_dimensions,
             "trial_id": next(
                 (row.get("trial_id") for row in rows if row.get("trial_id")),
                 None,
@@ -442,7 +531,11 @@ class PowerLabService:
         }
         self.db.add_rollup(rollup)
         evidence_epoch = self.db.active_evidence_epoch()
-        if evidence_epoch:
+        measurement_trust = self.db.get_meta("measurement_trust", {})
+        if evidence_epoch and measurement_trust_matches_epoch(
+            measurement_trust,
+            evidence_epoch,
+        ):
             self.stack["noise"].observe_rollup(
                 rollup,
                 evidence_epoch_id=str(evidence_epoch["epoch_id"]),
@@ -638,7 +731,7 @@ class PowerLabService:
             hardware_writable=bool(self.stack["controller"].hardware_writable),
             thermal_provider_healthy=bool(sample.get("thermald_active")),
             core_telemetry_valid=self.stack["trials"]._core_telemetry_valid(sample),
-            rollback_integrity_ok=bool(self.stack["controller"].hardware_writable),
+            rollback_integrity_ok=self.stack["controller"].rollback_integrity_ok(),
             thermal_emergency=thermal["state"] in {"THERMAL_PRESSURE", "THROTTLING"},
         )
         self.db.add_sample(sample)

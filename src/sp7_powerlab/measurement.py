@@ -24,6 +24,22 @@ def _valid_interval(
         return None
     if previous.get("resume_grace") or current.get("resume_grace"):
         return None
+    previous_battery_epoch = previous.get("battery_epoch")
+    current_battery_epoch = current.get("battery_epoch")
+    if (
+        previous_battery_epoch is not None
+        and current_battery_epoch is not None
+        and previous_battery_epoch != current_battery_epoch
+    ):
+        return None
+    previous_evidence_epoch = previous.get("evidence_epoch")
+    current_evidence_epoch = current.get("evidence_epoch")
+    if (
+        previous_evidence_epoch is not None
+        and current_evidence_epoch is not None
+        and previous_evidence_epoch != current_evidence_epoch
+    ):
+        return None
     return dt
 
 
@@ -75,6 +91,7 @@ def measurement_energy_summary(
     max_gap_seconds: float,
     max_consistency_ratio: float = 0.35,
     max_consistency_abs_wh: float = 0.05,
+    require_energy_delta: bool = False,
 ) -> dict[str, Any]:
     integrated, valid_seconds = integrate_battery_energy_wh(
         rows,
@@ -95,6 +112,8 @@ def measurement_energy_summary(
         # could not be checked. Stage A gauge characterization determines how
         # long future arms must be before endpoint delta is required.
         consistency_status = "UNAVAILABLE_OR_QUANTIZED"
+        if require_energy_delta:
+            quality = "DATA_QUALITY_FAILURE"
     else:
         error_wh = abs(integrated - delta)
         error_ratio = error_wh / max(integrated, delta, 1e-9)
@@ -115,35 +134,74 @@ def measurement_energy_summary(
     }
 
 
-def _minimum_positive_step(values: list[float]) -> float | None:
-    steps = sorted(
-        {
-            round(abs(right - left), 9)
-            for left, right in zip(values, values[1:], strict=False)
-            if right != left
-        }
-    )
-    return steps[0] if steps else None
+def _robust_positive_step(steps: list[float]) -> float | None:
+    return statistics.median(steps) if steps else None
+
+
+def _positive_steps(
+    rows: list[dict[str, Any]],
+    key: str,
+    *,
+    max_gap_seconds: float | None,
+) -> list[float]:
+    steps: list[float] = []
+    for previous, current in zip(rows, rows[1:], strict=False):
+        if (
+            max_gap_seconds is not None
+            and _valid_interval(previous, current, max_gap_seconds=max_gap_seconds) is None
+        ):
+            continue
+        left = previous.get(key)
+        right = current.get(key)
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            continue
+        step = abs(float(right) - float(left))
+        if step > 0:
+            steps.append(step)
+    return steps
 
 
 def _median_change_cadence(
     rows: list[dict[str, Any]],
     key: str,
+    *,
+    max_gap_seconds: float | None = None,
 ) -> float | None:
-    changed_at: list[float] = []
-    previous_value: Any = object()
+    intervals: list[float] = []
+    previous_value: float | None = None
+    last_change_ts: float | None = None
+    previous_row: dict[str, Any] | None = None
     for row in rows:
         value = row.get(key)
         if not isinstance(value, (int, float)):
+            previous_row = row
+            previous_value = None
+            last_change_ts = None
             continue
-        if value != previous_value:
-            changed_at.append(float(row["ts"]))
-            previous_value = value
-    intervals = [
-        right - left
-        for left, right in zip(changed_at, changed_at[1:], strict=False)
-        if right > left
-    ]
+        if (
+            max_gap_seconds is not None
+            and previous_row is not None
+            and _valid_interval(
+                previous_row,
+                row,
+                max_gap_seconds=max_gap_seconds,
+            )
+            is None
+        ):
+            previous_value = float(value)
+            last_change_ts = float(row["ts"])
+            previous_row = row
+            continue
+        if previous_value is None:
+            previous_value = float(value)
+            last_change_ts = float(row["ts"])
+        elif float(value) != previous_value:
+            current_ts = float(row["ts"])
+            if last_change_ts is not None and current_ts > last_change_ts:
+                intervals.append(current_ts - last_change_ts)
+            previous_value = float(value)
+            last_change_ts = current_ts
+        previous_row = row
     return statistics.median(intervals) if intervals else None
 
 
@@ -152,21 +210,30 @@ def characterize_battery_gauge(
     *,
     expected_power_w: float | None = None,
     energy_quantum_multiplier: float = 8.0,
+    max_gap_seconds: float | None = None,
 ) -> dict[str, Any]:
-    energy_values = [
-        float(row["battery_energy_wh"])
-        for row in rows
-        if isinstance(row.get("battery_energy_wh"), (int, float))
-    ]
-    power_values = [
-        float(row["battery_power_w"])
-        for row in rows
-        if isinstance(row.get("battery_power_w"), (int, float))
-    ]
-    quantum = _minimum_positive_step(energy_values)
-    power_quantum = _minimum_positive_step(power_values)
-    energy_cadence = _median_change_cadence(rows, "battery_energy_wh")
-    power_cadence = _median_change_cadence(rows, "battery_power_w")
+    energy_steps = _positive_steps(
+        rows,
+        "battery_energy_wh",
+        max_gap_seconds=max_gap_seconds,
+    )
+    power_steps = _positive_steps(
+        rows,
+        "battery_power_w",
+        max_gap_seconds=max_gap_seconds,
+    )
+    quantum = _robust_positive_step(energy_steps)
+    power_quantum = _robust_positive_step(power_steps)
+    energy_cadence = _median_change_cadence(
+        rows,
+        "battery_energy_wh",
+        max_gap_seconds=max_gap_seconds,
+    )
+    power_cadence = _median_change_cadence(
+        rows,
+        "battery_power_w",
+        max_gap_seconds=max_gap_seconds,
+    )
     minimum_arm_seconds = None
     if (
         quantum is not None
@@ -179,8 +246,18 @@ def characterize_battery_gauge(
         "power_quantum_w": power_quantum,
         "energy_update_cadence_seconds": energy_cadence,
         "power_update_cadence_seconds": power_cadence,
-        "observed_energy_points": len(energy_values),
-        "observed_power_points": len(power_values),
+        "observed_energy_points": sum(
+            isinstance(row.get("battery_energy_wh"), (int, float))
+            and row.get("battery_status") == "Discharging"
+            and not row.get("resume_grace")
+            for row in rows
+        ),
+        "observed_power_points": sum(
+            isinstance(row.get("battery_power_w"), (int, float))
+            and row.get("battery_status") == "Discharging"
+            and not row.get("resume_grace")
+            for row in rows
+        ),
         "energy_quantum_multiplier": energy_quantum_multiplier,
         "minimum_arm_seconds_from_quantum": minimum_arm_seconds,
     }
@@ -206,15 +283,17 @@ def assess_measurement_trust(
     powers = [float(row["battery_power_w"]) for row in discharge]
     expected_power = statistics.fmean(powers) if powers else None
     gauge = characterize_battery_gauge(
-        discharge,
+        rows,
         expected_power_w=expected_power,
         energy_quantum_multiplier=energy_quantum_multiplier,
+        max_gap_seconds=max_gap_seconds,
     )
-    observed_seconds = (
-        float(discharge[-1]["ts"]) - float(discharge[0]["ts"]) if len(discharge) >= 2 else 0.0
+    _integrated, observed_seconds = integrate_battery_energy_wh(
+        rows,
+        max_gap_seconds=max_gap_seconds,
     )
     energy_summary = measurement_energy_summary(
-        discharge,
+        rows,
         max_gap_seconds=max_gap_seconds,
     )
     quantum_arm = gauge.get("minimum_arm_seconds_from_quantum")
@@ -248,6 +327,22 @@ def assess_measurement_trust(
         "gauge": gauge,
         "energy_quality": energy_summary,
     }
+
+
+def measurement_trust_matches_epoch(
+    record: dict[str, Any] | None,
+    epoch: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(record, dict) or record.get("status") != "READY":
+        return False
+    if not isinstance(epoch, dict):
+        return False
+    return (
+        record.get("evidence_epoch_id") == epoch.get("epoch_id")
+        and record.get("battery_epoch") == epoch.get("battery_epoch")
+        and record.get("calibration_version") == epoch.get("calibration_version")
+        and record.get("evidence_semantics_version") == epoch.get("evidence_semantics_version")
+    )
 
 
 def _read_text(path: Path) -> str | None:

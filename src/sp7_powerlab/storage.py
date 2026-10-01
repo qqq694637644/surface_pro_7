@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 ACTIVE_TRIAL_STATES = {
     "PROPOSED",
@@ -77,6 +77,7 @@ DDL = [
     "CREATE INDEX IF NOT EXISTS idx_samples_trial ON samples(trial_id, trial_arm, ts)",
     """CREATE TABLE IF NOT EXISTS power_rollups (
         bucket_ts REAL PRIMARY KEY,
+        evidence_epoch_id TEXT,
         battery_epoch INTEGER,
         brightness_bucket INTEGER,
         demand_region TEXT,
@@ -84,6 +85,8 @@ DDL = [
         remote_bucket INTEGER,
         thermal_start TEXT,
         system_fingerprint TEXT,
+        current_envelope TEXT,
+        reference_eligible INTEGER NOT NULL,
         valid_seconds REAL NOT NULL,
         avg_power_w REAL,
         median_power_w REAL,
@@ -95,6 +98,7 @@ DDL = [
         max_thermal_pressure REAL,
         payload_json TEXT NOT NULL
     )""",
+    "CREATE INDEX IF NOT EXISTS idx_power_rollups_epoch ON power_rollups(evidence_epoch_id,bucket_ts)",
     """CREATE TABLE IF NOT EXISTS demand_windows (
         ts REAL PRIMARY KEY,
         region TEXT NOT NULL,
@@ -683,13 +687,14 @@ class Database:
         with self.conn:
             self.conn.execute(
                 """INSERT OR REPLACE INTO power_rollups(
-                    bucket_ts,battery_epoch,brightness_bucket,demand_region,media_playing,
-                    remote_bucket,thermal_start,system_fingerprint,valid_seconds,avg_power_w,
-                    median_power_w,p90_power_w,p95_power_w,avg_rapl_w,avg_cpu_psi,avg_io_psi,
-                    max_thermal_pressure,payload_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    bucket_ts,evidence_epoch_id,battery_epoch,brightness_bucket,demand_region,
+                    media_playing,remote_bucket,thermal_start,system_fingerprint,current_envelope,
+                    reference_eligible,valid_seconds,avg_power_w,median_power_w,p90_power_w,
+                    p95_power_w,avg_rapl_w,avg_cpu_psi,avg_io_psi,max_thermal_pressure,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rollup["bucket_ts"],
+                    rollup.get("evidence_epoch_id"),
                     rollup.get("battery_epoch"),
                     rollup.get("brightness_bucket"),
                     rollup.get("demand_region"),
@@ -697,6 +702,8 @@ class Database:
                     rollup.get("remote_bucket"),
                     rollup.get("thermal_start"),
                     rollup.get("system_fingerprint"),
+                    rollup.get("current_envelope"),
+                    int(bool(rollup.get("reference_eligible", False))),
                     rollup.get("valid_seconds", 0.0),
                     rollup.get("avg_power_w"),
                     rollup.get("median_power_w"),
@@ -1282,13 +1289,27 @@ class Database:
         self,
         *,
         trial_id: str | None = None,
+        evidence_epoch_id: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        if trial_id:
+        if trial_id and evidence_epoch_id:
+            rows = self.conn.execute(
+                """SELECT payload_json FROM evidence_decisions
+                WHERE trial_id=? AND evidence_epoch_id=?
+                ORDER BY created_ts DESC LIMIT ?""",
+                (trial_id, evidence_epoch_id, limit),
+            )
+        elif trial_id:
             rows = self.conn.execute(
                 """SELECT payload_json FROM evidence_decisions
                 WHERE trial_id=? ORDER BY created_ts DESC LIMIT ?""",
                 (trial_id, limit),
+            )
+        elif evidence_epoch_id:
+            rows = self.conn.execute(
+                """SELECT payload_json FROM evidence_decisions
+                WHERE evidence_epoch_id=? ORDER BY created_ts DESC LIMIT ?""",
+                (evidence_epoch_id, limit),
             )
         else:
             rows = self.conn.execute(
@@ -1725,15 +1746,21 @@ class Database:
                 (time.time(), _json({"aborted": True, "reason": reason}), run_id),
             )
 
-    def recent_rollups(self, since_ts: float, limit: int = 500) -> list[dict[str, Any]]:
-        return [
-            _loads(row[0])
-            for row in self.conn.execute(
-                """SELECT payload_json FROM power_rollups
-                WHERE bucket_ts>=? ORDER BY bucket_ts DESC LIMIT ?""",
-                (since_ts, limit),
-            )
-        ]
+    def recent_rollups(
+        self,
+        since_ts: float,
+        limit: int = 500,
+        *,
+        evidence_epoch_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT payload_json FROM power_rollups WHERE bucket_ts>=?"
+        args: list[Any] = [since_ts]
+        if evidence_epoch_id is not None:
+            sql += " AND evidence_epoch_id=?"
+            args.append(evidence_epoch_id)
+        sql += " ORDER BY bucket_ts DESC LIMIT ?"
+        args.append(limit)
+        return [_loads(row[0]) for row in self.conn.execute(sql, args)]
 
     def recent_control_actions(self, since_ts: float, limit: int = 100) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
