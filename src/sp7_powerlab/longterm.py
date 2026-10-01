@@ -15,35 +15,58 @@ from .measurement import (
     measurement_energy_summary,
     measurement_trust_matches_epoch,
 )
+from .runtime_audit import audit_fixed_runtime, fixed_runtime_identity
 from .storage import Database
 
-NET_BENEFIT_MODES = (
-    "MONITORING_OVERHEAD",
-    "DYNAMIC_CONTROLLER",
+NET_BENEFIT_MODES = ("DYNAMIC_CONTROLLER",)
+
+DYNAMIC_RUNTIME_CODE_FILES = (
+    "actuators/hwp.py",
+    "controller.py",
+    "demand.py",
+    "envelopes.py",
+    "hardware.py",
+    "helper.py",
+    "lifecycle.py",
+    "service.py",
+    "storage.py",
+    "telemetry.py",
+    "thermal.py",
+    "unexpected_power.py",
 )
 
-RUNTIME_POLICY_CODE_EXCLUDES = {
-    "agent_cli.py",
-    "agent_context.py",
-    "analytics.py",
-    "attribution.py",
+STAGE_E_CODE_FILES = (
     "cli.py",
-    "llm.py",
-}
+    "envelopes.py",
+    "hardware.py",
+    "longterm.py",
+    "measurement.py",
+    "minimal_meter_cli.py",
+    "runtime_audit.py",
+    "storage.py",
+)
+
+DYNAMIC_POLICY_CONFIG_SECTIONS = (
+    "activity",
+    "automation",
+    "collector",
+    "controller",
+    "drift",
+    "unexpected_power",
+)
 
 
-def _runtime_code_identity(config: Config) -> dict[str, Any]:
+def _code_identity(config: Config, files_to_hash: tuple[str, ...]) -> dict[str, Any]:
     package_roots = (
         config.root / "src" / "sp7_powerlab",
         Path(__file__).resolve().parent,
     )
     package_root = next((path for path in package_roots if path.is_dir()), package_roots[-1])
     files: dict[str, str] = {}
-    for path in sorted(package_root.rglob("*.py")):
-        relative = path.relative_to(package_root).as_posix()
-        if relative in RUNTIME_POLICY_CODE_EXCLUDES or relative.endswith("/__init__.py"):
-            continue
-        files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for relative in files_to_hash:
+        path = package_root / relative
+        if path.is_file():
+            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     encoded = json.dumps(files, sort_keys=True, separators=(",", ":"))
     return {
         "aggregate_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
@@ -51,11 +74,12 @@ def _runtime_code_identity(config: Config) -> dict[str, Any]:
     }
 
 
+def stage_e_code_identity(config: Config) -> dict[str, Any]:
+    return _code_identity(config, STAGE_E_CODE_FILES)
+
+
 def runtime_policy_snapshot(config: Config, db: Database) -> dict[str, Any]:
-    excluded_config_sections = {"storage", "helper", "minimal_meter", "net_benefit", "stable"}
-    policy_config = {
-        key: value for key, value in config.data.items() if key not in excluded_config_sections
-    }
+    policy_config = {key: config.data.get(key) for key in DYNAMIC_POLICY_CONFIG_SECTIONS}
     verified_envelopes = [
         {
             "name": str(item.get("name") or ""),
@@ -70,7 +94,7 @@ def runtime_policy_snapshot(config: Config, db: Database) -> dict[str, Any]:
         "config": policy_config,
         "verified_envelopes": verified_envelopes,
         "manual_override": db.get_meta("manual_override"),
-        "code_identity": _runtime_code_identity(config),
+        "code_identity": _code_identity(config, DYNAMIC_RUNTIME_CODE_FILES),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {
@@ -276,6 +300,7 @@ def assess_net_benefit(
         run
         for run in runs
         if run.get("end_ts") is not None
+        and str(run.get("mode") or "") in NET_BENEFIT_MODES
         and (run.get("result") or {}).get("comparison_quality") == "OK"
         and (run.get("result") or {}).get("comparison_design") == "A_B_B_A"
         and bool((run.get("result") or {}).get("fixed_baseline_envelope"))
@@ -361,60 +386,86 @@ def assess_net_benefit(
                 )
             ],
             "campaign_id": selected_campaign,
+            "fixed_baseline_envelope": None,
             "fixed_baseline_content_hash": None,
             "selected_policy_mode": None,
             "selected_policy_fingerprint": None,
             "latest_runs": latest,
         }
 
-    monitoring_delta = float(deltas["MONITORING_OVERHEAD"])
     dynamic_delta = float(deltas["DYNAMIC_CONTROLLER"])
     reasons: list[str] = []
-    fixed_baseline_content_hash = str(
-        ((latest.get("MONITORING_OVERHEAD") or {}).get("result") or {}).get(
-            "fixed_baseline_content_hash"
-        )
-        or ""
-    )
-    monitoring_policy_fingerprint = str(
-        ((latest.get("MONITORING_OVERHEAD") or {}).get("result") or {}).get(
-            "runtime_policy_fingerprint"
-        )
-        or ""
-    )
-    dynamic_policy_fingerprint = str(
-        ((latest.get("DYNAMIC_CONTROLLER") or {}).get("result") or {}).get(
-            "runtime_policy_fingerprint"
-        )
-        or ""
-    )
+    dynamic_result = (latest.get("DYNAMIC_CONTROLLER") or {}).get("result") or {}
+    fixed_baseline_envelope = str(dynamic_result.get("fixed_baseline_envelope") or "")
+    fixed_baseline_content_hash = str(dynamic_result.get("fixed_baseline_content_hash") or "")
+    dynamic_policy_fingerprint = str(dynamic_result.get("runtime_policy_fingerprint") or "")
+    dynamic_block_deltas = [
+        float(value)
+        for value in (dynamic_result.get("candidate_block_deltas_w") or [])
+        if isinstance(value, (int, float))
+    ]
+    if len(dynamic_block_deltas) != 2:
+        return {
+            "complete": False,
+            "missing_modes": [],
+            "practical_threshold_w": practical_threshold_w,
+            "deltas_w": deltas,
+            "dynamic_block_deltas_w": dynamic_block_deltas,
+            "recommendation": "NEED_MORE_DATA",
+            "reasons": ["dynamic comparison lacks two independent candidate block effects"],
+            "campaign_id": selected_campaign,
+            "fixed_baseline_envelope": fixed_baseline_envelope or None,
+            "fixed_baseline_content_hash": fixed_baseline_content_hash or None,
+            "selected_policy_mode": None,
+            "selected_policy_fingerprint": None,
+            "latest_runs": latest,
+        }
+    practical_blocks = [value <= -float(practical_threshold_w) for value in dynamic_block_deltas]
 
-    if dynamic_delta <= -practical_threshold_w:
+    if all(practical_blocks):
         recommendation = "KEEP_DYNAMIC_CONTROLLER"
         selected_policy_mode = "DYNAMIC_CONTROLLER"
         selected_policy_fingerprint = dynamic_policy_fingerprint
-        reasons.append("dynamic controller beats fixed-good by a practical margin")
-        if monitoring_delta > 0:
-            reasons.append("monitoring overhead consumes part of the controller savings")
+        reasons.append("both dynamic blocks beat fixed-good by a practical margin")
+    elif any(practical_blocks):
+        return {
+            "complete": False,
+            "missing_modes": [],
+            "practical_threshold_w": practical_threshold_w,
+            "deltas_w": deltas,
+            "dynamic_block_deltas_w": dynamic_block_deltas,
+            "recommendation": "NEED_MORE_DATA",
+            "reasons": [
+                "dynamic benefit is not repeatable: only one candidate block clears the practical threshold"
+            ],
+            "campaign_id": selected_campaign,
+            "fixed_baseline_envelope": fixed_baseline_envelope or None,
+            "fixed_baseline_content_hash": fixed_baseline_content_hash or None,
+            "selected_policy_mode": None,
+            "selected_policy_fingerprint": None,
+            "latest_runs": latest,
+        }
     else:
         recommendation = "FIXED_GOOD_ENVELOPE"
         selected_policy_mode = "FIXED_GOOD"
-        # The MONITORING comparison runs at Automation Level 0 and _meter_campaign
-        # requires the same policy fingerprint for its A1/B1/B2/A2 blocks. Its
-        # fingerprint therefore represents the validated fixed-good runtime policy.
-        selected_policy_fingerprint = monitoring_policy_fingerprint
-        reasons.append("dynamic controller does not beat fixed-good by a practical margin")
+        selected_policy_fingerprint = fixed_runtime_identity(
+            evidence_epoch_id=str(dynamic_result.get("evidence_epoch_id") or ""),
+            envelope=fixed_baseline_envelope,
+            envelope_content_hash=fixed_baseline_content_hash,
+        )
+        reasons.append("neither dynamic block beats fixed-good by a practical margin")
 
     return {
         "complete": True,
         "missing_modes": [],
         "practical_threshold_w": practical_threshold_w,
         "deltas_w": deltas,
-        "monitoring_overhead_w": monitoring_delta,
         "dynamic_net_saving_w": -dynamic_delta,
+        "dynamic_block_deltas_w": dynamic_block_deltas,
         "recommendation": recommendation,
         "reasons": reasons,
         "campaign_id": selected_campaign,
+        "fixed_baseline_envelope": fixed_baseline_envelope or None,
         "fixed_baseline_content_hash": fixed_baseline_content_hash or None,
         "selected_policy_mode": selected_policy_mode,
         "selected_policy_fingerprint": selected_policy_fingerprint or None,
@@ -496,15 +547,15 @@ class StableReadiness:
         if open_events:
             reasons.append("unresolved_unexpected_power_event")
 
-        overhead_runs = [
-            run for run in self.db.monitoring_overhead_runs(100) if run.get("end_ts") is not None
+        net_benefit_results = [
+            run for run in self.db.net_benefit_results(100) if run.get("end_ts") is not None
         ]
         complete_campaign_ids = {
             str(item["campaign_id"])
             for item in self.db.net_benefit_campaigns(status="COMPLETE", limit=100)
         }
         net_benefit = assess_net_benefit(
-            overhead_runs,
+            net_benefit_results,
             practical_threshold_w=float(self.config.get("evidence.practical_threshold_w", 0.10)),
             evidence_epoch_id=(epoch or {}).get("epoch_id"),
             complete_campaign_ids=complete_campaign_ids,
@@ -517,13 +568,39 @@ class StableReadiness:
         current_policy = runtime_policy_snapshot(self.config, self.db)
         current_runtime_mode = runtime_mode_status(self.config, self.db, now=now)
         selected_policy_fingerprint = str(net_benefit.get("selected_policy_fingerprint") or "")
-        if net_benefit["complete"] and selected_policy_fingerprint != str(
-            current_policy["fingerprint"]
-        ):
-            reasons.append("net_benefit_selected_policy_is_stale")
         selected_policy_mode = str(net_benefit.get("selected_policy_mode") or "")
-        if net_benefit["complete"] and selected_policy_mode != str(
-            current_runtime_mode.get("mode") or ""
+        fixed_runtime_audit: dict[str, Any] | None = None
+        if net_benefit["complete"] and selected_policy_mode == "DYNAMIC_CONTROLLER":
+            if selected_policy_fingerprint != str(current_policy["fingerprint"]):
+                reasons.append("net_benefit_selected_policy_is_stale")
+        elif net_benefit["complete"] and selected_policy_mode == "FIXED_GOOD":
+            expected_fixed_identity = fixed_runtime_identity(
+                evidence_epoch_id=str((epoch or {}).get("epoch_id") or ""),
+                envelope=str(net_benefit.get("fixed_baseline_envelope") or ""),
+                envelope_content_hash=str(net_benefit.get("fixed_baseline_content_hash") or ""),
+            )
+            if selected_policy_fingerprint != expected_fixed_identity:
+                reasons.append("net_benefit_selected_policy_is_stale")
+            fixed_runtime_audit = audit_fixed_runtime(
+                self.config,
+                self.db,
+                evidence_epoch=epoch,
+                fixed_baseline_envelope=net_benefit.get("fixed_baseline_envelope"),
+                fixed_baseline_content_hash=net_benefit.get("fixed_baseline_content_hash"),
+            )
+            if not fixed_runtime_audit.get("ready"):
+                reasons.append("fixed_runtime_audit_failed")
+            else:
+                current_runtime_mode = {
+                    **current_runtime_mode,
+                    "mode": "FIXED_GOOD",
+                    "source": "fixed_runtime_audit",
+                    "service_unit_state": fixed_runtime_audit.get("service_state"),
+                }
+        if (
+            net_benefit["complete"]
+            and selected_policy_mode == "DYNAMIC_CONTROLLER"
+            and selected_policy_mode != str(current_runtime_mode.get("mode") or "")
         ):
             reasons.append("net_benefit_selected_runtime_mode_mismatch")
 
@@ -538,6 +615,7 @@ class StableReadiness:
             == str((epoch or {}).get("epoch_id") or "")
             and str(stable_entry.get("selected_policy_fingerprint") or "")
             == selected_policy_fingerprint
+            and bool((fixed_runtime_audit or {}).get("ready"))
         )
         if not preserve_fixed_entry_coverage:
             reasons.extend(coverage_reasons)
@@ -575,6 +653,7 @@ class StableReadiness:
             "net_benefit": net_benefit,
             "current_runtime_policy": current_policy,
             "current_runtime_mode": current_runtime_mode,
+            "fixed_runtime_audit": fixed_runtime_audit,
             "open_unexpected_power_events": len(open_events),
             "recent_negative_feedback_count": len(negative_feedback),
         }
@@ -688,6 +767,8 @@ def summarize_minimal_meter_samples(
         consistency_reasons.append("non_discharging_sample_present")
     if any(bool(row.get("resume_grace")) for row in rows):
         consistency_reasons.append("resume_grace_present")
+    if any(bool(row.get("suspend_or_resume_detected")) for row in rows):
+        consistency_reasons.append("suspend_or_resume_detected")
     for field in ("battery_epoch", "evidence_epoch_id"):
         values = {str(row.get(field)) for row in rows if row.get(field) is not None}
         if len(values) > 1:

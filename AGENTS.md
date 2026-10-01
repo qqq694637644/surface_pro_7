@@ -26,7 +26,7 @@ PowerLab 只针对 Microsoft Surface Pro 7 / Intel Core i5-1035G4 / Linux + inte
 跟随 `docs/FIRST_RUN.md`。
 
 ### Agent 集成
-`docs/AI_LOOP.md` 定义长期闭环；`docs/MCP.md` 定义可选结构化接口。
+`docs/AI_LOOP.md` 定义 GPT-5.6 Sol + Bash 与 PowerLab runtime 的长期闭环。
 
 ## 3. Truth hierarchy
 
@@ -91,17 +91,15 @@ Stage E  End-to-End Net Benefit / Complexity Selection
 
 `BASELINE_OBSERVATION` 有当前 reference 后只是 Stage C ready；必须显式进入 optimize，不能直接跳 Stage D。
 
-正式 Stage E 只测：
-- FIXED_GOOD
-- MONITORING
-- DYNAMIC_CONTROLLER
-
-MONITORING 只解释 observer overhead。最终只保留 `KEEP_DYNAMIC_CONTROLLER`、`FIXED_GOOD_ENVELOPE` 或 `NEED_MORE_DATA`。
+正式 Stage E 只要求一个 A1-B1-B2-A2：A=FIXED_GOOD，B=DYNAMIC_CONTROLLER。
+MONITORING 只是按需 observer-overhead 诊断，不参与 STABLE readiness。
+最终只保留 `KEEP_DYNAMIC_CONTROLLER`、`FIXED_GOOD_ENVELOPE` 或 `NEED_MORE_DATA`。
 Level 2+ Scheduler/Agent/自动实验是按需学习能力，不是 formal Stage E 的长期 treatment。
-正式 Stage E 期间 hourly timer/service 必须停止；默认安装也不自动启用 hourly timer。
+当前运行时没有 scheduled Agent review unit；正式 Stage E 会拒绝残留旧 hourly unit 若其处于 active。
 
 StableReadiness 必须同时验证 selected policy fingerprint 和 actual selected runtime mode。
-runtime policy fingerprint 包含核心 control/evidence code identity；核心代码变化后旧 Stage E 不继续给新 runtime 背书。
+Dynamic runtime fingerprint 使用 Level-1 explicit code/config allowlist；Stage E 测量合同有独立 code identity。
+任一相关 identity 变化后旧 Stage E 不继续给新 runtime 背书。
 
 同名不等于同一份证据。按问题检查 battery epoch、hard evidence epoch、compatibility generation、envelope content hash、trial `evidence_scope_key`、Net Benefit campaign 和 runtime policy fingerprint。
 
@@ -140,6 +138,5 @@ Automation Level 约束 daemon/Scheduler 默认行为，不是同 UID Agent 的�
 - `docs/OPERATIONS.md`：已部署系统日常运维
 - `docs/DEPLOYMENT.md`：systemd / root helper / breaking runtime
 - `docs/AI_LOOP.md`：长期 Agent/runtime 闭环
-- `docs/MCP.md`：可选结构化接口
 
 不要用 Markdown 中的旧测试数、旧 commit 或旧 runtime 数字冒充当前事实。

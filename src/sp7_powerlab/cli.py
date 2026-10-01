@@ -19,8 +19,8 @@ from .demand import DemandObserver
 from .envelopes import EnvelopeRegistry
 from .hardware import inspect_hardware
 from .helper import RootHelperServer
+from .knowledge import build_review_pack
 from .lifecycle import LifecycleManager
-from .llm import build_knowledge_pack
 from .longterm import (
     StableReadiness,
     UsageCoverage,
@@ -784,8 +784,12 @@ def _meter_campaign(
 
     for run in runs:
         payload = run.get("payload") or {}
-        if int(payload.get("capture_contract_version") or 0) < 2:
-            raise SystemExit("Net Benefit comparison requires capture contract v2 provenance")
+        if int(payload.get("capture_contract_version") or 0) != 3:
+            raise SystemExit("Net Benefit comparison requires capture contract v3 provenance")
+    for field in ("stage_e_code_identity", "media_compatibility_generation"):
+        values = {str((run.get("payload") or {}).get(field) or "") for run in runs}
+        if len(values) != 1 or "" in values:
+            raise SystemExit(f"MinimalMeter {field} changed within A-B-B-A")
     before_end = float(reference_before.get("end_ts") or 0.0)
     first_start = float(candidate_first.get("start_ts") or 0.0)
     first_end = float(candidate_first.get("end_ts") or 0.0)
@@ -838,8 +842,14 @@ def _meter_campaign(
     ):
         db.invalidate_net_benefit_campaign(campaign_id, "fixed_baseline_changed")
         raise SystemExit("Net Benefit campaign fixed baseline no longer matches its contract")
-    comparisons = dict((campaign.get("payload") or {}).get("comparisons") or {})
-    if result_mode in comparisons:
+    campaign_payload = campaign.get("payload") or {}
+    for field in ("stage_e_code_identity", "media_compatibility_generation"):
+        run_value = str((candidate_first.get("payload") or {}).get(field) or "")
+        if str(campaign_payload.get(field) or "") != run_value:
+            db.invalidate_net_benefit_campaign(campaign_id, f"{field}_changed")
+            raise SystemExit(f"Net Benefit campaign {field} changed")
+    comparisons = dict(campaign_payload.get("comparisons") or {})
+    if result_mode == "DYNAMIC_CONTROLLER" and result_mode in comparisons:
         raise SystemExit(f"Net Benefit campaign already contains {result_mode}")
 
     active_epoch = db.active_evidence_epoch()
@@ -850,7 +860,7 @@ def _meter_campaign(
     return reference_before, candidate_first, candidate_second, reference_after, result_mode
 
 
-def cmd_overhead_compare(args: argparse.Namespace) -> int:
+def cmd_net_benefit_compare(args: argparse.Namespace) -> int:
     config, db = db_from_args(args)
     try:
         reference_before, candidate_first, candidate_second, reference_after, result_mode = (
@@ -921,8 +931,14 @@ def cmd_overhead_compare(args: argparse.Namespace) -> int:
             "fixed_baseline_envelope": reference_before["envelope"],
             "fixed_baseline_content_hash": reference_before["envelope_content_hash"],
             "runtime_policy_fingerprint": candidate_first["runtime_policy_fingerprint"],
+            "stage_e_code_identity": (candidate_first.get("payload") or {}).get(
+                "stage_e_code_identity"
+            ),
+            "media_compatibility_generation": (candidate_first.get("payload") or {}).get(
+                "media_compatibility_generation"
+            ),
         }
-        run_id = db.start_monitoring_overhead_run(
+        run_id = db.start_net_benefit_result(
             mode=result_mode,
             payload={
                 "comparison_design": "A_B_B_A",
@@ -935,9 +951,9 @@ def cmd_overhead_compare(args: argparse.Namespace) -> int:
                 "campaign_id": candidate_first["campaign_id"],
             },
         )
-        db.finish_monitoring_overhead_run(run_id, result)
+        db.finish_net_benefit_result(run_id, result)
         campaign = None
-        if result.get("comparison_quality") == "OK":
+        if result.get("comparison_quality") == "OK" and result_mode == "DYNAMIC_CONTROLLER":
             campaign = db.record_net_benefit_campaign_comparison(
                 str(candidate_first["campaign_id"]),
                 mode=result_mode,
@@ -950,16 +966,16 @@ def cmd_overhead_compare(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_overhead_history(args: argparse.Namespace) -> int:
+def cmd_net_benefit_history(args: argparse.Namespace) -> int:
     _config, db = db_from_args(args)
     try:
-        emit({"runs": db.monitoring_overhead_runs(args.limit)})
+        emit({"results": db.net_benefit_results(args.limit)})
     finally:
         db.close()
     return 0
 
 
-def cmd_overhead_summary(args: argparse.Namespace) -> int:
+def cmd_net_benefit_summary(args: argparse.Namespace) -> int:
     config, db = db_from_args(args)
     try:
         epoch = db.active_evidence_epoch()
@@ -969,7 +985,7 @@ def cmd_overhead_summary(args: argparse.Namespace) -> int:
         }
         emit(
             assess_net_benefit(
-                db.monitoring_overhead_runs(args.limit),
+                db.net_benefit_results(args.limit),
                 practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
                 evidence_epoch_id=(epoch or {}).get("epoch_id"),
                 complete_campaign_ids=complete_campaign_ids,
@@ -1182,18 +1198,6 @@ def cmd_trial_start(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_trial_evaluate(args: argparse.Namespace) -> int:
-    stack = _trial_stack(args)
-    try:
-        latest = stack["db"].latest_sample()
-        if not latest:
-            raise SystemExit("no telemetry sample available")
-        emit({"trial": stack["trials"].tick(latest)})
-    finally:
-        stack["db"].close()
-    return 0
-
-
 def cmd_trial_rollback(args: argparse.Namespace) -> int:
     stack = _trial_stack(args)
     try:
@@ -1235,10 +1239,10 @@ def cmd_feedback(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_hourly(args: argparse.Namespace) -> int:
+def cmd_review_pack(args: argparse.Namespace) -> int:
     config, db, registry = _registry(args)
     try:
-        pack = build_knowledge_pack(config, db, registry)
+        pack = build_review_pack(config, db, registry)
         if args.output:
             path = Path(args.output)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1247,23 +1251,6 @@ def cmd_hourly(args: argparse.Namespace) -> int:
                 encoding="utf-8",
             )
         emit(pack)
-    finally:
-        db.close()
-    return 0
-
-
-def cmd_knowledge_export(args: argparse.Namespace) -> int:
-    config, db, registry = _registry(args)
-    try:
-        pack = build_knowledge_pack(config, db, registry)
-        directory = ROOT / "history" / "continuous"
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "knowledge.json"
-        path.write_text(
-            json.dumps(pack, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
-            encoding="utf-8",
-        )
-        emit({"path": str(path), "run_id": pack["run_id"]})
     finally:
         db.close()
     return 0
@@ -1448,22 +1435,22 @@ def parser() -> argparse.ArgumentParser:
     evidence_trust.add_argument("--hours", type=float, default=6.0)
     evidence_trust.set_defaults(func=cmd_evidence_trust)
 
-    overhead = sub.add_parser("overhead")
-    overhead_sub = overhead.add_subparsers(dest="overhead_command", required=True)
-    overhead_compare = overhead_sub.add_parser("compare")
-    overhead_compare.add_argument("reference_before_run")
-    overhead_compare.add_argument("candidate_first_run")
-    overhead_compare.add_argument("candidate_second_run")
-    overhead_compare.add_argument("reference_after_run")
-    overhead_compare.add_argument("--usable-battery-wh", type=float)
-    overhead_compare.add_argument("--max-gap-seconds", type=float, default=90.0)
-    overhead_compare.set_defaults(func=cmd_overhead_compare)
-    overhead_history = overhead_sub.add_parser("history")
-    overhead_history.add_argument("--limit", type=int, default=20)
-    overhead_history.set_defaults(func=cmd_overhead_history)
-    overhead_summary = overhead_sub.add_parser("summary")
-    overhead_summary.add_argument("--limit", type=int, default=50)
-    overhead_summary.set_defaults(func=cmd_overhead_summary)
+    net_benefit = sub.add_parser("net-benefit")
+    net_benefit_sub = net_benefit.add_subparsers(dest="net_benefit_command", required=True)
+    net_benefit_compare = net_benefit_sub.add_parser("compare")
+    net_benefit_compare.add_argument("reference_before_run")
+    net_benefit_compare.add_argument("candidate_first_run")
+    net_benefit_compare.add_argument("candidate_second_run")
+    net_benefit_compare.add_argument("reference_after_run")
+    net_benefit_compare.add_argument("--usable-battery-wh", type=float)
+    net_benefit_compare.add_argument("--max-gap-seconds", type=float, default=90.0)
+    net_benefit_compare.set_defaults(func=cmd_net_benefit_compare)
+    net_benefit_history = net_benefit_sub.add_parser("history")
+    net_benefit_history.add_argument("--limit", type=int, default=20)
+    net_benefit_history.set_defaults(func=cmd_net_benefit_history)
+    net_benefit_summary = net_benefit_sub.add_parser("summary")
+    net_benefit_summary.add_argument("--limit", type=int, default=50)
+    net_benefit_summary.set_defaults(func=cmd_net_benefit_summary)
 
     scheduler = sub.add_parser("scheduler")
     scheduler_sub = scheduler.add_subparsers(dest="scheduler_command", required=True)
@@ -1511,8 +1498,6 @@ def parser() -> argparse.ArgumentParser:
     trial_start = trial_sub.add_parser("start")
     trial_start.add_argument("proposal")
     trial_start.set_defaults(func=cmd_trial_start)
-    trial_eval = trial_sub.add_parser("evaluate")
-    trial_eval.set_defaults(func=cmd_trial_evaluate)
     trial_rollback = trial_sub.add_parser("rollback")
     trial_rollback.add_argument("--trial-id")
     trial_rollback.add_argument("--reason", default="manual rollback")
@@ -1528,12 +1513,9 @@ def parser() -> argparse.ArgumentParser:
     feedback.add_argument("--notes")
     feedback.set_defaults(func=cmd_feedback)
 
-    hourly = sub.add_parser("hourly")
-    hourly.add_argument("--output")
-    hourly.set_defaults(func=cmd_hourly)
-
-    knowledge = sub.add_parser("knowledge-export")
-    knowledge.set_defaults(func=cmd_knowledge_export)
+    review_pack = sub.add_parser("review-pack")
+    review_pack.add_argument("--output")
+    review_pack.set_defaults(func=cmd_review_pack)
 
     service = sub.add_parser("service")
     service_sub = service.add_subparsers(dest="service_command", required=True)

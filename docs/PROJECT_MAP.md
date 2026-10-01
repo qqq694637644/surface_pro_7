@@ -435,7 +435,8 @@ UnexpectedPower detector。
 - StableReadiness
 - DriftDetector
 - runtime policy fingerprint
-- core control/evidence code identity
+- explicit Level-1 Dynamic runtime code identity
+- separate Stage E measurement-contract code identity
 - actual runtime mode validation
 - MinimalMeter A1-B1-B2-A2 paired comparison
 - brightness/active/media/remote/network/temperature comparability veto
@@ -456,15 +457,16 @@ Stage E 的低开销 capture 入口。
 负责在 capture-time 固定 provenance，并验证实际 runtime mode：
 
 - FIXED_GOOD：service 停止 + actual HWP 每点保持同一 VERIFIED envelope
-- MONITORING：live service + Automation Level 0 + fixed HWP
 - DYNAMIC_CONTROLLER：live CONTROL_ALLOWED service + Automation Level 1
+- MONITORING：可选诊断模式，live service + Automation Level 0 + fixed HWP
 
 同时采集 brightness、active/media/remote fraction 所需信号、basic network、package temperature 和
 actual HWP snapshot，并冻结 runtime policy fingerprint。trial/calibration、hard context 或 policy 变化会让
-run INVALID。每个正式 block 还必须是一段连续 Discharging observation，且 hourly timer/service 必须保持
-inactive。campaign 有独立 DB lifecycle，不允许跨周复用裸字符串拼结果。
+run INVALID。每个正式 block 还必须是一段连续 Discharging observation；若遗留 scheduled-review unit
+仍存在，它们必须保持 inactive。campaign 有独立 DB lifecycle，不允许跨周复用裸字符串拼结果。
 
-Level 2+ 的 Scheduler/Agent/自动学习是按需能力，不是 formal Stage E treatment。
+正式 STABLE evidence 只要求 Dynamic vs Fixed-good；MONITORING 不参与 readiness。Level 2+ 的
+Scheduler/Agent/自动学习是按需能力，不是 formal Stage E treatment。
 
 最终允许系统得出：
 
@@ -484,19 +486,18 @@ SQLite schema 和持久化 API。
 
 高频原始 SQLite 不进 Git。
 
-### src/sp7_powerlab/llm.py
+### src/sp7_powerlab/knowledge.py
 
-结构化 Agent knowledge pack 和 decision contract。
+构建按需 review pack。它只组织历史事实，不调用 LLM，也不提供 action DSL。
 
-它是可选高层接口，不是唯一 Agent 能力边界。
+CLI：`sp7-powerlab review-pack [--output PATH]`。
 
-### src/sp7_powerlab/agent_cli.py
+GPT-5.6 Sol 直接通过 Bash 使用主 CLI、SQLite、日志、sysfs 和源码；仓库不再维护第二套 Agent command language。
 
-sp7-powerlab-agent 便利 CLI。
+### src/sp7_powerlab/runtime_audit.py
 
-用于 observe/hourly/submit-decision 等结构化 workflow。
-
-拥有 Bash 的 Agent 也可以直接使用主 CLI、SQLite、日志和源码。
+FIXED_GOOD 的 one-shot 物理事实审计：main service、legacy scheduled units、thermald、ownership、live hard
+identity、verified fixed baseline 和 actual HWP snapshot。
 
 ### src/sp7_powerlab/cli.py
 
@@ -516,7 +517,6 @@ sp7-powerlab-agent 便利 CLI。
 - scheduler budgets
 - stable coverage
 - Net Benefit campaign/comparability limits
-- helper downgrade/reconnect threshold
 - drift thresholds
 
 不要把这些数值复制到 PLAN2；运行时以当前 config 为准。
@@ -566,7 +566,7 @@ thermal model 参数。
 - learning_lifecycle_history
 - unexpected_power_events
 - investigations
-- monitoring_overhead_runs
+- net_benefit_results
 - net_benefit_campaigns
 - minimal_meter_runs
 
@@ -630,9 +630,9 @@ sp7-powerlab investigation attribute <id>
 
 ### “PowerLab 自己到底值不值得？”
 
-sp7-powerlab overhead history
+sp7-powerlab net-benefit history
 
-sp7-powerlab overhead summary
+sp7-powerlab net-benefit summary
 
 ### “实验状态”
 
@@ -699,7 +699,6 @@ REMOTE_EFFICIENT 的判断不应依赖某个低 CPU ssh 进程一定进入 top-N
 - OPERATIONS.md：日常维护
 - DEPLOYMENT.md：systemd/root helper
 - AI_LOOP.md：Agent 与 PowerLab runtime 交互
-- MCP.md：可选结构化接口
 
 按任务读，不要机械加载全部文档：仓库工程优先 PROJECT_STATUS + PROJECT_MAP；真实 SP7 运维优先
 PROJECT_STATUS + agent-context + LLM_BEHAVIOR/OPERATIONS；设计变更再读 PLAN2。

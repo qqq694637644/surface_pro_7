@@ -72,6 +72,17 @@ def test_v7_database_fails_fast_after_campaign_schema_break(tmp_path: Path):
         Database(path)
 
 
+def test_v8_database_fails_fast_after_agent_surface_cleanup(tmp_path: Path):
+    path = tmp_path / "powerlab.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY,value_json TEXT NOT NULL)")
+    conn.execute("INSERT INTO metadata(key,value_json) VALUES('schema_version','8')")
+    conn.commit()
+    conn.close()
+    with pytest.raises(LegacyDatabaseError, match="schema 8"):
+        Database(path)
+
+
 def test_v1_database_fails_fast(tmp_path: Path):
     path = tmp_path / "powerlab.sqlite3"
     conn = sqlite3.connect(path)
@@ -126,7 +137,7 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
             battery_identity_hash="battery-a",
             hard_identity_hash="hard-a",
             calibration_version=3,
-            evidence_semantics_version=7,
+            evidence_semantics_version=8,
             envelope="INTERACTIVE_EFFICIENT",
             envelope_content_hash="env-hash",
             runtime_policy_fingerprint="policy-hash",
@@ -152,7 +163,7 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
         assert run["battery_identity_hash"] == "battery-a"
         assert run["hard_identity_hash"] == "hard-a"
         assert run["calibration_version"] == 3
-        assert run["evidence_semantics_version"] == 7
+        assert run["evidence_semantics_version"] == 8
         assert run["envelope"] == "INTERACTIVE_EFFICIENT"
         assert run["envelope_content_hash"] == "env-hash"
         assert run["runtime_policy_fingerprint"] == "policy-hash"
@@ -163,7 +174,7 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
         db.close()
 
 
-def test_net_benefit_campaign_closes_after_monitoring_and_dynamic_comparisons(tmp_path: Path):
+def test_net_benefit_campaign_closes_after_dynamic_comparison(tmp_path: Path):
     db = Database(tmp_path / "db.sqlite3")
     try:
         campaign = db.create_net_benefit_campaign(
@@ -172,24 +183,27 @@ def test_net_benefit_campaign_closes_after_monitoring_and_dynamic_comparisons(tm
             battery_epoch=1,
             hard_identity_hash="hard-a",
             calibration_version=1,
-            evidence_semantics_version=7,
+            evidence_semantics_version=8,
             fixed_baseline_envelope="INTERACTIVE_EFFICIENT",
             fixed_baseline_content_hash="fixed-hash",
         )
         assert campaign["status"] == "OPEN"
-        for index, mode in enumerate(("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER"), start=1):
-            campaign = db.record_net_benefit_campaign_comparison(
+        with pytest.raises(ValueError, match="invalid Net Benefit mode"):
+            db.record_net_benefit_campaign_comparison(
                 "campaign-a",
-                mode=mode,
-                overhead_run_id=f"overhead-{index}",
-                runtime_policy_fingerprint=f"policy-{index}",
+                mode="MONITORING_OVERHEAD",
+                overhead_run_id="overhead-monitoring",
+                runtime_policy_fingerprint="policy-monitoring",
             )
+        campaign = db.record_net_benefit_campaign_comparison(
+            "campaign-a",
+            mode="DYNAMIC_CONTROLLER",
+            overhead_run_id="overhead-dynamic",
+            runtime_policy_fingerprint="policy-dynamic",
+        )
         assert campaign["status"] == "COMPLETE"
         assert campaign["closed_ts"] is not None
-        assert set(campaign["payload"]["comparisons"]) == {
-            "MONITORING_OVERHEAD",
-            "DYNAMIC_CONTROLLER",
-        }
+        assert set(campaign["payload"]["comparisons"]) == {"DYNAMIC_CONTROLLER"}
         with pytest.raises(ValueError, match="not OPEN"):
             db.record_net_benefit_campaign_comparison(
                 "campaign-a",

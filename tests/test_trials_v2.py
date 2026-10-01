@@ -10,6 +10,11 @@ from sp7_powerlab.storage import Database
 from sp7_powerlab.unexpected_power import brightness_bucket
 
 
+@pytest.fixture(autouse=True)
+def _fresh_trial_clock(monkeypatch):
+    monkeypatch.setattr("sp7_powerlab.experiments.time.time", lambda: 100.0)
+
+
 class FakeActuator:
     def __init__(self):
         self.state = {
@@ -180,6 +185,16 @@ def test_trial_requires_verified_current_baseline(project_root):
             assert "current envelope" in str(exc)
         else:
             raise AssertionError("trial should require actual baseline envelope")
+    finally:
+        db.close()
+
+
+def test_trial_rejects_stale_latest_sample(project_root, monkeypatch):
+    db, _registry, _actuator, manager = make_manager(project_root)
+    try:
+        monkeypatch.setattr("sp7_powerlab.experiments.time.time", lambda: 200.0)
+        with pytest.raises(TrialError, match="latest telemetry sample is stale"):
+            manager.start(proposal(), base_sample(100))
     finally:
         db.close()
 

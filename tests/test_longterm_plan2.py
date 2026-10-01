@@ -17,8 +17,10 @@ from sp7_powerlab.longterm import (
     negative_feedback_blocks_current_policy,
     runtime_mode_status,
     runtime_policy_snapshot,
+    stage_e_code_identity,
     summarize_minimal_meter_samples,
 )
+from sp7_powerlab.runtime_audit import fixed_runtime_identity
 from sp7_powerlab.storage import Database
 
 
@@ -223,10 +225,16 @@ def test_meter_comparison_reports_end_to_end_delta_and_minutes():
 
 def test_stable_readiness_requires_measurement_coverage_and_system_value_evidence(
     project_root: Path,
+    monkeypatch,
 ):
     from sp7_powerlab.config import load_config
 
     config = load_config(project_root)
+    fixed_audit = {"ready": True, "reasons": []}
+    monkeypatch.setattr(
+        "sp7_powerlab.longterm.audit_fixed_runtime",
+        lambda *_args, **_kwargs: dict(fixed_audit),
+    )
     db = Database(project_root / "runtime/readiness.sqlite3")
     registry = EnvelopeRegistry(project_root, db)
     registry.load()
@@ -273,7 +281,6 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
                 "frozen": True,
             }
         )
-        policy_fingerprint = str(runtime_policy_snapshot(config, db)["fingerprint"])
         db.create_net_benefit_campaign(
             campaign_id="stable-campaign",
             evidence_epoch_id=epoch,
@@ -285,12 +292,12 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
             fixed_baseline_content_hash=fixed_hash,
         )
         mode_results = {
-            "MONITORING_OVERHEAD": (0.18, policy_fingerprint),
+            "MONITORING_OVERHEAD": (0.18, "monitoring-policy"),
             "DYNAMIC_CONTROLLER": (-0.05, "dynamic-policy"),
         }
         for mode, (delta_w, run_policy_fingerprint) in mode_results.items():
-            run_id = db.start_monitoring_overhead_run(mode=mode)
-            db.finish_monitoring_overhead_run(
+            run_id = db.start_net_benefit_result(mode=mode)
+            db.finish_net_benefit_result(
                 run_id,
                 {
                     "candidate_minus_reference_w": delta_w,
@@ -301,14 +308,16 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
                     "fixed_baseline_envelope": "INTERACTIVE_EFFICIENT",
                     "fixed_baseline_content_hash": fixed_hash,
                     "runtime_policy_fingerprint": run_policy_fingerprint,
+                    "candidate_block_deltas_w": [delta_w, delta_w],
                 },
             )
-            db.record_net_benefit_campaign_comparison(
-                "stable-campaign",
-                mode=mode,
-                overhead_run_id=run_id,
-                runtime_policy_fingerprint=run_policy_fingerprint,
-            )
+            if mode == "DYNAMIC_CONTROLLER":
+                db.record_net_benefit_campaign_comparison(
+                    "stable-campaign",
+                    mode=mode,
+                    overhead_run_id=run_id,
+                    runtime_policy_fingerprint=run_policy_fingerprint,
+                )
 
         too_short = StableReadiness(config, db).assess(now=now)
         assert too_short["ready"] is False
@@ -330,8 +339,14 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
         assert ready["ready"] is True
         assert ready["net_benefit"]["recommendation"] == "FIXED_GOOD_ENVELOPE"
         assert ready["net_benefit"]["selected_policy_mode"] == "FIXED_GOOD"
-        assert ready["net_benefit"]["selected_policy_fingerprint"] == policy_fingerprint
+        fixed_policy_fingerprint = fixed_runtime_identity(
+            evidence_epoch_id=epoch,
+            envelope="INTERACTIVE_EFFICIENT",
+            envelope_content_hash=fixed_hash,
+        )
+        assert ready["net_benefit"]["selected_policy_fingerprint"] == fixed_policy_fingerprint
         assert ready["current_runtime_mode"]["mode"] == "FIXED_GOOD"
+        assert ready["fixed_runtime_audit"]["ready"] is True
         assert ready["usage_coverage"]["trusted_fraction"] == 1.0
         assert ready["usage_coverage"]["distinct_usage_days"] == 5
         assert ready["usage_coverage"]["observation_span_seconds"] >= 7 * 86400.0
@@ -343,7 +358,7 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
                 "qualified": True,
                 "evidence_epoch_id": epoch,
                 "selected_policy_mode": "FIXED_GOOD",
-                "selected_policy_fingerprint": policy_fingerprint,
+                "selected_policy_fingerprint": fixed_policy_fingerprint,
                 "usage_coverage": ready["usage_coverage"],
             },
         )
@@ -360,15 +375,21 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
                 "control_state": "READ_ONLY",
             },
         )
-        wrong_mode = StableReadiness(config, db).assess(now=now)
-        assert wrong_mode["ready"] is False
-        assert "net_benefit_selected_runtime_mode_mismatch" in wrong_mode["reasons"]
+        stale_heartbeat_does_not_override_live_audit = StableReadiness(config, db).assess(now=now)
+        assert stale_heartbeat_does_not_override_live_audit["ready"] is True
+        assert stale_heartbeat_does_not_override_live_audit["current_runtime_mode"]["mode"] == (
+            "FIXED_GOOD"
+        )
 
         db.set_meta("service_heartbeat", {"ts": 0.0})
         config.data["automation"]["level"] = 4
-        stale = StableReadiness(config, db).assess(now=now)
-        assert stale["ready"] is False
-        assert "net_benefit_selected_policy_is_stale" in stale["reasons"]
+        fixed_is_physical = StableReadiness(config, db).assess(now=now)
+        assert fixed_is_physical["ready"] is True
+
+        fixed_audit.update({"ready": False, "reasons": ["fixed_hwp_state_mismatch"]})
+        audit_failed = StableReadiness(config, db).assess(now=now)
+        assert audit_failed["ready"] is False
+        assert "fixed_runtime_audit_failed" in audit_failed["reasons"]
     finally:
         db.close()
 
@@ -379,6 +400,7 @@ def _completed_run(
     ts: float,
     *,
     policy_fingerprint: str = "policy-fingerprint",
+    block_deltas: list[float] | None = None,
 ) -> dict:
     return {
         "run_id": f"{mode}-{ts}",
@@ -390,9 +412,13 @@ def _completed_run(
             "comparison_quality": "OK",
             "comparison_design": "A_B_B_A",
             "campaign_id": "unit-campaign",
+            "evidence_epoch_id": "epoch-current",
             "fixed_baseline_envelope": "INTERACTIVE_EFFICIENT",
             "fixed_baseline_content_hash": "fixed-hash",
             "runtime_policy_fingerprint": policy_fingerprint,
+            "candidate_block_deltas_w": (
+                list(block_deltas) if block_deltas is not None else [delta_w, delta_w]
+            ),
         },
     }
 
@@ -400,7 +426,6 @@ def _completed_run(
 def test_net_benefit_keeps_dynamic_when_dynamic_clears_threshold():
     result = assess_net_benefit(
         [
-            _completed_run("MONITORING_OVERHEAD", 0.05, 100, policy_fingerprint="monitoring"),
             _completed_run("DYNAMIC_CONTROLLER", -0.30, 110, policy_fingerprint="dynamic"),
         ],
         practical_threshold_w=0.10,
@@ -411,7 +436,7 @@ def test_net_benefit_keeps_dynamic_when_dynamic_clears_threshold():
     assert result["selected_policy_fingerprint"] == "dynamic"
 
 
-def test_net_benefit_prefers_dynamic_when_monitoring_consumes_controller_savings():
+def test_net_benefit_ignores_optional_monitoring_diagnostic_for_policy_selection():
     result = assess_net_benefit(
         [
             _completed_run("MONITORING_OVERHEAD", 0.18, 100, policy_fingerprint="monitoring"),
@@ -422,7 +447,7 @@ def test_net_benefit_prefers_dynamic_when_monitoring_consumes_controller_savings
     assert result["recommendation"] == "KEEP_DYNAMIC_CONTROLLER"
     assert result["selected_policy_mode"] == "DYNAMIC_CONTROLLER"
     assert result["selected_policy_fingerprint"] == "dynamic"
-    assert "monitoring overhead consumes part" in " ".join(result["reasons"])
+    assert result["deltas_w"] == {"DYNAMIC_CONTROLLER": -0.28}
 
 
 def test_net_benefit_prefers_fixed_good_when_complexity_has_no_practical_gain():
@@ -435,7 +460,29 @@ def test_net_benefit_prefers_fixed_good_when_complexity_has_no_practical_gain():
     )
     assert result["recommendation"] == "FIXED_GOOD_ENVELOPE"
     assert result["selected_policy_mode"] == "FIXED_GOOD"
-    assert result["selected_policy_fingerprint"] == "monitoring"
+    assert result["selected_policy_fingerprint"] == fixed_runtime_identity(
+        evidence_epoch_id="epoch-current",
+        envelope="INTERACTIVE_EFFICIENT",
+        envelope_content_hash="fixed-hash",
+    )
+
+
+def test_net_benefit_needs_more_data_when_only_one_dynamic_block_is_practical():
+    result = assess_net_benefit(
+        [
+            _completed_run(
+                "DYNAMIC_CONTROLLER",
+                -0.11,
+                110,
+                policy_fingerprint="dynamic",
+                block_deltas=[-0.02, -0.20],
+            ),
+        ],
+        practical_threshold_w=0.10,
+    )
+    assert result["complete"] is False
+    assert result["recommendation"] == "NEED_MORE_DATA"
+    assert result["dynamic_block_deltas_w"] == [-0.02, -0.20]
 
 
 def test_usage_coverage_ignores_rollups_from_other_evidence_epochs(project_root: Path):
@@ -611,6 +658,7 @@ def test_net_benefit_filters_runs_by_current_evidence_epoch():
         runs,
         practical_threshold_w=0.1,
         evidence_epoch_id="current",
+        complete_campaign_ids={"a"},
     )
     assert result["complete"] is False
     assert result["recommendation"] == "NEED_MORE_DATA"
@@ -639,41 +687,33 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
         runs,
         practical_threshold_w=0.1,
         evidence_epoch_id="current",
+        complete_campaign_ids={"a"},
     )
     assert result["complete"] is False
     assert result["campaign_id"] is None
 
 
-def test_net_benefit_rejects_same_campaign_with_different_fixed_baselines():
-    runs = []
-    for index, mode in enumerate(("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER")):
-        run = _completed_run(mode, -0.2, 100 + index * 10)
-        run["result"] = {
-            **run["result"],
-            "evidence_epoch_id": "current",
-            "campaign_id": "campaign-a",
-            "fixed_baseline_content_hash": f"fixed-{index}",
-        }
-        runs.append(run)
+def test_net_benefit_does_not_let_monitoring_diagnostic_change_formal_baseline():
+    monitoring = _completed_run("MONITORING_OVERHEAD", 0.05, 100)
+    monitoring["result"] = {
+        **monitoring["result"],
+        "fixed_baseline_content_hash": "diagnostic-fixed",
+    }
+    dynamic = _completed_run("DYNAMIC_CONTROLLER", -0.2, 110)
     result = assess_net_benefit(
-        runs,
+        [monitoring, dynamic],
         practical_threshold_w=0.1,
-        evidence_epoch_id="current",
     )
-    assert result["complete"] is False
-    assert result["recommendation"] == "NEED_MORE_DATA"
+    assert result["complete"] is True
+    assert result["fixed_baseline_content_hash"] == "fixed-hash"
 
 
-def test_net_benefit_rejects_same_campaign_string_across_long_time_span():
-    runs = [
-        _completed_run("MONITORING_OVERHEAD", 0.02, 100.0),
-        _completed_run("DYNAMIC_CONTROLLER", -0.2, 8 * 86400.0),
-    ]
+def test_net_benefit_requires_campaign_marked_complete_by_capture_contract():
+    runs = [_completed_run("DYNAMIC_CONTROLLER", -0.2, 100.0)]
     result = assess_net_benefit(
         runs,
         practical_threshold_w=0.1,
-        complete_campaign_ids={"unit-campaign"},
-        max_campaign_span_seconds=86400.0,
+        complete_campaign_ids={"different-campaign"},
     )
     assert result["complete"] is False
     assert result["recommendation"] == "NEED_MORE_DATA"
@@ -696,6 +736,38 @@ def test_runtime_policy_snapshot_changes_when_core_control_code_changes(project_
         assert first["fingerprint"] != second["fingerprint"]
     finally:
         db.close()
+
+
+def test_runtime_policy_snapshot_ignores_scheduler_code_for_level_one_runtime(project_root: Path):
+    from sp7_powerlab.config import load_config
+
+    package_root = project_root / "src" / "sp7_powerlab"
+    package_root.mkdir(parents=True)
+    scheduler = package_root / "scheduler.py"
+    scheduler.write_text("SEARCH_VERSION = 1\n", encoding="utf-8")
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/policy-scheduler.sqlite3")
+    try:
+        first = runtime_policy_snapshot(config, db)
+        scheduler.write_text("SEARCH_VERSION = 2\n", encoding="utf-8")
+        second = runtime_policy_snapshot(config, db)
+        assert first["fingerprint"] == second["fingerprint"]
+    finally:
+        db.close()
+
+
+def test_stage_e_code_identity_includes_cli_contract(project_root: Path):
+    from sp7_powerlab.config import load_config
+
+    package_root = project_root / "src" / "sp7_powerlab"
+    package_root.mkdir(parents=True)
+    cli = package_root / "cli.py"
+    cli.write_text("STAGE_E_VERSION = 1\n", encoding="utf-8")
+    config = load_config(project_root)
+    first = stage_e_code_identity(config)
+    cli.write_text("STAGE_E_VERSION = 2\n", encoding="utf-8")
+    second = stage_e_code_identity(config)
+    assert first["aggregate_sha256"] != second["aggregate_sha256"]
 
 
 def test_runtime_mode_status_is_independent_of_policy_fingerprint(project_root: Path):

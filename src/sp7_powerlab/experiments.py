@@ -189,6 +189,13 @@ class TrialManager:
             raise TrialError("automation level must be >= 2 to start a trial")
         if self.db.active_trial():
             raise TrialError("another trial is already active")
+        sample_ts = current_sample.get("ts")
+        sample_max_age = max(float(self.config.get("collector.sample_seconds", 10.0)) * 3.0, 30.0)
+        now = time.time()
+        if not isinstance(sample_ts, (int, float)) or not (
+            0.0 <= now - float(sample_ts) <= sample_max_age
+        ):
+            raise TrialError("latest telemetry sample is stale")
         machine = load_machine(self.config.root)
         if not bool((machine.get("calibration") or {}).get("valid", False)):
             raise TrialError("machine calibration must be valid before starting a trial")

@@ -6,14 +6,14 @@
 bash scripts/install-user-services.sh
 ~~~
 
-安装用户级 sp7-powerlab.service，以及可选的 slow-review hourly service/timer unit 文件。
-installer 默认**不启用** hourly timer，并会关闭已有 timer/oneshot。
+安装用户级 `sp7-powerlab.service`。旧的 scheduled review hourly service/timer 已删除；installer 会停止并
+移除遗留 unit。
 
 主 service 负责 telemetry、demand、thermal、controller、trial tick、UnexpectedPower
 detection，以及在 automation level 3+ 下受 gate 约束的 Candidate Scheduler。
 
-hourly service 只是 Agent slow-review 的一种 transport。需要时手动运行 `sp7-powerlab hourly`，或用户明确
-选择后再 enable timer。正式 Stage E capture 时 timer/oneshot 必须停止。
+需要历史摘要时按需运行 `sp7-powerlab review-pack`。正式 Stage E capture 会 fail-closed 检查遗留 hourly
+unit，若旧 unit 仍 active 则拒绝采集。
 
 ## Root helper
 
@@ -90,6 +90,6 @@ doctor 会报告已知冲突。
 个人设备建议先停留在 0–2，等 Measurement Trust、rollback、thermal preemption、
 independent revalidation 和 stop rules 都经过真机验证后再提高。
 
-个人使用时可以由用户向 GPT-5.6 提供 Bash/workspace/MCP 等通用用户态能力。
-`sp7-powerlab-agent` 只是便利入口，不是权限沙箱。无论 Agent 具有什么用户态能力，
-root helper 仍只暴露有限 HWP 操作，不提供 unrestricted root shell。
+个人使用时由 GPT-5.6 Sol 直接通过 Bash/workspace 使用主 CLI、SQLite、journal 和 sysfs；仓库不再维护
+第二套 Agent action DSL。无论 Agent 具有什么用户态能力，root helper 仍只暴露有限 HWP 操作，不提供
+unrestricted root shell。

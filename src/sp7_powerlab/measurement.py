@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,8 @@ def valid_discharge_interval_seconds(
     if current.get("battery_status") != "Discharging":
         return None
     if previous.get("resume_grace") or current.get("resume_grace"):
+        return None
+    if previous.get("suspend_or_resume_detected") or current.get("suspend_or_resume_detected"):
         return None
     previous_battery_epoch = previous.get("battery_epoch")
     current_battery_epoch = current.get("battery_epoch")
@@ -478,6 +480,9 @@ def _read_number(path: Path, divisor: float = 1.0) -> float | None:
 @dataclass
 class MinimalMeter:
     sys_root: Path = Path("/sys")
+    suspend_detection_seconds: float = 3.0
+    _previous_wall_ts: float | None = field(default=None, init=False, repr=False)
+    _previous_monotonic_ts: float | None = field(default=None, init=False, repr=False)
 
     def sample(self) -> dict[str, Any]:
         battery = battery_directory(self.sys_root)
@@ -486,8 +491,21 @@ class MinimalMeter:
         power = _read_number(battery / "power_now", 1_000_000.0)
         if power is not None:
             power = abs(power)
+        wall_ts = time.time()
+        monotonic_ts = time.monotonic()
+        suspend_gap_seconds = 0.0
+        if self._previous_wall_ts is not None and self._previous_monotonic_ts is not None:
+            wall_delta = wall_ts - self._previous_wall_ts
+            monotonic_delta = monotonic_ts - self._previous_monotonic_ts
+            suspend_gap_seconds = max(0.0, wall_delta - monotonic_delta)
+        suspend_detected = suspend_gap_seconds > float(self.suspend_detection_seconds)
+        self._previous_wall_ts = wall_ts
+        self._previous_monotonic_ts = monotonic_ts
         return {
-            "ts": time.time(),
+            "ts": wall_ts,
+            "monotonic_ts": monotonic_ts,
+            "suspend_gap_seconds": suspend_gap_seconds,
+            "suspend_or_resume_detected": suspend_detected,
             "battery_status": _read_text(battery / "status"),
             "battery_power_w": power,
             "battery_energy_wh": _read_number(battery / "energy_now", 1_000_000.0),

@@ -12,15 +12,14 @@ fi
 USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 mkdir -p "$USER_DIR"
 
+# Remove the old scheduled review units. Review packs are now explicit/on-demand.
+systemctl --user disable --now sp7-powerlab-hourly.timer 2>/dev/null || true
+systemctl --user stop sp7-powerlab-hourly.service 2>/dev/null || true
+rm -f "$USER_DIR/sp7-powerlab-hourly.service" "$USER_DIR/sp7-powerlab-hourly.timer"
+
 sed   -e "s|@ROOT@|$ROOT|g"   -e "s|@POWERLAB_BIN@|$BIN|g"   "$ROOT/systemd/sp7-powerlab.service.in"   > "$USER_DIR/sp7-powerlab.service"
-
-sed   -e "s|@ROOT@|$ROOT|g"   -e "s|@POWERLAB_BIN@|$BIN|g"   "$ROOT/systemd/sp7-powerlab-hourly.service.in"   > "$USER_DIR/sp7-powerlab-hourly.service"
-
-cp "$ROOT/systemd/sp7-powerlab-hourly.timer" "$USER_DIR/sp7-powerlab-hourly.timer"
 
 systemctl --user daemon-reload
 systemctl --user enable --now sp7-powerlab.service
-systemctl --user disable --now sp7-powerlab-hourly.timer || true
-systemctl --user stop sp7-powerlab-hourly.service || true
 
-echo "PowerLab user service installed. Hourly analysis remains opt-in/manual."
+echo "PowerLab user service installed. Review packs are explicit via 'sp7-powerlab review-pack'."

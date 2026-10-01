@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import signal
 import statistics
@@ -26,7 +24,13 @@ from .envelopes import EnvelopeRegistry
 from .evaluation import valid_duration
 from .evidence import NoiseTracker
 from .experiments import TrialError, TrialManager
-from .hardware import inspect_hardware, system_fingerprint, thermal_sensor_path
+from .hardware import (
+    fingerprint_hash,
+    hard_control_identity,
+    inspect_hardware,
+    system_fingerprint,
+    thermal_sensor_path,
+)
 from .helper import RootHelperClient
 from .lifecycle import CONTROL_ALLOWED, EMERGENCY, READ_ONLY, STABLE, LifecycleManager
 from .longterm import DriftDetector
@@ -36,12 +40,6 @@ from .storage import Database
 from .telemetry import TelemetryCollector
 from .thermal import ThermalObserver
 from .unexpected_power import UnexpectedPowerDetector, brightness_bucket, remote_bucket
-
-
-def fingerprint_hash(value: dict[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()[:24]
 
 
 def _median(values: list[float]) -> float | None:
@@ -58,15 +56,11 @@ def _refresh_fingerprint_state(
 ) -> str:
     fingerprint_payload = system_fingerprint(report)
     versions = fingerprint_payload.get("versions") or {}
-    control_fingerprint = {
-        key: value for key, value in fingerprint_payload.items() if key != "versions"
-    }
-    control_fingerprint["thermald_version"] = versions.get("thermald")
-    control_fingerprint["thermal_config_hash"] = fingerprint_hash(thermal_config)
-    control_fingerprint["calibration_version"] = int(
-        (machine.get("calibration") or {}).get("version") or 0
+    fp_hash, _control_fingerprint = hard_control_identity(
+        report,
+        thermal_config=thermal_config,
+        calibration_version=int((machine.get("calibration") or {}).get("version") or 0),
     )
-    fp_hash = fingerprint_hash(control_fingerprint)
     changed = db.set_system_fingerprint(fp_hash, fingerprint_payload)
     if changed:
         registry.mark_verified_needs_revalidation(
@@ -233,6 +227,7 @@ class PowerLabService:
         self._last_thermal_state: str | None = None
         self._last_prune_ts = 0.0
         self._last_hardware_refresh_ts = time.time()
+        self._last_compatibility_refresh_ts = time.time()
         self._last_hwp_reconcile_ts = 0.0
         self._last_scheduler_check_ts = 0.0
         self._machine_mtime = self._mtime(self.root / "config" / "machine.toml")
@@ -305,6 +300,7 @@ class PowerLabService:
                 self.stack["registry"].mark_verified_needs_revalidation(
                     "calibration version changed"
                 )
+                self._last_compatibility_refresh_ts = 0.0
 
         thermal_path = self.root / "config" / "thermal.toml"
         thermal_mtime = self._mtime(thermal_path)
@@ -316,6 +312,7 @@ class PowerLabService:
                 self.stack["registry"].mark_verified_needs_revalidation(
                     "thermal model configuration changed"
                 )
+                self._last_compatibility_refresh_ts = 0.0
             self._thermal_mtime = thermal_mtime
 
     def _refresh_hardware_contract(self, ts: float) -> None:
@@ -329,6 +326,7 @@ class PowerLabService:
                 (self.stack["machine"].get("thermal") or {}).get("sensor_path") or ""
             )
             or None,
+            include_versions=False,
         )
         actuator, actuator_available, actuator_mode = build_actuator(self.config)
         probed_actuator = actuator
@@ -410,6 +408,21 @@ class PowerLabService:
                     "active_trial": active_trial,
                 },
             )
+        self._last_hardware_refresh_ts = ts
+
+    def _refresh_compatibility_contract(self, ts: float) -> None:
+        if ts - self._last_compatibility_refresh_ts < 6 * 3600.0:
+            return
+        identity = self.stack["machine"].get("identity") or {}
+        report = inspect_hardware(
+            expected_product=str(identity.get("expected_product", "Surface Pro 7")),
+            expected_cpu_substring=str(identity.get("expected_cpu_substring", "i5-1035G4")),
+            configured_thermal_sensor=str(
+                (self.stack["machine"].get("thermal") or {}).get("sensor_path") or ""
+            )
+            or None,
+            include_versions=True,
+        )
         self.stack["fingerprint"] = _refresh_fingerprint_state(
             db=self.db,
             registry=self.stack["registry"],
@@ -417,7 +430,7 @@ class PowerLabService:
             machine=self.stack["machine"],
             thermal_config=self.stack["thermal_config"],
         )
-        self._last_hardware_refresh_ts = ts
+        self._last_compatibility_refresh_ts = ts
 
     def _battery_epoch(self, sample: dict[str, Any]) -> int:
         battery = sample.get("battery") or {}
@@ -803,6 +816,7 @@ class PowerLabService:
         self._configure_telemetry_mode()
         sample = self.stack["collector"].sample()
         self._refresh_hardware_contract(float(sample["ts"]))
+        self._refresh_compatibility_contract(float(sample["ts"]))
         self._reconcile_hwp(float(sample["ts"]), "periodic runtime reconcile")
         epoch = self._battery_epoch(sample)
         evidence_epoch = self._sync_evidence_epoch(epoch)

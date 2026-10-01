@@ -314,7 +314,7 @@ sp7-powerlab evidence noise
 sp7-powerlab scheduler status
 sp7-powerlab unexpected-power list
 sp7-powerlab investigation list
-sp7-powerlab overhead summary
+sp7-powerlab net-benefit summary
 ~~~
 
 详见 docs/OPERATIONS.md。
@@ -323,11 +323,8 @@ sp7-powerlab overhead summary
 
 最终不是只比较两个 envelope。
 
-需要用 MinimalMeter 对照：
-
-- fixed-good
-- monitoring-only observer overhead
-- dynamic controller
+正式 Stage E 用 MinimalMeter 只做一次 Dynamic vs Fixed-good 的 A1-B1-B2-A2 paired comparison。
+monitoring-only observer overhead 是按需诊断，不是 STABLE blocker。
 
 Automation Level 2+ 的 Scheduler/Agent 学习能力按需运行，不作为必须长期常开的第四种 Stage E treatment。
 
@@ -348,7 +345,6 @@ Automation Level 2+ 的 Scheduler/Agent 学习能力按需运行，不作为必�
 - docs/PROJECT_STATUS.md — 当前实现/真机验证进度
 - docs/LLM_BEHAVIOR.md — Agent 调教纪律
 - docs/AI_LOOP.md — Agent/runtime 交互
-- docs/MCP.md — 可选结构化接口
 
 ### 设计
 

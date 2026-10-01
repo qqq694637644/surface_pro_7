@@ -175,8 +175,9 @@ sp7-powerlab envelope clear-override
 
 普通 Controller 只使用 VERIFIED envelope。
 
-注意：manual override、VERIFIED envelope set/content hash 和核心 control/evidence code identity 都属于
-Stage E runtime policy identity。修改它们后，旧 Net Benefit 可能不再代表当前 runtime。
+注意：manual override、VERIFIED envelope set/content hash 和 Level-1 Dynamic code/config identity 都属于
+Dynamic runtime policy identity；Stage E 测量合同还有独立 code identity。相关 identity 改变后，旧 Net
+Benefit 可能不再代表当前 runtime。
 
 ## 8. Scheduler
 
@@ -368,59 +369,51 @@ Stage D 要证明当前 policy 在代表性真实使用中成立，而不是立�
 - capture mode
 - runtime policy fingerprint
 
-runtime policy fingerprint 覆盖 relevant runtime/config、Automation Level、VERIFIED envelope set/content hashes 和 manual override。
-它还包含核心 PowerLab control/evidence code identity；核心代码变更后旧 Stage E 不能继续为新 runtime 背书。
+Dynamic runtime policy fingerprint 覆盖 Level-1 runtime 真正使用的 config、Automation Level、VERIFIED
+envelope set/content hashes、manual override 和 explicit code allowlist。Stage E 测量合同另有独立 code
+identity；media compatibility generation 也属于 campaign provenance。
 
 每个 A1-B1-B2-A2 comparison 内必须先冻结该次要验证的 policy/config；四个 block 期间 Automation
 Level、VERIFIED envelope set 和 manual override 不得变化。FIXED_GOOD 只停止 service，不临时改 policy。
 
-正式 Stage E 只测：
+正式 Stage E 只强制比较：
 
 - FIXED_GOOD：main service off + fixed VERIFIED HWP；
-- MONITORING：live Level 0 + fixed HWP，只解释 observer overhead；
 - DYNAMIC_CONTROLLER：live Level 1 + CONTROL_ALLOWED。
 
-Level 2+ 的 Scheduler/Agent/自动实验不是必须长期常开的第四种 treatment。
+MONITORING 是可选 observer-overhead 诊断，不参与 StableReadiness。Level 2+ 的 Scheduler/Agent/自动实验
+也不是必须长期常开的 treatment。
 
-先关闭 hourly background work：
+当前版本不部署 scheduled review unit。MinimalMeter 会 fail-closed 检查遗留 hourly unit；旧 unit 若仍 active，
+先清理再采集。
 
-```bash
-systemctl --user disable --now sp7-powerlab-hourly.timer
-systemctl --user stop sp7-powerlab-hourly.service
-```
-
-MinimalMeter 每个 sample 都会验证它们没有 active。
-
-### 17.1 每一种 candidate mode 使用 A1-B1-B2-A2
+### 17.1 正式 Dynamic vs Fixed 使用 A1-B1-B2-A2
 
 ```bash
 # A1: service stopped, actual HWP at the same VERIFIED fixed baseline
 systemctl --user stop sp7-powerlab.service
-# wait until the last service heartbeat is no longer fresh (default >30s)
-sleep 35
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 
-# B1/B2: run the target mode and capture two independent blocks
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
-sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
+# B1/B2: Automation Level 1, service live, two independent Dynamic blocks
+systemctl --user start sp7-powerlab.service
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
+sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode DYNAMIC_CONTROLLER --count 60
 
 # A2: return to the same fixed baseline and stop service
 systemctl --user stop sp7-powerlab.service
-sleep 35
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 ```
 
 比较：
 
 ```bash
-sp7-powerlab overhead compare meter-a1 meter-b1 meter-b2 meter-a2
+sp7-powerlab net-benefit compare meter-a1 meter-b1 meter-b2 meter-a2
 ```
 
 runtime mode 不是标签：
 
-- MONITORING：live Level 0 + fixed HWP
 - DYNAMIC_CONTROLLER：live Level 1 + CONTROL_ALLOWED
-- FIXED_GOOD：service stopped + actual HWP 每点匹配同一个 VERIFIED fixed envelope
+- FIXED_GOOD：live systemd state 必须 inactive + actual HWP 每点匹配同一个 VERIFIED fixed envelope
 
 A1/B1/B2/A2 四块必须具有同一 runtime policy fingerprint。B1/B2 中间发生 promotion/config/override/policy 修改时，该 comparison 作废。
 
@@ -445,14 +438,14 @@ PowerLab 还检查：
 - 固定 hard/battery/calibration/semantics context 与 fixed baseline；
 - 受 `net_benefit.max_campaign_span_seconds` 限制；
 - context/baseline 改变或超时会 INVALID；
-- Monitoring 与 Dynamic 两类有效 comparison 各完成一次后自动 COMPLETE/CLOSED；
+- 一个有效 Dynamic comparison 完成后自动 COMPLETE/CLOSED；
 - CLOSED campaign 不能继续复用名字写入新结果。
 
 查看：
 
 ```bash
-sp7-powerlab overhead history
-sp7-powerlab overhead summary
+sp7-powerlab net-benefit history
+sp7-powerlab net-benefit summary
 sp7-powerlab lifecycle readiness
 ```
 
@@ -462,7 +455,8 @@ sp7-powerlab lifecycle readiness
 - FIXED_GOOD_ENVELOPE
 - NEED_MORE_DATA
 
-Monitoring 只解释 observer overhead。Dynamic 相比 fixed-good 没有 practical net gain 时，应回到 fixed-good。
+只有 B1/B2 两个 Dynamic paired delta 都达到 practical threshold 才保留 Dynamic；只有一个达到时
+NEED_MORE_DATA；两个都达不到时回到 fixed-good。MONITORING 只在需要解释 observer overhead 时按需运行。
 
 Stage E 结束后，把当前 runtime 恢复为 recommendation 对应的**已验证 selected policy**：Dynamic 或
 Level-0/fixed-good。StableReadiness 同时校验 selected policy fingerprint 和 actual runtime mode。
@@ -476,16 +470,15 @@ sp7-powerlab lifecycle readiness
 sp7-powerlab lifecycle freeze --reason "Stage A-E and current policy net benefit validated"
 ```
 
-STABLE readiness 会重新确认 recommendation 对应的 selected policy fingerprint 和 actual runtime mode
-都代表当前 runtime。如果只是没恢复 selected mode/config，先 reconcile；核心 code/config/policy 真正改变
-时才需要重新验证。
+STABLE readiness 对 Dynamic 校验 selected runtime fingerprint/mode；对 Fixed-good 执行 one-shot live audit，
+直接验证 service、thermald、ownership、hard identity、baseline hash 和 actual HWP。
 
 STABLE 下：
 
 - selected=Dynamic：main service 保留 core telemetry / drift / UnexpectedPower；
 - selected=Fixed-good：main service 可保持停止，状态/调查按需执行；
 - qualified fixed-good 使用 freeze 时的 entry coverage；同 epoch/policy/mode 下 rolling coverage 自然过期不单独判 stale；
-- hourly timer 默认保持关闭；
+- 不部署 scheduled review timer；
 - Scheduler 睡眠；
 - 无主动 trial；
 - 正常 Agent 结论经常是 NO_CHANGE。
@@ -504,11 +497,10 @@ reopen 后按当前证据缺口回到合适 Stage，不是假设必须从零重�
 
 代码、配置、文档和 durable knowledge 可以提交。
 
-需要长期知识快照：
+需要按需 review/知识快照：
 
 ```bash
-sp7-powerlab knowledge-export
-bash scripts/commit-knowledge.sh
+sp7-powerlab review-pack --output history/continuous/knowledge.json
 ```
 
 默认不自动 push。

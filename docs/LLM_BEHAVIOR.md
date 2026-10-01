@@ -242,7 +242,7 @@ i5-1035G4 的持续高功耗会快速增加机身/CPU 热量，并可能造成�
 - 不主动寻找更细参数；
 - selected=Dynamic 时保持低开销 core telemetry；
 - selected=Fixed-good 时 main service 可以保持停止，调查按需运行；
-- hourly timer 默认关闭；
+- 不部署 scheduled review timer；review pack 按需生成；
 - 只有异常/漂移时 diagnostic burst；
 - 只有明确 reopen 条件才重新搜索。
 

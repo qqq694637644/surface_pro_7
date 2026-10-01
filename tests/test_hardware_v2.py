@@ -50,7 +50,7 @@ def test_surface_contract_accepts_expected_machine(tmp_path, monkeypatch):
     monkeypatch.setattr(
         hardware,
         "thermald_status",
-        lambda: {"available": True, "active": True, "version": "2"},
+        lambda **_kwargs: {"available": True, "active": True, "version": "2"},
     )
     monkeypatch.setattr(hardware, "ownership_conflicts", lambda: [])
     report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)
@@ -66,7 +66,7 @@ def test_wrong_cpu_blocks_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(
         hardware,
         "thermald_status",
-        lambda: {"available": True, "active": True, "version": "2"},
+        lambda **_kwargs: {"available": True, "active": True, "version": "2"},
     )
     monkeypatch.setattr(hardware, "ownership_conflicts", lambda: [])
     report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)
@@ -80,7 +80,7 @@ def test_conflicting_writer_blocks_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(
         hardware,
         "thermald_status",
-        lambda: {"available": True, "active": True, "version": "2"},
+        lambda **_kwargs: {"available": True, "active": True, "version": "2"},
     )
     monkeypatch.setattr(hardware, "ownership_conflicts", lambda: ["auto-cpufreq.service"])
     report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)
@@ -96,7 +96,7 @@ def test_arbitrary_acpi_thermal_zone_is_not_cpu_control_sensor(tmp_path, monkeyp
     monkeypatch.setattr(
         hardware,
         "thermald_status",
-        lambda: {"available": True, "active": True, "version": "2"},
+        lambda **_kwargs: {"available": True, "active": True, "version": "2"},
     )
     monkeypatch.setattr(hardware, "ownership_conflicts", lambda: [])
     report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)

@@ -10,9 +10,8 @@ from typing import Any
 
 from .measurement import valid_discharge_interval_seconds
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 NET_BENEFIT_CAMPAIGN_MODES = {
-    "MONITORING_OVERHEAD",
     "DYNAMIC_CONTROLLER",
 }
 
@@ -247,20 +246,6 @@ DDL = [
         status TEXT NOT NULL,
         result_json TEXT
     )""",
-    """CREATE TABLE IF NOT EXISTS llm_runs (
-        run_id TEXT PRIMARY KEY,
-        ts REAL NOT NULL,
-        pack_json TEXT NOT NULL,
-        decision_json TEXT
-    )""",
-    """CREATE TABLE IF NOT EXISTS llm_decisions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts REAL NOT NULL,
-        action TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        executed INTEGER NOT NULL,
-        result_json TEXT
-    )""",
     """CREATE TABLE IF NOT EXISTS rejections (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts REAL NOT NULL,
@@ -421,7 +406,7 @@ DDL = [
         reason TEXT NOT NULL,
         payload_json TEXT NOT NULL
     )""",
-    """CREATE TABLE IF NOT EXISTS monitoring_overhead_runs (
+    """CREATE TABLE IF NOT EXISTS net_benefit_results (
         run_id TEXT PRIMARY KEY,
         start_ts REAL NOT NULL,
         end_ts REAL,
@@ -1830,38 +1815,38 @@ class Database:
             result.append(item)
         return result
 
-    def start_monitoring_overhead_run(
+    def start_net_benefit_result(
         self,
         *,
         mode: str,
         payload: dict[str, Any] | None = None,
     ) -> str:
-        run_id = f"overhead-{uuid.uuid4().hex[:12]}"
+        run_id = f"net-benefit-{uuid.uuid4().hex[:12]}"
         with self.conn:
             self.conn.execute(
-                """INSERT INTO monitoring_overhead_runs(
+                """INSERT INTO net_benefit_results(
                     run_id,start_ts,mode,result_json
                 ) VALUES(?,?,?,?)""",
                 (run_id, time.time(), mode, _json(payload or {})),
             )
         return run_id
 
-    def finish_monitoring_overhead_run(
+    def finish_net_benefit_result(
         self,
         run_id: str,
         result: dict[str, Any],
     ) -> None:
         with self.conn:
             self.conn.execute(
-                """UPDATE monitoring_overhead_runs
+                """UPDATE net_benefit_results
                 SET end_ts=?,result_json=? WHERE run_id=?""",
                 (time.time(), _json(result), run_id),
             )
 
-    def monitoring_overhead_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+    def net_benefit_results(self, limit: int = 50) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for row in self.conn.execute(
-            """SELECT * FROM monitoring_overhead_runs
+            """SELECT * FROM net_benefit_results
             ORDER BY start_ts DESC LIMIT ?""",
             (limit,),
         ):
@@ -2023,36 +2008,6 @@ class Database:
             item["after"] = _loads(item.pop("after_json"), None)
             result.append(item)
         return result
-
-    def add_llm_run(self, pack: dict[str, Any]) -> str:
-        run_id = f"llm-{uuid.uuid4().hex[:12]}"
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO llm_runs(run_id,ts,pack_json) VALUES(?,?,?)",
-                (run_id, time.time(), _json(pack)),
-            )
-        return run_id
-
-    def add_llm_decision(
-        self,
-        action: str,
-        payload: dict[str, Any],
-        *,
-        executed: bool,
-        result: dict[str, Any] | None,
-    ) -> None:
-        with self.conn:
-            self.conn.execute(
-                """INSERT INTO llm_decisions(ts,action,payload_json,executed,result_json)
-                VALUES(?,?,?,?,?)""",
-                (
-                    time.time(),
-                    action,
-                    _json(payload),
-                    int(executed),
-                    _json(result) if result is not None else None,
-                ),
-            )
 
     def prune_raw(self, older_than_ts: float) -> int:
         with self.conn:

@@ -596,11 +596,20 @@ def test_kernel_is_hard_fingerprint_and_media_versions_get_compatibility_generat
     }
     monkeypatch.setattr(service_module, "system_fingerprint", lambda _report: dict(payload))
     machine = {"calibration": {"version": 1}}
+    report = SimpleNamespace(
+        product="Surface Pro 7",
+        cpu="Intel(R) Core(TM) i5-1035G4",
+        bios="test-bios",
+        kernel="6.10.1-surface",
+        capabilities={"intel_pstate": True, "hwp_epp": True},
+        thermal_sensor="/sys/class/thermal/thermal_zone0/temp",
+        thermald={"version": "2.5"},
+    )
     try:
         first = service_module._refresh_fingerprint_state(
             db=db,
             registry=registry,
-            report=SimpleNamespace(),
+            report=report,
             machine=machine,
             thermal_config={},
         )
@@ -610,7 +619,7 @@ def test_kernel_is_hard_fingerprint_and_media_versions_get_compatibility_generat
         browser_only = service_module._refresh_fingerprint_state(
             db=db,
             registry=registry,
-            report=SimpleNamespace(),
+            report=report,
             machine=machine,
             thermal_config={},
         )
@@ -618,10 +627,11 @@ def test_kernel_is_hard_fingerprint_and_media_versions_get_compatibility_generat
         assert db.get_meta("media_compatibility_generation") != first_media
 
         payload["kernel"] = "6.10.2-surface"
+        report.kernel = "6.10.2-surface"
         kernel_changed = service_module._refresh_fingerprint_state(
             db=db,
             registry=registry,
-            report=SimpleNamespace(),
+            report=report,
             machine=machine,
             thermal_config={},
         )
@@ -773,5 +783,55 @@ def test_hardware_refresh_freezes_actuator_backend_during_active_trial(
         assert trials.actuator is old_actuator
         assert controller.hardware_writable is False
         assert db.get_meta("actuator_probe_degraded")["active_trial"] is True
+    finally:
+        db.close()
+
+
+def test_fast_hardware_refresh_skips_versions_and_compatibility_scan_is_slow(
+    project_root: Path,
+    monkeypatch,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/refresh-cadence.sqlite3")
+    service = object.__new__(PowerLabService)
+    service.config = config
+    service.db = db
+    service._last_hardware_refresh_ts = 0.0
+    service._last_compatibility_refresh_ts = 100.0
+    controller = SimpleNamespace(hardware_writable=False, actuator=None)
+    service.stack = {
+        "machine": {"identity": {}, "calibration": {"version": 1}},
+        "actuator": SimpleNamespace(name="unavailable"),
+        "actuator_available": False,
+        "actuator_mode": "read-only",
+        "controller": controller,
+        "trials": SimpleNamespace(actuator=None),
+        "lifecycle": SimpleNamespace(set_control=lambda *_args, **_kwargs: None),
+        "registry": SimpleNamespace(),
+        "thermal_config": {},
+        "fingerprint": "old",
+    }
+    include_versions_calls = []
+
+    def fake_inspect(**kwargs):
+        include_versions_calls.append(kwargs.get("include_versions"))
+        return SimpleNamespace(control_capable=True, errors=[])
+
+    monkeypatch.setattr(service_module, "inspect_hardware", fake_inspect)
+    monkeypatch.setattr(
+        service_module,
+        "build_actuator",
+        lambda _config: (SimpleNamespace(name="unavailable"), False, "read-only"),
+    )
+    monkeypatch.setattr(service_module, "_refresh_fingerprint_state", lambda **_kwargs: "new-fp")
+    try:
+        service._refresh_hardware_contract(400.0)
+        assert include_versions_calls == [False]
+
+        service._refresh_compatibility_contract(100.0 + 6 * 3600.0 - 1.0)
+        assert include_versions_calls == [False]
+
+        service._refresh_compatibility_contract(100.0 + 6 * 3600.0)
+        assert include_versions_calls == [False, True]
     finally:
         db.close()

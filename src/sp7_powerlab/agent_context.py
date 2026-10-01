@@ -75,7 +75,6 @@ def _documentation_context() -> dict[str, str]:
         "operations": "docs/OPERATIONS.md",
         "deployment": "docs/DEPLOYMENT.md",
         "agent_loop": "docs/AI_LOOP.md",
-        "structured_agent_interface": "docs/MCP.md",
     }
 
 
@@ -255,7 +254,6 @@ def _compact_net_benefit(value: dict[str, Any]) -> dict[str, Any]:
             "missing_modes",
             "practical_threshold_w",
             "deltas_w",
-            "monitoring_overhead_w",
             "dynamic_net_saving_w",
             "campaign_id",
             "fixed_baseline_envelope",
@@ -286,6 +284,7 @@ def _compact_stable_readiness(value: dict[str, Any]) -> dict[str, Any]:
             "open_unexpected_power_events",
             "recent_negative_feedback_count",
             "current_runtime_mode",
+            "fixed_runtime_audit",
         )
     }
 
@@ -409,6 +408,7 @@ def _stage_and_actions(
         selected_policy_reasons = {
             "net_benefit_selected_policy_is_stale",
             "net_benefit_selected_runtime_mode_mismatch",
+            "fixed_runtime_audit_failed",
         }
         if stable_reasons and stable_reasons <= selected_policy_reasons:
             return (
@@ -419,7 +419,11 @@ def _stage_and_actions(
                 },
                 [
                     {
-                        "action": "reconcile_selected_net_benefit_policy",
+                        "action": (
+                            "repair_fixed_runtime_state"
+                            if "fixed_runtime_audit_failed" in stable_reasons
+                            else "reconcile_selected_net_benefit_policy"
+                        ),
                         "reason": ", ".join(sorted(stable_reasons)),
                     }
                 ],
@@ -530,14 +534,20 @@ def _stage_and_actions(
         "net_benefit_validation_incomplete",
         "net_benefit_selected_policy_is_stale",
         "net_benefit_selected_runtime_mode_mismatch",
+        "fixed_runtime_audit_failed",
     }
     if readiness_reasons and readiness_reasons <= net_benefit_reasons:
         stale_reasons = {
             "net_benefit_selected_policy_is_stale",
             "net_benefit_selected_runtime_mode_mismatch",
+            "fixed_runtime_audit_failed",
         }
         if readiness_reasons <= stale_reasons:
-            action = "reconcile_selected_net_benefit_policy"
+            action = (
+                "repair_fixed_runtime_state"
+                if "fixed_runtime_audit_failed" in readiness_reasons
+                else "reconcile_selected_net_benefit_policy"
+            )
             net_benefit = stable_readiness.get("net_benefit") or {}
             current_mode = stable_readiness.get("current_runtime_mode") or {}
             reason = (
@@ -651,11 +661,18 @@ def build_agent_context(
         evidence_epoch_id=(evidence_epoch or {}).get("epoch_id"),
     )
     stable_readiness = StableReadiness(config, db).assess(now=now)
-    monitoring_runs = db.monitoring_overhead_runs(50)
+    net_benefit_results = db.net_benefit_results(50)
+    complete_campaign_ids = {
+        str(item["campaign_id"]) for item in db.net_benefit_campaigns(status="COMPLETE", limit=100)
+    }
     net_benefit = assess_net_benefit(
-        monitoring_runs,
+        net_benefit_results,
         practical_threshold_w=float(config.get("evidence.practical_threshold_w", 0.10)),
         evidence_epoch_id=(evidence_epoch or {}).get("epoch_id"),
+        complete_campaign_ids=complete_campaign_ids,
+        max_campaign_span_seconds=float(
+            config.get("net_benefit.max_campaign_span_seconds", 86400.0)
+        ),
     )
 
     latest = db.latest_sample()

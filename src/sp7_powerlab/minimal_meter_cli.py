@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -15,8 +14,8 @@ import psutil
 from .config import load_config, load_machine
 from .demand import remote_process_tags
 from .envelopes import snapshot_matches_envelope
-from .hardware import thermal_sensor_path
-from .longterm import runtime_mode_status, runtime_policy_snapshot
+from .hardware import systemd_user_unit_state, thermal_sensor_path
+from .longterm import runtime_mode_status, runtime_policy_snapshot, stage_e_code_identity
 from .measurement import MinimalMeter, measurement_trust_matches_epoch
 from .service import build_actuator
 from .storage import Database
@@ -58,37 +57,21 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _hourly_units_status() -> dict[str, str]:
-    states: dict[str, str] = {}
-    for unit in NET_BENEFIT_BACKGROUND_UNITS:
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "is-active", unit],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"cannot verify background PowerLab unit {unit}: {exc}") from exc
-        state = result.stdout.strip() or "unknown"
-        if result.returncode not in {0, 3, 4}:
-            detail = result.stderr.strip() or state
-            raise RuntimeError(f"cannot verify background PowerLab unit {unit}: {detail}")
-        states[unit] = state
-    return states
+    return {unit: systemd_user_unit_state(unit) for unit in NET_BENEFIT_BACKGROUND_UNITS}
 
 
 def _service_mode_status(config: Any, db: Database, mode: str) -> dict[str, Any]:
     status = runtime_mode_status(config, db)
     actual_mode = str(status["mode"])
+    service_unit_state = systemd_user_unit_state("sp7-powerlab.service")
     if mode == "FIXED_GOOD":
-        if actual_mode != "FIXED_GOOD":
+        if service_unit_state != "inactive":
             raise RuntimeError("FIXED_GOOD capture requires the PowerLab service to be stopped")
     elif mode == "MONITORING":
-        if actual_mode != "MONITORING":
+        if service_unit_state != "active" or actual_mode != "MONITORING":
             raise RuntimeError("MONITORING capture requires a live service with automation.level=0")
     elif mode == "DYNAMIC_CONTROLLER":
-        if actual_mode != "DYNAMIC_CONTROLLER":
+        if service_unit_state != "active" or actual_mode != "DYNAMIC_CONTROLLER":
             raise RuntimeError(
                 "DYNAMIC_CONTROLLER capture requires a live CONTROL_ALLOWED service at automation.level=1"
             )
@@ -105,7 +88,11 @@ def _service_mode_status(config: Any, db: Database, mode: str) -> dict[str, Any]
             "Net Benefit capture requires hourly background units to be stopped: "
             + ", ".join(active_units)
         )
-    return {**status, "hourly_units": hourly_units}
+    return {
+        **status,
+        "service_unit_state": service_unit_state,
+        "hourly_units": hourly_units,
+    }
 
 
 def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dict[str, Any]:
@@ -142,6 +129,8 @@ def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dic
         raise RuntimeError("MinimalMeter capture requires a current VERIFIED envelope")
     service_mode = _service_mode_status(config, db, mode)
     policy = runtime_policy_snapshot(config, db)
+    stage_e_identity = stage_e_code_identity(config)
+    media_generation = str(db.get_meta("media_compatibility_generation", "media-missing") or "")
 
     return {
         "evidence_epoch_id": str(epoch["epoch_id"]),
@@ -153,9 +142,8 @@ def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dic
         "envelope": envelope,
         "envelope_content_hash": str(envelope_record.get("content_hash") or ""),
         "runtime_policy_fingerprint": str(policy["fingerprint"]),
-        "runtime_code_identity": str(
-            ((policy.get("payload") or {}).get("code_identity") or {}).get("aggregate_sha256") or ""
-        ),
+        "stage_e_code_identity": str(stage_e_identity.get("aggregate_sha256") or ""),
+        "media_compatibility_generation": media_generation,
         "runtime_policy": policy["payload"],
         "service_mode": service_mode,
     }
@@ -175,6 +163,8 @@ def _capture_context_change_reason(
         "calibration_version",
         "evidence_semantics_version",
         "runtime_policy_fingerprint",
+        "stage_e_code_identity",
+        "media_compatibility_generation",
     )
     if any(final[field] != start[field] for field in stable_context_fields):
         return "capture_context_changed"
@@ -210,7 +200,8 @@ def _prepare_campaign(
             fixed_baseline_content_hash=str(context["envelope_content_hash"]),
             payload={
                 "comparisons": {},
-                "runtime_code_identity": str(context["runtime_code_identity"]),
+                "stage_e_code_identity": str(context["stage_e_code_identity"]),
+                "media_compatibility_generation": str(context["media_compatibility_generation"]),
             },
         )
     if campaign.get("status") != "OPEN":
@@ -234,12 +225,15 @@ def _prepare_campaign(
             "campaign_context_changed:" + ",".join(sorted(mismatched)),
         )
         raise RuntimeError("Net Benefit campaign context changed: " + ", ".join(sorted(mismatched)))
-    campaign_code_identity = str(
-        ((campaign.get("payload") or {}).get("runtime_code_identity")) or ""
-    )
-    if campaign_code_identity != str(context.get("runtime_code_identity") or ""):
-        db.invalidate_net_benefit_campaign(campaign_id, "runtime_code_identity_changed")
-        raise RuntimeError("Net Benefit campaign runtime code identity changed")
+    campaign_payload = campaign.get("payload") or {}
+    campaign_code_identity = str(campaign_payload.get("stage_e_code_identity") or "")
+    if campaign_code_identity != str(context.get("stage_e_code_identity") or ""):
+        db.invalidate_net_benefit_campaign(campaign_id, "stage_e_code_identity_changed")
+        raise RuntimeError("Net Benefit campaign Stage E code identity changed")
+    campaign_media_generation = str(campaign_payload.get("media_compatibility_generation") or "")
+    if campaign_media_generation != str(context.get("media_compatibility_generation") or ""):
+        db.invalidate_net_benefit_campaign(campaign_id, "media_compatibility_generation_changed")
+        raise RuntimeError("Net Benefit campaign media compatibility generation changed")
     if mode == "FIXED_GOOD" and (
         str(campaign.get("fixed_baseline_envelope") or "") != str(context.get("envelope") or "")
         or str(campaign.get("fixed_baseline_content_hash") or "")
@@ -360,11 +354,13 @@ def main(argv: list[str] | None = None) -> int:
         envelope_content_hash=start_context["envelope_content_hash"],
         runtime_policy_fingerprint=start_context["runtime_policy_fingerprint"],
         payload={
-            "capture_contract_version": 2,
+            "capture_contract_version": 3,
             "interval_seconds": float(args.interval),
             "actuator_mode": actuator_mode,
             "service_mode": start_context["service_mode"],
             "runtime_policy": start_context["runtime_policy"],
+            "stage_e_code_identity": start_context["stage_e_code_identity"],
+            "media_compatibility_generation": start_context["media_compatibility_generation"],
             "start_hwp_snapshot": start_snapshot,
         },
     )
@@ -437,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         db.finish_minimal_meter_run(
             run_id,
             {
-                "capture_contract_version": 2,
+                "capture_contract_version": 3,
                 "interval_seconds": float(args.interval),
                 "sample_count": count,
                 "terminal_reason": terminal_reason,

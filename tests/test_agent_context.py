@@ -73,12 +73,9 @@ def test_agent_context_is_compact_runtime_truth_entrypoint(
         },
     )
     try:
-        before_runs = db.conn.execute("SELECT COUNT(*) FROM llm_runs").fetchone()[0]
         context = build_agent_context(config, db, registry)
-        after_runs = db.conn.execute("SELECT COUNT(*) FROM llm_runs").fetchone()[0]
 
-        assert before_runs == after_runs
-        assert context["project"]["runtime_schema"] == 8
+        assert context["project"]["runtime_schema"] == 9
         assert context["project"]["git"]["commit"] == "abc123"
         assert context["documentation"]["ai_entry"] == "AGENTS.md"
         assert context["documentation"]["design_contract"] == "PLAN2.md"
@@ -86,7 +83,6 @@ def test_agent_context_is_compact_runtime_truth_entrypoint(
         assert context["documentation"]["first_run"] == "docs/FIRST_RUN.md"
         assert context["documentation"]["deployment"] == "docs/DEPLOYMENT.md"
         assert context["documentation"]["agent_loop"] == "docs/AI_LOOP.md"
-        assert context["documentation"]["structured_agent_interface"] == "docs/MCP.md"
         assert context["hardware"]["supported_machine"] is True
         assert context["current_stage"]["name"] == "STAGE_A_MEASUREMENT_TRUST"
         assert context["current_stage"]["status"] == "BLOCKED"
@@ -355,14 +351,14 @@ def test_agent_context_requires_explicit_stage_c_transition_after_baseline():
         "epoch_id": "epoch-current",
         "battery_epoch": 1,
         "calibration_version": 2,
-        "evidence_semantics_version": 7,
+        "evidence_semantics_version": 8,
     }
     measurement_trust = {
         "status": "READY",
         "evidence_epoch_id": "epoch-current",
         "battery_epoch": 1,
         "calibration_version": 2,
-        "evidence_semantics_version": 7,
+        "evidence_semantics_version": 8,
     }
     stage, actions = _stage_and_actions(
         hardware={"supported_machine": True},
@@ -392,14 +388,14 @@ def test_agent_context_stale_selected_policy_suggests_reconcile_not_retest():
         "epoch_id": "epoch-current",
         "battery_epoch": 1,
         "calibration_version": 2,
-        "evidence_semantics_version": 7,
+        "evidence_semantics_version": 8,
     }
     measurement_trust = {
         "status": "READY",
         "evidence_epoch_id": "epoch-current",
         "battery_epoch": 1,
         "calibration_version": 2,
-        "evidence_semantics_version": 7,
+        "evidence_semantics_version": 8,
     }
     stage, actions = _stage_and_actions(
         hardware={"supported_machine": True},

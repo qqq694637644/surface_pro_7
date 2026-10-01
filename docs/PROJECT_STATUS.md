@@ -16,8 +16,8 @@ sp7-powerlab agent-context
 
 当前 runtime：
 
-- SQLite schema v8
-- evidence semantics v7
+- SQLite schema v9
+- evidence semantics v8
 - 旧 runtime schema fail-fast，不维护兼容迁移
 - AI 入口：AGENTS.md + sp7-powerlab agent-context
 - 设计合同：PLAN2.md
@@ -254,8 +254,8 @@ IMPLEMENTED + SOFTWARE-VALIDATED
 - PROJECT_STATUS
 - LLM_BEHAVIOR
 - sp7-powerlab agent-context
-- sp7-powerlab-agent convenience interface
-- knowledge pack / structured decision contract
+- sp7-powerlab review-pack 按需历史摘要
+- GPT-5.6 Sol + Bash 直接使用主 CLI / SQLite / journal / sysfs
 - Bash/workspace Agent 信任模型
 - task-mode-aware Agent 入口：仓库工程与真实 SP7 运维不再共用一套机械启动流程
 - Agent 入口统一 Stage A→B→C→D→E→STABLE 生命周期与 evidence identity 模型
@@ -283,12 +283,18 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - STABLE negative feedback 只阻塞当前保留策略的未解决负面证据；已 reject/rollback 的 candidate 不继续冷却当前策略
 - Net Benefit block 必须是单一 contiguous Discharging observation；Charging/resume/gap/epoch change 整块 fail-closed
 - Net Benefit 使用 time-weighted integrated BAT power，并对 data quality fail-closed
-- capture mode 验证真实 service Automation Level / ControlSafety；FIXED/MONITORING 每点核对实际 HWP
-- formal capture 每个 sample 都要求 hourly timer/service inactive；默认安装不启用 hourly timer
+- FIXED_GOOD 用 live systemd 状态 + one-shot runtime audit 证明 service inactive、thermald/ownership/hard identity/HWP 都正确
+- MinimalMeter 用 wall-vs-monotonic 检测短 suspend；formal block 任一 suspend/resume 整块 fail-closed
+- capture mode 验证真实 service state / Automation Level / ControlSafety；FIXED 每点核对实际 HWP
+- 正式 capture 会拒绝残留旧 hourly unit 若其处于 active；当前安装不再部署 scheduled review unit
 - brightness/active/media/remote/network/temperature 作为低成本 comparability veto
 - 正式 Net Benefit 使用 A1-B1-B2-A2 paired campaign，检查两个 candidate delta 的方向/spread
-- runtime policy fingerprint 固定 controller/config、Automation Level、VERIFIED envelope set/hash、override 与核心 control/evidence code identity
-- Net Benefit campaign 是 OPEN/COMPLETE/INVALID 实体，限制最大 campaign span，Monitoring + Dynamic 完成后即关闭
+- Dynamic policy fingerprint 只固定 Level-1 runtime 相关 config / VERIFIED set / override / explicit code allowlist
+- Stage E 另有 measurement-contract code identity，包含 CLI/MinimalMeter/measurement/longterm 等正式比较代码
+- media compatibility generation 进入 capture/campaign provenance
+- Net Benefit campaign 是 OPEN/COMPLETE/INVALID 实体；一个有效 Dynamic A1-B1-B2-A2 即可 COMPLETE
+- 两个 Dynamic candidate block 都必须达到 practical saving；只有一个达到时 NEED_MORE_DATA
+- MONITORING 仅为按需诊断，不进入 StableReadiness
 - STABLE 同时验证 selected policy fingerprint 与实际 selected runtime mode
 - KEEP_DYNAMIC_CONTROLLER
 - FIXED_GOOD_ENVELOPE
@@ -296,7 +302,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 
 仍需真机：
 
-- monitoring overhead
+- optional monitoring overhead（只在需要解释 Dynamic 结果时）
 - probe/DB write 成本
 - dynamic controller 实际净收益
 - 真机 A1-B1-B2-A2 block 时长和 comparability 阈值是否合适
@@ -320,7 +326,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 9. 收集只属于当前 evidence epoch、稳定 brightness/envelope 的自然 baseline/noise
 10. coarse optimization
 11. Stage D independent validation + representative real-usage burn-in
-12. Stage E fixed-good / monitoring / dynamic Net Benefit campaign
+12. Stage E fixed-good / dynamic A1-B1-B2-A2 Net Benefit campaign
 13. deterministic readiness 全部通过后 freeze STABLE
 
 ## 当前不能声称

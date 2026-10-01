@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from sp7_powerlab.measurement import (
+    MinimalMeter,
     assess_measurement_trust,
     characterize_battery_gauge,
     measurement_energy_summary,
+    valid_discharge_interval_seconds,
 )
 
 
@@ -45,6 +47,27 @@ def test_charging_gap_cannot_be_hidden_by_endpoint_delta():
     assert summary["integrated_energy_wh"] is None
     assert summary["battery_energy_delta_wh"] is None
     assert summary["data_quality"] == "DATA_QUALITY_FAILURE"
+
+
+def test_minimal_meter_detects_short_suspend_from_wall_vs_monotonic(tmp_path, monkeypatch):
+    battery = tmp_path / "class" / "power_supply" / "BAT0"
+    battery.mkdir(parents=True)
+    (battery / "status").write_text("Discharging\n", encoding="utf-8")
+    (battery / "power_now").write_text("5000000\n", encoding="utf-8")
+    (battery / "energy_now").write_text("30000000\n", encoding="utf-8")
+
+    wall = iter((100.0, 180.0))
+    monotonic = iter((50.0, 110.0))
+    monkeypatch.setattr("sp7_powerlab.measurement.time.time", lambda: next(wall))
+    monkeypatch.setattr("sp7_powerlab.measurement.time.monotonic", lambda: next(monotonic))
+
+    meter = MinimalMeter(tmp_path, suspend_detection_seconds=3.0)
+    first = meter.sample()
+    second = meter.sample()
+    assert first["suspend_or_resume_detected"] is False
+    assert second["suspend_gap_seconds"] == 20.0
+    assert second["suspend_or_resume_detected"] is True
+    assert valid_discharge_interval_seconds(first, second, max_gap_seconds=90.0) is None
 
 
 def test_static_energy_gauge_is_recorded_as_quantized_not_fake_mismatch():

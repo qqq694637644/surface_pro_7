@@ -583,7 +583,7 @@ STABLE 下：
 - selected=Dynamic 时 Controller / main service / core telemetry / drift / UnexpectedPower 继续
 - selected=Fixed-good 时 main service 可以保持停止，实际 HWP 固定在 verified envelope
 - fixed-good 的状态检查、diagnostic / attribution 按需运行
-- hourly timer 默认关闭
+- 不部署 scheduled review timer；review pack 按需生成
 - Scheduler 默认睡眠
 - 不主动 trial
 - AI 最常见结论应是 NO_CHANGE
@@ -937,7 +937,7 @@ STABLE 下即使 Level 4，也默认不主动探索。
 
 必须比较整个系统。
 
-同一 MinimalMeter 下至少评估：
+正式 Stage E 只强制评估：
 
 ### A. fixed-good
 
@@ -945,13 +945,7 @@ STABLE 下即使 Level 4，也默认不主动探索。
 MinimalMeter + fixed good verified configuration
 ~~~
 
-### B. monitoring
-
-~~~
-MinimalMeter + PowerLab monitoring + fixed configuration
-~~~
-
-### C. dynamic controller
+### B. dynamic controller
 
 ~~~
 MinimalMeter + dynamic controller
@@ -961,17 +955,21 @@ Automation Level 2+ 的 Scheduler / Agent / autonomous trial 能力是按需学�
 第四种 Net Benefit treatment。若未来明确决定长期运行 autonomous learning，再为那个实际 runtime mode
 单独建立新的 treatment 和验证合同。
 
+MONITORING（Level 0 + fixed HWP）只保留为按需 observer-overhead 诊断，不进入 formal StableReadiness。
+
 Net Benefit 直接来自 end-to-end paired comparison，而不是两个任意历史小时均值相减。
 
 MinimalMeter capture 的 provenance 必须在**采集开始时**固定并持久化，至少包括 run/campaign、
 capture mode、battery identity/epoch、hard evidence epoch/fingerprint、calibration version、evidence
-semantics、起始 verified envelope 和 runtime policy fingerprint。比较时只能读取 capture-time provenance；
+semantics、起始 verified envelope、media compatibility generation、runtime policy fingerprint 和 Stage E
+measurement-contract code identity。比较时只能读取 capture-time provenance；
 禁止读取“当前 epoch”后给旧采集文件事后贴标签。
 
-runtime policy fingerprint 至少覆盖会改变实际 runtime 行为的 controller/runtime config、Automation
-Level、VERIFIED envelope names/content hashes、manual override state，以及核心 PowerLab control/evidence
-代码 identity。一个 A1-B1-B2-A2 comparison 的四个 block 必须具有同一个 policy fingerprint；核心代码、
-config、verified set 或 override 在中途变化都使该 comparison 失效。
+Dynamic runtime policy fingerprint 使用**显式 allowlist**，只覆盖 Level-1 长期 runtime 真正使用的
+controller/service/telemetry/demand/thermal/HWP 等代码、相关 config、VERIFIED envelope names/content
+hashes 和 manual override。Scheduler/Trial/Agent 代码不应因为与 Level-1 无关而迫使重做长期 Dynamic
+验证。Stage E 的测量合同另有独立 code identity，明确包含 `cli.py`、`minimal_meter_cli.py`、
+`measurement.py`、`longterm.py` 等比较路径代码。
 
 Net Benefit 使用 gap-aware integrated BAT energy / valid discharge duration 计算 time-weighted mean
 power，但**一个正式 block 必须恰好是一段连续 Discharging observation**。block 中出现 Charging/AC、
@@ -982,8 +980,8 @@ suspend/resume、超限 sample gap、battery epoch change 或 evidence epoch cha
 
 ~~~
 A1 = FIXED_GOOD
-B1 = MONITORING / DYNAMIC_CONTROLLER
-B2 = 同一个 candidate mode 的第二个独立 block
+B1 = DYNAMIC_CONTROLLER
+B2 = DYNAMIC_CONTROLLER 的第二个独立 block
 A2 = FIXED_GOOD
 ~~~
 
@@ -998,39 +996,41 @@ remote fraction、basic network 和 package temperature。它们只用于 veto �
 
 capture mode 不能只是用户标签。正式 capture 必须验证：
 
-- FIXED_GOOD：PowerLab service 停止，且每个 sample 的实际 HWP 都匹配同一个 VERIFIED envelope
-- MONITORING：service 正在运行、Automation Level 0，且每个 sample 的实际 HWP 仍匹配 fixed envelope
+- FIXED_GOOD：live systemd state 证明 PowerLab service inactive，且每个 sample 的实际 HWP 都匹配同一个 VERIFIED envelope
 - DYNAMIC_CONTROLLER：service 正在运行、Automation Level 1、ControlSafety=CONTROL_ALLOWED
 
-所有正式 Stage E capture 期间，`sp7-powerlab-hourly.timer` 和 `sp7-powerlab-hourly.service` 都必须停止，
-避免 PowerLab 自己的 slow-review/knowledge-pack 工作污染 treatment。默认安装不自动启用 hourly timer。
+当前版本不再部署 scheduled Agent review unit；installer 会移除旧 hourly unit。正式 capture 仍 fail-closed
+检查遗留 `sp7-powerlab-hourly.timer/service`，防止旧部署污染 treatment。
 
-capture 中发生 trial/calibration、hard context 改变、fixed-mode HWP 改变、service mode 失真或 hourly
-background unit 运行时，整个 run 标记 INVALID。
+capture 中发生 trial/calibration、hard context 改变、media compatibility generation 改变、fixed-mode HWP
+改变、service mode 失真、短 suspend/resume 或遗留 scheduled-review unit 运行时，整个 run 标记 INVALID。
 
-用于 STABLE readiness 的 monitoring / dynamic 两种结果必须来自同一个 hard evidence epoch、同一个
-显式 validation campaign、同一个 fixed baseline content hash，并且每种结果本身都已经
-通过 A1-B1-B2-A2 comparability gate。不能把不同周、不同 fixed reference 或不同系统条件下各自最新的
-一次结果拼成“完整比较”。
+用于 STABLE readiness 的 Dynamic 结果必须来自一个显式 bounded validation campaign、同一个 hard
+evidence epoch、同一个 fixed baseline content hash，并通过完整 A1-B1-B2-A2 comparability gate。不能把
+不同周、不同 fixed reference 或不同系统条件下的历史 block 拼成“完整比较”。
 
 validation campaign 是有生命周期的 DB entity，不是可无限复用的字符串。campaign 从 OPEN 开始，
 固定 hard/battery/calibration/semantics context 与 fixed baseline identity；超过 `max_campaign_span_seconds`
-或 context/baseline 变化时 INVALID。Monitoring 与 Dynamic 两种有效 comparison 各完成一次后自动
-COMPLETE/CLOSED，禁止继续往旧 campaign 塞新结果。
+或 context/baseline/media generation/Stage-E-code identity 变化时 INVALID。一个有效 Dynamic comparison
+完成后自动 COMPLETE/CLOSED，禁止继续往旧 campaign 塞新结果。
 
-MonitoringOverhead 只解释 observer 成本。最终复杂度选择只问一个问题：
+最终复杂度选择只问一个问题：
 
 ~~~
-Dynamic Controller 相比 Fixed-good 是否至少节省一个 practical threshold / MUE？
+Dynamic Controller 的两个独立 paired block 是否都至少节省一个 practical threshold？
 ~~~
 
 - 是：KEEP_DYNAMIC_CONTROLLER
-- 否：FIXED_GOOD_ENVELOPE
-- evidence 不完整：NEED_MORE_DATA
+- 两个都否：FIXED_GOOD_ENVELOPE
+- 只有一个是，或 evidence 不完整：NEED_MORE_DATA
 
-STABLE 必须同时验证 recommendation 对应的 selected policy fingerprint 与**实际 selected runtime mode**
-仍匹配当前系统。仅 fingerprint 相同不够；service stopped/live、Automation Level 和 CONTROL_ALLOWED
-必须符合 selected mode。如果只是 Stage E 后尚未恢复 selected mode/config，应先 reconcile，而不是默认重测。
+若结果接近、Agent 值得继续调查“是不是 observer 自己太贵”，可以额外运行 MONITORING A1-B1-B2-A2。
+该结果只进入诊断 history，不阻塞或完成 formal Stage E campaign。
+
+STABLE 对 Dynamic 必须同时验证 selected policy fingerprint 与实际 Level-1 runtime mode。对 FIXED_GOOD
+不使用 stale heartbeat 推断物理状态，而是在每次 `agent-context` / `lifecycle readiness` / `freeze` 运行
+one-shot audit：main service inactive、thermald active、无 ownership conflict、live hard identity 与当前
+evidence epoch 一致、fixed baseline 仍 VERIFIED/hash 匹配、actual HWP snapshot 匹配 envelope。
 
 允许结论：
 
@@ -1074,7 +1074,7 @@ fixed-good 与复杂系统实际续航/UX 等价时，删掉复杂度是成功�
 - trial / feedback
 - control/learning history
 - UnexpectedPower / investigation
-- monitoring / MinimalMeter runs
+- Net Benefit / MinimalMeter results
 - MinimalMeter capture provenance
 - Net Benefit campaign lifecycle
 - runtime policy fingerprint
@@ -1120,7 +1120,7 @@ Git 保存：
 - FrozenReference
 - RecentNoise
 - practical threshold 初步验证
-- monitoring overhead 初步量化
+- optional monitoring overhead 诊断（仅需要时）
 
 **Stage C — Coarse Search**
 
@@ -1139,11 +1139,11 @@ Git 保存：
 **Stage E — Net Benefit / Complexity Selection**
 
 - fixed-good
-- monitoring
 - dynamic
 - complete one bounded validation campaign
+- B1/B2 都达到 practical saving 才 KEEP_DYNAMIC_CONTROLLER
 - selected/recommended policy fingerprint still matches runtime
-- selected runtime mode still matches live service/Automation Level/Control state
+- fixed-good one-shot live audit / dynamic live mode check
 
 完成 Stage E 后，只有 deterministic StableReadiness 的全部 gate 都通过，才进入 STABLE。
 STABLE 是 A–E 完成后的收敛状态，不是 Stage E 之前的 burn-in 状态。
@@ -1200,7 +1200,7 @@ STABLE 是 A–E 完成后的收敛状态，不是 Stage E 之前的 burn-in 状
 - 稀有 workload 有安全 fallback
 - 无 active trial/investigation
 - reference/noise 可用
-- monitoring/dynamic 来自同一 bounded COMPLETE campaign
+- Dynamic 来自一个 bounded COMPLETE campaign
 - selected/recommended policy fingerprint 与 actual runtime mode 都代表当前系统
 - dynamic controller 无 practical net gain 时退回 fixed-good
 

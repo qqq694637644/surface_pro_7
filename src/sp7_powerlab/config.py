@@ -61,7 +61,7 @@ DEFAULTS: dict[str, Any] = {
         "max_sustained_compute_delta": 0.10,
     },
     "evidence": {
-        "semantics_version": 7,
+        "semantics_version": 8,
         "practical_threshold_w": 0.10,
         "min_crossover_episodes": 2,
         "medium_effect_min_crossover_episodes": 3,
@@ -103,8 +103,7 @@ DEFAULTS: dict[str, Any] = {
         "database": "runtime/powerlab.sqlite3",
         "raw_retention_days": 30,
     },
-    "llm": {
-        "analysis_interval_minutes": 60,
+    "review": {
         "history_hours": 24,
         "max_incidents": 20,
         "max_trials": 20,

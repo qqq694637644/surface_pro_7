@@ -27,6 +27,8 @@ def _meter_run(
     envelope: str = "INTERACTIVE_EFFICIENT",
     envelope_hash: str = "fixed-hash",
     policy_fingerprint: str = "policy-a",
+    stage_e_code_identity: str = "stage-e-code-a",
+    media_generation: str = "media-a",
     order: int,
 ) -> str:
     if mode == "FIXED_GOOD" and db.net_benefit_campaign(campaign) is None:
@@ -36,9 +38,14 @@ def _meter_run(
             battery_epoch=1,
             hard_identity_hash="hard",
             calibration_version=1,
-            evidence_semantics_version=7,
+            evidence_semantics_version=8,
             fixed_baseline_envelope=envelope,
             fixed_baseline_content_hash=envelope_hash,
+            payload={
+                "comparisons": {},
+                "stage_e_code_identity": stage_e_code_identity,
+                "media_compatibility_generation": media_generation,
+            },
         )
     run_id = db.start_minimal_meter_run(
         capture_mode=mode,
@@ -48,11 +55,15 @@ def _meter_run(
         battery_identity_hash="battery",
         hard_identity_hash="hard",
         calibration_version=1,
-        evidence_semantics_version=7,
+        evidence_semantics_version=8,
         envelope=envelope,
         envelope_content_hash=envelope_hash,
         runtime_policy_fingerprint=policy_fingerprint,
-        payload={"capture_contract_version": 2},
+        payload={
+            "capture_contract_version": 3,
+            "stage_e_code_identity": stage_e_code_identity,
+            "media_compatibility_generation": media_generation,
+        },
     )
     db.finish_minimal_meter_run(run_id, {"sample_count": 2})
     start_ts = float(order * 100)
@@ -71,7 +82,7 @@ def test_meter_campaign_requires_paired_capture_time_provenance(tmp_path: Path):
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=7,
+            evidence_semantics_version=8,
             payload={},
         )
         before = _meter_run(
@@ -128,6 +139,51 @@ def test_meter_campaign_requires_paired_capture_time_provenance(tmp_path: Path):
         db.close()
 
 
+def test_meter_campaign_rejects_media_generation_change(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite3")
+    try:
+        epoch = db.ensure_evidence_epoch(
+            hard_identity_hash="hard",
+            battery_epoch=1,
+            calibration_version=1,
+            evidence_semantics_version=8,
+            payload={},
+        )
+        before = _meter_run(
+            db,
+            mode="FIXED_GOOD",
+            campaign="campaign-media",
+            epoch=epoch,
+            order=1,
+        )
+        first = _meter_run(
+            db,
+            mode="DYNAMIC_CONTROLLER",
+            campaign="campaign-media",
+            epoch=epoch,
+            order=2,
+        )
+        second = _meter_run(
+            db,
+            mode="DYNAMIC_CONTROLLER",
+            campaign="campaign-media",
+            epoch=epoch,
+            media_generation="media-b",
+            order=3,
+        )
+        after = _meter_run(
+            db,
+            mode="FIXED_GOOD",
+            campaign="campaign-media",
+            epoch=epoch,
+            order=4,
+        )
+        with pytest.raises(SystemExit, match="media_compatibility_generation"):
+            _meter_campaign(db, before, first, second, after)
+    finally:
+        db.close()
+
+
 def test_meter_campaign_rejects_runs_from_stale_epoch(tmp_path: Path):
     db = Database(tmp_path / "db.sqlite3")
     try:
@@ -135,7 +191,7 @@ def test_meter_campaign_rejects_runs_from_stale_epoch(tmp_path: Path):
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=7,
+            evidence_semantics_version=8,
             payload={},
         )
         before = _meter_run(
@@ -170,7 +226,7 @@ def test_meter_campaign_rejects_runs_from_stale_epoch(tmp_path: Path):
             hard_identity_hash="hard-new",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=7,
+            evidence_semantics_version=8,
             payload={},
         )
         with pytest.raises(SystemExit, match="current evidence epoch"):
@@ -186,7 +242,7 @@ def test_meter_campaign_rejects_changed_fixed_baseline(tmp_path: Path):
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=7,
+            evidence_semantics_version=8,
             payload={},
         )
         before = _meter_run(
@@ -232,7 +288,7 @@ def test_meter_campaign_rejects_large_interblock_gap(tmp_path: Path):
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=7,
+            evidence_semantics_version=8,
             payload={},
         )
         before = _meter_run(
@@ -283,7 +339,7 @@ def test_meter_campaign_rejects_runtime_policy_change_between_candidate_blocks(t
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=7,
+            evidence_semantics_version=8,
             payload={},
         )
         before = _meter_run(
@@ -324,7 +380,7 @@ def test_meter_campaign_rejects_runtime_policy_change_between_candidate_blocks(t
         db.close()
 
 
-def test_net_benefit_campaign_rejects_core_code_change_between_mode_comparisons(tmp_path: Path):
+def test_net_benefit_campaign_rejects_stage_e_code_change_between_blocks(tmp_path: Path):
     db = Database(tmp_path / "db.sqlite3")
     try:
         context = {
@@ -332,10 +388,12 @@ def test_net_benefit_campaign_rejects_core_code_change_between_mode_comparisons(
             "battery_epoch": 1,
             "hard_identity_hash": "hard",
             "calibration_version": 1,
-            "evidence_semantics_version": 7,
+            "evidence_semantics_version": 8,
             "envelope": "INTERACTIVE_EFFICIENT",
             "envelope_content_hash": "fixed-hash",
-            "runtime_code_identity": "code-a",
+            "runtime_policy_fingerprint": "dynamic-policy",
+            "stage_e_code_identity": "code-a",
+            "media_compatibility_generation": "media-a",
         }
         campaign = _prepare_campaign(
             db,
@@ -344,14 +402,14 @@ def test_net_benefit_campaign_rejects_core_code_change_between_mode_comparisons(
             context=context,
             max_campaign_span_seconds=86400.0,
         )
-        assert campaign["payload"]["runtime_code_identity"] == "code-a"
+        assert campaign["payload"]["stage_e_code_identity"] == "code-a"
 
-        with pytest.raises(RuntimeError, match="runtime code identity changed"):
+        with pytest.raises(RuntimeError, match="Stage E code identity changed"):
             _prepare_campaign(
                 db,
                 campaign_id="campaign-code",
                 mode="DYNAMIC_CONTROLLER",
-                context={**context, "runtime_code_identity": "code-b"},
+                context={**context, "stage_e_code_identity": "code-b"},
                 max_campaign_span_seconds=86400.0,
             )
         assert db.net_benefit_campaign("campaign-code")["status"] == "INVALID"
@@ -366,8 +424,10 @@ def test_dynamic_capture_allows_verified_envelope_changes_but_fixed_capture_does
         "battery_identity_hash": "battery",
         "hard_identity_hash": "hard",
         "calibration_version": 1,
-        "evidence_semantics_version": 7,
+        "evidence_semantics_version": 8,
         "runtime_policy_fingerprint": "policy-a",
+        "stage_e_code_identity": "code-a",
+        "media_compatibility_generation": "media-a",
         "envelope": "INTERACTIVE_EFFICIENT",
         "envelope_content_hash": "fixed",
     }
@@ -387,6 +447,12 @@ def test_service_mode_status_verifies_runtime_mode(project_root: Path, monkeypat
     config = load_config(project_root)
     config.data["automation"]["level"] = 0
     db = Database(project_root / "runtime/meter-mode.sqlite3")
+    service_state = {"value": "inactive"}
+    monkeypatch.setattr(
+        meter_cli_module,
+        "systemd_user_unit_state",
+        lambda unit: service_state["value"] if unit == "sp7-powerlab.service" else "unavailable",
+    )
     monkeypatch.setattr(
         meter_cli_module,
         "_hourly_units_status",
@@ -398,7 +464,9 @@ def test_service_mode_status_verifies_runtime_mode(project_root: Path, monkeypat
     try:
         fixed = _service_mode_status(config, db, "FIXED_GOOD")
         assert fixed["service_heartbeat_fresh"] is False
+        assert fixed["service_unit_state"] == "inactive"
 
+        service_state["value"] = "active"
         db.set_meta(
             "service_heartbeat",
             {
@@ -434,6 +502,11 @@ def test_service_mode_status_rejects_active_hourly_background_unit(project_root:
     db = Database(project_root / "runtime/meter-hourly.sqlite3")
     monkeypatch.setattr(
         meter_cli_module,
+        "systemd_user_unit_state",
+        lambda unit: "inactive" if unit == "sp7-powerlab.service" else "unavailable",
+    )
+    monkeypatch.setattr(
+        meter_cli_module,
         "_hourly_units_status",
         lambda: {
             "sp7-powerlab-hourly.timer": "active",
@@ -447,9 +520,36 @@ def test_service_mode_status_rejects_active_hourly_background_unit(project_root:
         db.close()
 
 
+def test_fixed_good_rejects_stale_heartbeat_if_service_is_actually_active(
+    project_root: Path,
+    monkeypatch,
+):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/meter-fixed-physical.sqlite3")
+    monkeypatch.setattr(
+        meter_cli_module,
+        "systemd_user_unit_state",
+        lambda unit: "active" if unit == "sp7-powerlab.service" else "unavailable",
+    )
+    monkeypatch.setattr(
+        meter_cli_module,
+        "_hourly_units_status",
+        lambda: {
+            "sp7-powerlab-hourly.timer": "unavailable",
+            "sp7-powerlab-hourly.service": "unavailable",
+        },
+    )
+    try:
+        db.set_meta("service_heartbeat", {"ts": 0.0})
+        with pytest.raises(RuntimeError, match="service to be stopped"):
+            _service_mode_status(config, db, "FIXED_GOOD")
+    finally:
+        db.close()
+
+
 def test_service_run_returns_non_restartable_exit_for_legacy_schema(monkeypatch, capsys):
     def fail_service(*_args, **_kwargs):
-        raise LegacyDatabaseError("database schema 7 is not supported by schema 8")
+        raise LegacyDatabaseError("database schema 8 is not supported by schema 9")
 
     monkeypatch.setattr(cli_module, "PowerLabService", fail_service)
     result = cli_module.cmd_service_run(SimpleNamespace(config=None, iterations=None))

@@ -82,10 +82,10 @@ sp7-powerlab agent-context
 
 如果 agent-context 与 Markdown 在实时状态上冲突，以当前 OS/SQLite/CLI 为准；如果是设计语义冲突，回到 PLAN2 + implementation/tests 明确处理。
 
-## 3. knowledge pack 只在需要历史时加载
+## 3. review pack 只在需要历史时加载
 
 ```bash
-sp7-powerlab-agent hourly
+sp7-powerlab review-pack
 ```
 
 适用于：
@@ -103,7 +103,7 @@ sp7-powerlab-agent hourly
 - Net Benefit
 - versions
 
-不要每轮把全部 SQLite、journal、源码、文档和 knowledge pack 一起塞进模型。
+不要每轮把全部 SQLite、journal、源码、文档和 review pack 一起塞进模型。
 
 先用 agent-context 定位当前缺口，再读取最小必要历史。
 
@@ -147,8 +147,7 @@ sp7-powerlab-agent hourly
 - 部署/运维
 - 删除复杂度
 
-hourly timer 默认不启用。`sp7-powerlab hourly` 可以按需执行；只有用户明确希望固定 slow review 时才
-enable timer，它也不是“每小时必须修改系统”的要求。
+仓库不再部署 scheduled review timer。需要慢速复盘时由 Agent 按需运行 `sp7-powerlab review-pack`。
 
 ## 5. 每轮先问三个问题
 
@@ -237,12 +236,13 @@ Agent 应：
 Agent 应：
 
 - 使用同一 bounded OPEN campaign；
-- 为 MONITORING 和 DYNAMIC_CONTROLLER 分别运行 A1-B1-B2-A2；
+- 正式只运行一次 Dynamic vs Fixed-good A1-B1-B2-A2；
 - 检查 runtime policy fingerprint；
-- 检查 actual runtime mode 和 hourly background units；
+- 检查 actual runtime mode，并拒绝遗留 scheduled review unit 干扰；
 - 拒绝 Charging/resume/gap 后重连 block；
 - 拒绝跨时间/context/policy 拼接；
-- MONITORING 只解释 observer overhead；最终决定保留 Dynamic 还是回到 Fixed-good。
+- B1/B2 两个 Dynamic block 都达到 practical saving 才保留 Dynamic；只有一个达到时 NEED_MORE_DATA；
+- MONITORING 仅在需要解释 observer overhead 时另做可选诊断。
 
 ### STABLE
 
@@ -283,23 +283,10 @@ UnexpectedPower / Drift
 
 外部事实（例如某 kernel/Firefox/Mesa regression）需要可核实来源；本机是否受影响仍需本机验证。
 
-## 8. Structured actions 是便利协议
+## 8. GPT + Bash 直接使用 deterministic contracts
 
-可选 decision contract：
-
-- NO_CHANGE
-- NEED_MORE_DATA
-- INVESTIGATE_POWER_SPIKE
-- INVESTIGATE_THERMAL_EVENT
-- PROPOSE_POWER_FIX
-- PROPOSE_ENVELOPE_TRIAL
-- ROLLBACK_TRIAL
-- PROMOTE_ENVELOPE
-- PROPOSE_MANUAL_RECALIBRATION
-
-拥有 Bash/workspace 的 Agent 不被限制只能使用这些 action。
-
-但无论使用哪种接口，都不能绕过：
+项目不维护专用 LLM action language。GPT-5.6 Sol 可以直接调用主 CLI、读取 SQLite/journal/sysfs、修改
+仓库代码；但无论使用哪种用户态接口，都不能绕过：
 
 - thermal safety
 - transactional HWP / read-back / rollback
@@ -318,7 +305,7 @@ UnexpectedPower / Drift
 - 搜索邻域已耗尽；
 - candidate 反复 equivalent/inconclusive；
 - dynamic controller 没实际净收益；
-- monitoring overhead 接近收益；
+- optional monitoring 诊断表明 observer overhead 接近收益；
 - fixed-good 已足够；
 
 Agent 应建议停止、冻结或删除复杂度。
