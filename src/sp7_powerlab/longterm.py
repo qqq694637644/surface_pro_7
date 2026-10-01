@@ -5,6 +5,7 @@ import json
 import statistics
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .config import Config
@@ -19,8 +20,35 @@ from .storage import Database
 NET_BENEFIT_MODES = (
     "MONITORING_OVERHEAD",
     "DYNAMIC_CONTROLLER",
-    "FULL_POWERLAB",
 )
+
+RUNTIME_POLICY_CODE_EXCLUDES = {
+    "agent_cli.py",
+    "agent_context.py",
+    "analytics.py",
+    "attribution.py",
+    "cli.py",
+    "llm.py",
+}
+
+
+def _runtime_code_identity(config: Config) -> dict[str, Any]:
+    package_roots = (
+        config.root / "src" / "sp7_powerlab",
+        Path(__file__).resolve().parent,
+    )
+    package_root = next((path for path in package_roots if path.is_dir()), package_roots[-1])
+    files: dict[str, str] = {}
+    for path in sorted(package_root.rglob("*.py")):
+        relative = path.relative_to(package_root).as_posix()
+        if relative in RUNTIME_POLICY_CODE_EXCLUDES or relative.endswith("/__init__.py"):
+            continue
+        files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    encoded = json.dumps(files, sort_keys=True, separators=(",", ":"))
+    return {
+        "aggregate_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        "files": files,
+    }
 
 
 def runtime_policy_snapshot(config: Config, db: Database) -> dict[str, Any]:
@@ -42,12 +70,85 @@ def runtime_policy_snapshot(config: Config, db: Database) -> dict[str, Any]:
         "config": policy_config,
         "verified_envelopes": verified_envelopes,
         "manual_override": db.get_meta("manual_override"),
+        "code_identity": _runtime_code_identity(config),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {
         "fingerprint": hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24],
         "payload": payload,
     }
+
+
+def runtime_mode_status(
+    config: Config,
+    db: Database,
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
+    now = float(now or time.time())
+    heartbeat = db.get_meta("service_heartbeat", {})
+    heartbeat_ts = float(heartbeat.get("ts") or 0.0) if isinstance(heartbeat, dict) else 0.0
+    heartbeat_limit = max(float(config.get("collector.sample_seconds", 10.0)) * 3.0, 30.0)
+    heartbeat_fresh = heartbeat_ts > 0 and now - heartbeat_ts <= heartbeat_limit
+    configured_level = int(config.get("automation.level", 0))
+    runtime_level = (
+        int(heartbeat.get("automation_level", -1))
+        if heartbeat_fresh and isinstance(heartbeat, dict)
+        else None
+    )
+    control_state = str(heartbeat.get("control_state") or "") if heartbeat_fresh else ""
+
+    if not heartbeat_fresh:
+        mode = "FIXED_GOOD"
+    elif configured_level == 0 and runtime_level == 0:
+        mode = "MONITORING"
+    elif configured_level == 1 and runtime_level == 1 and control_state == "CONTROL_ALLOWED":
+        mode = "DYNAMIC_CONTROLLER"
+    elif (
+        configured_level >= 2
+        and runtime_level is not None
+        and runtime_level >= 2
+        and control_state == "CONTROL_ALLOWED"
+    ):
+        mode = "LEARNING_ENABLED"
+    else:
+        mode = "INVALID"
+
+    return {
+        "mode": mode,
+        "service_heartbeat_fresh": heartbeat_fresh,
+        "configured_automation_level": configured_level,
+        "runtime_automation_level": runtime_level,
+        "control_state": control_state or None,
+    }
+
+
+def negative_feedback_blocks_current_policy(
+    db: Database,
+    item: dict[str, Any],
+    *,
+    current_envelope: str,
+) -> bool:
+    if item.get("rating") not in {"sluggish", "bad", "unstable"}:
+        return False
+    trial_id = str(item.get("trial_id") or "")
+    envelope_name = str(item.get("envelope") or "")
+    if trial_id:
+        trial = db.get_trial(trial_id)
+        if trial and str(trial.get("state") or "") in {
+            "REJECTED",
+            "ROLLED_BACK",
+            "FAILED",
+            "EQUIVALENT",
+        }:
+            return False
+    if envelope_name:
+        envelope = db.envelope(envelope_name)
+        if not envelope or envelope.get("status") != "VERIFIED":
+            return False
+        if current_envelope and envelope_name != current_envelope:
+            return False
+    return True
 
 
 def minutes_gained_per_charge(
@@ -261,7 +362,6 @@ def assess_net_benefit(
             ],
             "campaign_id": selected_campaign,
             "fixed_baseline_content_hash": None,
-            "full_policy_fingerprint": None,
             "selected_policy_mode": None,
             "selected_policy_fingerprint": None,
             "latest_runs": latest,
@@ -269,16 +369,11 @@ def assess_net_benefit(
 
     monitoring_delta = float(deltas["MONITORING_OVERHEAD"])
     dynamic_delta = float(deltas["DYNAMIC_CONTROLLER"])
-    full_delta = float(deltas["FULL_POWERLAB"])
     reasons: list[str] = []
     fixed_baseline_content_hash = str(
         ((latest.get("MONITORING_OVERHEAD") or {}).get("result") or {}).get(
             "fixed_baseline_content_hash"
         )
-        or ""
-    )
-    full_policy_fingerprint = str(
-        ((latest.get("FULL_POWERLAB") or {}).get("result") or {}).get("runtime_policy_fingerprint")
         or ""
     )
     monitoring_policy_fingerprint = str(
@@ -294,18 +389,11 @@ def assess_net_benefit(
         or ""
     )
 
-    if full_delta <= -practical_threshold_w:
-        recommendation = "KEEP_FULL_POWERLAB"
-        selected_policy_mode = "FULL_POWERLAB"
-        selected_policy_fingerprint = full_policy_fingerprint
-        reasons.append("full PowerLab has practically meaningful net battery savings")
-    elif dynamic_delta <= -practical_threshold_w:
-        recommendation = "KEEP_DYNAMIC_REDUCE_MONITORING"
+    if dynamic_delta <= -practical_threshold_w:
+        recommendation = "KEEP_DYNAMIC_CONTROLLER"
         selected_policy_mode = "DYNAMIC_CONTROLLER"
         selected_policy_fingerprint = dynamic_policy_fingerprint
-        reasons.append(
-            "dynamic control helps but full PowerLab does not clear the net-benefit threshold"
-        )
+        reasons.append("dynamic controller beats fixed-good by a practical margin")
         if monitoring_delta > 0:
             reasons.append("monitoring overhead consumes part of the controller savings")
     else:
@@ -315,7 +403,7 @@ def assess_net_benefit(
         # requires the same policy fingerprint for its A1/B1/B2/A2 blocks. Its
         # fingerprint therefore represents the validated fixed-good runtime policy.
         selected_policy_fingerprint = monitoring_policy_fingerprint
-        reasons.append("dynamic/full PowerLab does not beat fixed-good by a practical margin")
+        reasons.append("dynamic controller does not beat fixed-good by a practical margin")
 
     return {
         "complete": True,
@@ -324,12 +412,10 @@ def assess_net_benefit(
         "deltas_w": deltas,
         "monitoring_overhead_w": monitoring_delta,
         "dynamic_net_saving_w": -dynamic_delta,
-        "full_net_saving_w": -full_delta,
         "recommendation": recommendation,
         "reasons": reasons,
         "campaign_id": selected_campaign,
         "fixed_baseline_content_hash": fixed_baseline_content_hash or None,
-        "full_policy_fingerprint": full_policy_fingerprint or None,
         "selected_policy_mode": selected_policy_mode,
         "selected_policy_fingerprint": selected_policy_fingerprint or None,
         "latest_runs": latest,
@@ -344,6 +430,7 @@ class StableReadiness:
     def assess(self, *, now: float | None = None) -> dict[str, Any]:
         now = float(now or time.time())
         reasons: list[str] = []
+        coverage_reasons: list[str] = []
         epoch = self.db.active_evidence_epoch()
         if not epoch:
             reasons.append("missing_evidence_epoch")
@@ -360,9 +447,9 @@ class StableReadiness:
         )
         trusted_fraction = coverage.get("trusted_fraction")
         if not isinstance(trusted_fraction, (int, float)):
-            reasons.append("trusted_usage_coverage_unavailable")
+            coverage_reasons.append("trusted_usage_coverage_unavailable")
         elif float(trusted_fraction) < target_fraction:
-            reasons.append("trusted_usage_coverage_below_target")
+            coverage_reasons.append("trusted_usage_coverage_below_target")
         minimum_total_valid_usage_seconds = float(
             self.config.get("stable.minimum_total_valid_usage_seconds", 28800.0)
         )
@@ -374,15 +461,15 @@ class StableReadiness:
             self.config.get("stable.minimum_observation_span_days", 7.0)
         )
         if float(coverage.get("total_valid_seconds") or 0.0) < minimum_total_valid_usage_seconds:
-            reasons.append("total_valid_usage_below_minimum")
+            coverage_reasons.append("total_valid_usage_below_minimum")
         if float(coverage.get("trusted_seconds") or 0.0) < minimum_total_trusted_usage_seconds:
-            reasons.append("trusted_usage_below_minimum")
+            coverage_reasons.append("trusted_usage_below_minimum")
         if int(coverage.get("distinct_usage_days") or 0) < minimum_distinct_usage_days:
-            reasons.append("distinct_usage_days_below_minimum")
+            coverage_reasons.append("distinct_usage_days_below_minimum")
         if float(coverage.get("observation_span_seconds") or 0.0) < (
             minimum_observation_span_days * 86400.0
         ):
-            reasons.append("observation_span_below_minimum")
+            coverage_reasons.append("observation_span_below_minimum")
 
         reference_count = 0
         if epoch:
@@ -428,19 +515,45 @@ class StableReadiness:
         if not net_benefit["complete"]:
             reasons.append("net_benefit_validation_incomplete")
         current_policy = runtime_policy_snapshot(self.config, self.db)
+        current_runtime_mode = runtime_mode_status(self.config, self.db, now=now)
         selected_policy_fingerprint = str(net_benefit.get("selected_policy_fingerprint") or "")
         if net_benefit["complete"] and selected_policy_fingerprint != str(
             current_policy["fingerprint"]
         ):
             reasons.append("net_benefit_selected_policy_is_stale")
+        selected_policy_mode = str(net_benefit.get("selected_policy_mode") or "")
+        if net_benefit["complete"] and selected_policy_mode != str(
+            current_runtime_mode.get("mode") or ""
+        ):
+            reasons.append("net_benefit_selected_runtime_mode_mismatch")
+
+        learning_row = self.db.latest_runtime_state("learning")
+        stable_entry = self.db.get_meta("stable_entry_readiness", {})
+        preserve_fixed_entry_coverage = (
+            bool(stable_entry.get("qualified"))
+            and str((learning_row or {}).get("state") or "") == "STABLE"
+            and selected_policy_mode == "FIXED_GOOD"
+            and str(current_runtime_mode.get("mode") or "") == "FIXED_GOOD"
+            and str(stable_entry.get("evidence_epoch_id") or "")
+            == str((epoch or {}).get("epoch_id") or "")
+            and str(stable_entry.get("selected_policy_fingerprint") or "")
+            == selected_policy_fingerprint
+        )
+        if not preserve_fixed_entry_coverage:
+            reasons.extend(coverage_reasons)
 
         feedback_lookback_days = int(self.config.get("stable.feedback_lookback_days", 7))
-        negative_feedback = [
-            item
-            for item in self.db.recent_feedback(200)
-            if float(item.get("ts") or 0.0) >= now - feedback_lookback_days * 86400.0
-            and item.get("rating") in {"sluggish", "bad", "unstable"}
-        ]
+        current_envelope = str(self.db.get_meta("current_envelope", "") or "")
+        negative_feedback = []
+        for item in self.db.recent_feedback(200):
+            if float(item.get("ts") or 0.0) < now - feedback_lookback_days * 86400.0:
+                continue
+            if negative_feedback_blocks_current_policy(
+                self.db,
+                item,
+                current_envelope=current_envelope,
+            ):
+                negative_feedback.append(item)
         if negative_feedback:
             reasons.append("recent_negative_user_feedback")
 
@@ -456,9 +569,12 @@ class StableReadiness:
             "minimum_distinct_usage_days": minimum_distinct_usage_days,
             "minimum_observation_span_days": minimum_observation_span_days,
             "usage_coverage": coverage,
+            "coverage_reasons": coverage_reasons,
+            "using_stable_entry_coverage": preserve_fixed_entry_coverage,
             "frozen_reference_count": reference_count,
             "net_benefit": net_benefit,
             "current_runtime_policy": current_policy,
+            "current_runtime_mode": current_runtime_mode,
             "open_unexpected_power_events": len(open_events),
             "recent_negative_feedback_count": len(negative_feedback),
         }
@@ -564,6 +680,18 @@ def summarize_minimal_meter_samples(
         )
     ]
     consistency_reasons: list[str] = []
+    if summary.get("consistency_status") == "DISCONTINUOUS_OBSERVATION":
+        consistency_reasons.append("discontinuous_observation")
+    if len(segment_summaries) != 1:
+        consistency_reasons.append("multiple_or_missing_discharge_segments")
+    if any(row.get("battery_status") != "Discharging" for row in rows):
+        consistency_reasons.append("non_discharging_sample_present")
+    if any(bool(row.get("resume_grace")) for row in rows):
+        consistency_reasons.append("resume_grace_present")
+    for field in ("battery_epoch", "evidence_epoch_id"):
+        values = {str(row.get(field)) for row in rows if row.get(field) is not None}
+        if len(values) > 1:
+            consistency_reasons.append(f"{field}_changed")
     if (
         summary.get("integrated_energy_wh") is None
         or float(summary.get("energy_valid_seconds") or 0) <= 0

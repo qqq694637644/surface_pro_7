@@ -7,10 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 import sp7_powerlab.cli as cli_module
+import sp7_powerlab.minimal_meter_cli as meter_cli_module
 from sp7_powerlab.cli import _meter_campaign
 from sp7_powerlab.config import load_config
 from sp7_powerlab.minimal_meter_cli import (
     _capture_context_change_reason,
+    _prepare_campaign,
     _service_mode_status,
 )
 from sp7_powerlab.storage import Database, LegacyDatabaseError
@@ -34,7 +36,7 @@ def _meter_run(
             battery_epoch=1,
             hard_identity_hash="hard",
             calibration_version=1,
-            evidence_semantics_version=6,
+            evidence_semantics_version=7,
             fixed_baseline_envelope=envelope,
             fixed_baseline_content_hash=envelope_hash,
         )
@@ -46,7 +48,7 @@ def _meter_run(
         battery_identity_hash="battery",
         hard_identity_hash="hard",
         calibration_version=1,
-        evidence_semantics_version=6,
+        evidence_semantics_version=7,
         envelope=envelope,
         envelope_content_hash=envelope_hash,
         runtime_policy_fingerprint=policy_fingerprint,
@@ -69,7 +71,7 @@ def test_meter_campaign_requires_paired_capture_time_provenance(tmp_path: Path):
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=6,
+            evidence_semantics_version=7,
             payload={},
         )
         before = _meter_run(
@@ -133,7 +135,7 @@ def test_meter_campaign_rejects_runs_from_stale_epoch(tmp_path: Path):
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=6,
+            evidence_semantics_version=7,
             payload={},
         )
         before = _meter_run(
@@ -168,7 +170,7 @@ def test_meter_campaign_rejects_runs_from_stale_epoch(tmp_path: Path):
             hard_identity_hash="hard-new",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=6,
+            evidence_semantics_version=7,
             payload={},
         )
         with pytest.raises(SystemExit, match="current evidence epoch"):
@@ -184,7 +186,7 @@ def test_meter_campaign_rejects_changed_fixed_baseline(tmp_path: Path):
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=6,
+            evidence_semantics_version=7,
             payload={},
         )
         before = _meter_run(
@@ -230,7 +232,7 @@ def test_meter_campaign_rejects_large_interblock_gap(tmp_path: Path):
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=6,
+            evidence_semantics_version=7,
             payload={},
         )
         before = _meter_run(
@@ -281,7 +283,7 @@ def test_meter_campaign_rejects_runtime_policy_change_between_candidate_blocks(t
             hard_identity_hash="hard",
             battery_epoch=1,
             calibration_version=1,
-            evidence_semantics_version=6,
+            evidence_semantics_version=7,
             payload={},
         )
         before = _meter_run(
@@ -294,7 +296,7 @@ def test_meter_campaign_rejects_runtime_policy_change_between_candidate_blocks(t
         )
         first = _meter_run(
             db,
-            mode="FULL_POWERLAB",
+            mode="DYNAMIC_CONTROLLER",
             campaign="campaign-a",
             epoch=epoch,
             policy_fingerprint="policy-a",
@@ -302,7 +304,7 @@ def test_meter_campaign_rejects_runtime_policy_change_between_candidate_blocks(t
         )
         second = _meter_run(
             db,
-            mode="FULL_POWERLAB",
+            mode="DYNAMIC_CONTROLLER",
             campaign="campaign-a",
             epoch=epoch,
             policy_fingerprint="policy-b",
@@ -322,6 +324,41 @@ def test_meter_campaign_rejects_runtime_policy_change_between_candidate_blocks(t
         db.close()
 
 
+def test_net_benefit_campaign_rejects_core_code_change_between_mode_comparisons(tmp_path: Path):
+    db = Database(tmp_path / "db.sqlite3")
+    try:
+        context = {
+            "evidence_epoch_id": "epoch-current",
+            "battery_epoch": 1,
+            "hard_identity_hash": "hard",
+            "calibration_version": 1,
+            "evidence_semantics_version": 7,
+            "envelope": "INTERACTIVE_EFFICIENT",
+            "envelope_content_hash": "fixed-hash",
+            "runtime_code_identity": "code-a",
+        }
+        campaign = _prepare_campaign(
+            db,
+            campaign_id="campaign-code",
+            mode="FIXED_GOOD",
+            context=context,
+            max_campaign_span_seconds=86400.0,
+        )
+        assert campaign["payload"]["runtime_code_identity"] == "code-a"
+
+        with pytest.raises(RuntimeError, match="runtime code identity changed"):
+            _prepare_campaign(
+                db,
+                campaign_id="campaign-code",
+                mode="DYNAMIC_CONTROLLER",
+                context={**context, "runtime_code_identity": "code-b"},
+                max_campaign_span_seconds=86400.0,
+            )
+        assert db.net_benefit_campaign("campaign-code")["status"] == "INVALID"
+    finally:
+        db.close()
+
+
 def test_dynamic_capture_allows_verified_envelope_changes_but_fixed_capture_does_not():
     start = {
         "evidence_epoch_id": "epoch",
@@ -329,14 +366,13 @@ def test_dynamic_capture_allows_verified_envelope_changes_but_fixed_capture_does
         "battery_identity_hash": "battery",
         "hard_identity_hash": "hard",
         "calibration_version": 1,
-        "evidence_semantics_version": 6,
+        "evidence_semantics_version": 7,
         "runtime_policy_fingerprint": "policy-a",
         "envelope": "INTERACTIVE_EFFICIENT",
         "envelope_content_hash": "fixed",
     }
     final = {**start, "envelope": "REMOTE_EFFICIENT"}
     assert _capture_context_change_reason(start, final, mode="DYNAMIC_CONTROLLER") is None
-    assert _capture_context_change_reason(start, final, mode="FULL_POWERLAB") is None
     assert (
         _capture_context_change_reason(start, final, mode="FIXED_GOOD")
         == "fixed_capture_envelope_changed"
@@ -347,10 +383,18 @@ def test_dynamic_capture_allows_verified_envelope_changes_but_fixed_capture_does
     )
 
 
-def test_service_mode_status_verifies_runtime_mode(project_root: Path):
+def test_service_mode_status_verifies_runtime_mode(project_root: Path, monkeypatch):
     config = load_config(project_root)
     config.data["automation"]["level"] = 0
     db = Database(project_root / "runtime/meter-mode.sqlite3")
+    monkeypatch.setattr(
+        meter_cli_module,
+        "_hourly_units_status",
+        lambda: {
+            "sp7-powerlab-hourly.timer": "inactive",
+            "sp7-powerlab-hourly.service": "inactive",
+        },
+    )
     try:
         fixed = _service_mode_status(config, db, "FIXED_GOOD")
         assert fixed["service_heartbeat_fresh"] is False
@@ -381,8 +425,24 @@ def test_service_mode_status_verifies_runtime_mode(project_root: Path):
         assert (
             _service_mode_status(config, db, "DYNAMIC_CONTROLLER")["runtime_automation_level"] == 1
         )
-        with pytest.raises(RuntimeError, match="automation.level>=2"):
-            _service_mode_status(config, db, "FULL_POWERLAB")
+    finally:
+        db.close()
+
+
+def test_service_mode_status_rejects_active_hourly_background_unit(project_root: Path, monkeypatch):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/meter-hourly.sqlite3")
+    monkeypatch.setattr(
+        meter_cli_module,
+        "_hourly_units_status",
+        lambda: {
+            "sp7-powerlab-hourly.timer": "active",
+            "sp7-powerlab-hourly.service": "inactive",
+        },
+    )
+    try:
+        with pytest.raises(RuntimeError, match="hourly background units"):
+            _service_mode_status(config, db, "FIXED_GOOD")
     finally:
         db.close()
 

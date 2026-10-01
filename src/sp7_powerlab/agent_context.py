@@ -257,11 +257,9 @@ def _compact_net_benefit(value: dict[str, Any]) -> dict[str, Any]:
             "deltas_w",
             "monitoring_overhead_w",
             "dynamic_net_saving_w",
-            "full_net_saving_w",
             "campaign_id",
             "fixed_baseline_envelope",
             "fixed_baseline_content_hash",
-            "full_policy_fingerprint",
             "selected_policy_mode",
             "selected_policy_fingerprint",
             "recommendation",
@@ -282,9 +280,12 @@ def _compact_stable_readiness(value: dict[str, Any]) -> dict[str, Any]:
             "minimum_total_trusted_usage_seconds",
             "minimum_distinct_usage_days",
             "minimum_observation_span_days",
+            "coverage_reasons",
+            "using_stable_entry_coverage",
             "frozen_reference_count",
             "open_unexpected_power_events",
             "recent_negative_feedback_count",
+            "current_runtime_mode",
         )
     }
 
@@ -404,6 +405,25 @@ def _stage_and_actions(
 
     learning = str(lifecycle.get("learning_lifecycle") or "")
     if learning == "STABLE" and not stable_readiness.get("ready"):
+        stable_reasons = set(stable_readiness.get("reasons") or [])
+        selected_policy_reasons = {
+            "net_benefit_selected_policy_is_stale",
+            "net_benefit_selected_runtime_mode_mismatch",
+        }
+        if stable_reasons and stable_reasons <= selected_policy_reasons:
+            return (
+                {
+                    "name": "STABLE_STALE",
+                    "status": "BLOCKED",
+                    "reason": "the selected Stage E policy no longer matches the live runtime",
+                },
+                [
+                    {
+                        "action": "reconcile_selected_net_benefit_policy",
+                        "reason": ", ".join(sorted(stable_reasons)),
+                    }
+                ],
+            )
         return (
             {
                 "name": "STABLE_STALE",
@@ -437,6 +457,21 @@ def _stage_and_actions(
             }
         )
         return stage, actions
+
+    if learning == "BASELINE_OBSERVATION":
+        return (
+            {
+                "name": "STAGE_C_READY",
+                "status": "READY",
+                "reason": "current-epoch baseline/reference evidence exists; bounded coarse search may begin",
+            },
+            [
+                {
+                    "action": "begin_coarse_search",
+                    "reason": "explicitly transition learning lifecycle with lifecycle optimize before candidate search",
+                }
+            ],
+        )
 
     if learning in {"COARSE_OPTIMIZATION", "REOPENED"}:
         stage = {
@@ -494,8 +529,25 @@ def _stage_and_actions(
     net_benefit_reasons = {
         "net_benefit_validation_incomplete",
         "net_benefit_selected_policy_is_stale",
+        "net_benefit_selected_runtime_mode_mismatch",
     }
     if readiness_reasons and readiness_reasons <= net_benefit_reasons:
+        stale_reasons = {
+            "net_benefit_selected_policy_is_stale",
+            "net_benefit_selected_runtime_mode_mismatch",
+        }
+        if readiness_reasons <= stale_reasons:
+            action = "reconcile_selected_net_benefit_policy"
+            net_benefit = stable_readiness.get("net_benefit") or {}
+            current_mode = stable_readiness.get("current_runtime_mode") or {}
+            reason = (
+                f"selected={net_benefit.get('selected_policy_mode')} "
+                f"selected_fp={net_benefit.get('selected_policy_fingerprint')} "
+                f"current={current_mode.get('mode')}; " + ", ".join(sorted(readiness_reasons))
+            )
+        else:
+            action = "complete_net_benefit_validation"
+            reason = ", ".join(sorted(readiness_reasons))
         return (
             {
                 "name": "STAGE_E_NET_BENEFIT",
@@ -507,8 +559,8 @@ def _stage_and_actions(
             },
             [
                 {
-                    "action": "complete_net_benefit_validation",
-                    "reason": ", ".join(sorted(readiness_reasons)),
+                    "action": action,
+                    "reason": reason,
                 }
             ],
         )

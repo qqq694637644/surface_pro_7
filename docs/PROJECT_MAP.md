@@ -435,6 +435,8 @@ UnexpectedPower detector。
 - StableReadiness
 - DriftDetector
 - runtime policy fingerprint
+- core control/evidence code identity
+- actual runtime mode validation
 - MinimalMeter A1-B1-B2-A2 paired comparison
 - brightness/active/media/remote/network/temperature comparability veto
 - fixed baseline content hash / campaign coherence gate
@@ -456,16 +458,17 @@ Stage E 的低开销 capture 入口。
 - FIXED_GOOD：service 停止 + actual HWP 每点保持同一 VERIFIED envelope
 - MONITORING：live service + Automation Level 0 + fixed HWP
 - DYNAMIC_CONTROLLER：live CONTROL_ALLOWED service + Automation Level 1
-- FULL_POWERLAB：live CONTROL_ALLOWED service + Automation Level >= 2
 
 同时采集 brightness、active/media/remote fraction 所需信号、basic network、package temperature 和
 actual HWP snapshot，并冻结 runtime policy fingerprint。trial/calibration、hard context 或 policy 变化会让
-run INVALID；campaign 有独立 DB lifecycle，不允许跨周复用裸字符串拼结果。
+run INVALID。每个正式 block 还必须是一段连续 Discharging observation，且 hourly timer/service 必须保持
+inactive。campaign 有独立 DB lifecycle，不允许跨周复用裸字符串拼结果。
+
+Level 2+ 的 Scheduler/Agent/自动学习是按需能力，不是 formal Stage E treatment。
 
 最终允许系统得出：
 
-- KEEP_FULL_POWERLAB
-- KEEP_DYNAMIC_REDUCE_MONITORING
+- KEEP_DYNAMIC_CONTROLLER
 - FIXED_GOOD_ENVELOPE
 - NEED_MORE_DATA
 

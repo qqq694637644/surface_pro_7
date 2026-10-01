@@ -147,7 +147,8 @@ sp7-powerlab-agent hourly
 - 部署/运维
 - 删除复杂度
 
-固定 hourly 可以作为 slow-review transport，但不是“每小时必须修改系统”的要求。
+hourly timer 默认不启用。`sp7-powerlab hourly` 可以按需执行；只有用户明确希望固定 slow review 时才
+enable timer，它也不是“每小时必须修改系统”的要求。
 
 ## 5. 每轮先问三个问题
 
@@ -236,10 +237,12 @@ Agent 应：
 Agent 应：
 
 - 使用同一 bounded OPEN campaign；
-- 为每个 mode 运行 A1-B1-B2-A2；
+- 为 MONITORING 和 DYNAMIC_CONTROLLER 分别运行 A1-B1-B2-A2；
 - 检查 runtime policy fingerprint；
+- 检查 actual runtime mode 和 hourly background units；
+- 拒绝 Charging/resume/gap 后重连 block；
 - 拒绝跨时间/context/policy 拼接；
-- 根据 end-to-end 结果决定保留 Full、只保留 Dynamic、还是回到 Fixed-good。
+- MONITORING 只解释 observer overhead；最终决定保留 Dynamic 还是回到 Fixed-good。
 
 ### STABLE
 
@@ -316,15 +319,13 @@ UnexpectedPower / Drift
 - candidate 反复 equivalent/inconclusive；
 - dynamic controller 没实际净收益；
 - monitoring overhead 接近收益；
-- full PowerLab 没有 practical gain；
 - fixed-good 已足够；
 
 Agent 应建议停止、冻结或删除复杂度。
 
 正确工程结果包括：
 
-- KEEP_FULL_POWERLAB
-- KEEP_DYNAMIC_REDUCE_MONITORING
+- KEEP_DYNAMIC_CONTROLLER
 - FIXED_GOOD_ENVELOPE
 - NEED_MORE_DATA
 - NO_CHANGE

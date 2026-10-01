@@ -61,7 +61,7 @@ DEFAULTS: dict[str, Any] = {
         "max_sustained_compute_delta": 0.10,
     },
     "evidence": {
-        "semantics_version": 6,
+        "semantics_version": 7,
         "practical_threshold_w": 0.10,
         "min_crossover_episodes": 2,
         "medium_effect_min_crossover_episodes": 3,
@@ -118,7 +118,6 @@ DEFAULTS: dict[str, Any] = {
     "helper": {
         "socket": "/run/sp7-powerlab/helper.sock",
         "enabled": True,
-        "downgrade_after_failed_probes": 3,
     },
     "minimal_meter": {
         "sample_seconds": 60.0,

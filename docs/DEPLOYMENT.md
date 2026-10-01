@@ -6,12 +6,14 @@
 bash scripts/install-user-services.sh
 ~~~
 
-安装用户级 sp7-powerlab.service，以及可选的 slow-review hourly service/timer。
+安装用户级 sp7-powerlab.service，以及可选的 slow-review hourly service/timer unit 文件。
+installer 默认**不启用** hourly timer，并会关闭已有 timer/oneshot。
 
 主 service 负责 telemetry、demand、thermal、controller、trial tick、UnexpectedPower
 detection，以及在 automation level 3+ 下受 gate 约束的 Candidate Scheduler。
 
-hourly service 只是 Agent slow-review 的一种 transport，不是“每小时必须修改系统”的设计要求。
+hourly service 只是 Agent slow-review 的一种 transport。需要时手动运行 `sp7-powerlab hourly`，或用户明确
+选择后再 enable timer。正式 Stage E capture 时 timer/oneshot 必须停止。
 
 ## Root helper
 
@@ -35,9 +37,9 @@ root helper 尚未就绪，PowerLab 会先保持 READ_ONLY；helper 稍后恢复
 下一次 refresh 会重新绑定。是否恢复 CONTROL_ALLOWED 仍由 calibration/thermal/telemetry/rollback
 integrity 等 gate 决定。
 
-已经绑定可用 backend 后，单次 helper probe 失败不会立即把 reconnect-capable client 替换成
-UnavailableActuator；默认连续失败达到阈值后才允许降级。active trial 期间 backend identity 冻结，
-避免 helper 瞬时重启把正在执行的 candidate/rollback 路径切断。
+已经绑定可用 backend 后，一次明确 helper probe failure 就立即撤销正常写权限并进入只读安全路径。
+reconnect-capable client object 可以保留用于下一次 probe/reconnect；active trial 期间 backend identity
+冻结，不能静默换成另一个 actuator backend。恢复成功后仍需重新通过 Control Safety gate。
 
 ## Breaking runtime schema
 

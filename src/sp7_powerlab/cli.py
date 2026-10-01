@@ -322,6 +322,20 @@ def cmd_lifecycle_freeze(args: argparse.Namespace) -> int:
             emit({"frozen": False, "readiness": readiness})
             return 2
         manager.freeze(args.reason)
+        net_benefit = readiness.get("net_benefit") or {}
+        epoch = readiness.get("evidence_epoch") or {}
+        db.set_meta(
+            "stable_entry_readiness",
+            {
+                "ts": time.time(),
+                "qualified": bool(readiness.get("ready")),
+                "forced": bool(args.force),
+                "evidence_epoch_id": epoch.get("epoch_id"),
+                "selected_policy_mode": net_benefit.get("selected_policy_mode"),
+                "selected_policy_fingerprint": net_benefit.get("selected_policy_fingerprint"),
+                "usage_coverage": readiness.get("usage_coverage"),
+            },
+        )
         emit({"frozen": True, "forced": bool(args.force), **manager.status()})
     finally:
         db.close()
@@ -333,6 +347,7 @@ def cmd_lifecycle_reopen(args: argparse.Namespace) -> int:
     try:
         manager = LifecycleManager(db)
         manager.reopen(args.reason)
+        db.set_meta("stable_entry_readiness", {})
         emit(manager.status())
     finally:
         db.close()
@@ -692,7 +707,6 @@ def cmd_evidence_trust(args: argparse.Namespace) -> int:
 NET_BENEFIT_CAPTURE_MODES = {
     "MONITORING": "MONITORING_OVERHEAD",
     "DYNAMIC_CONTROLLER": "DYNAMIC_CONTROLLER",
-    "FULL_POWERLAB": "FULL_POWERLAB",
 }
 
 
@@ -733,9 +747,7 @@ def _meter_campaign(
         raise SystemExit("both Net Benefit candidate blocks must use the same capture mode")
     result_mode = NET_BENEFIT_CAPTURE_MODES.get(candidate_mode)
     if result_mode is None:
-        raise SystemExit(
-            "candidate MinimalMeter run must use MONITORING, DYNAMIC_CONTROLLER, or FULL_POWERLAB"
-        )
+        raise SystemExit("candidate MinimalMeter run must use MONITORING or DYNAMIC_CONTROLLER")
 
     provenance_fields = (
         "campaign_id",

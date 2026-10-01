@@ -97,7 +97,6 @@ def test_agent_context_is_compact_runtime_truth_entrypoint(
         assert "minimum_total_valid_usage_seconds" in context["stable_readiness"]
         assert "minimum_observation_span_days" in context["stable_readiness"]
         assert "campaign_id" in context["net_benefit"]
-        assert "full_policy_fingerprint" in context["net_benefit"]
         assert "selected_policy_mode" in context["net_benefit"]
         assert "selected_policy_fingerprint" in context["net_benefit"]
         assert context["runtime"]["latest_sample"]["current_envelope_content_hash"] == (
@@ -349,3 +348,80 @@ def test_agent_context_stage_model_separates_validation_burn_in_from_net_benefit
     )
     assert stable_ready_stage["name"] == "STABLE_READY"
     assert stable_ready_actions[0]["action"] == "consider_freezing_stable"
+
+
+def test_agent_context_requires_explicit_stage_c_transition_after_baseline():
+    evidence_epoch = {
+        "epoch_id": "epoch-current",
+        "battery_epoch": 1,
+        "calibration_version": 2,
+        "evidence_semantics_version": 7,
+    }
+    measurement_trust = {
+        "status": "READY",
+        "evidence_epoch_id": "epoch-current",
+        "battery_epoch": 1,
+        "calibration_version": 2,
+        "evidence_semantics_version": 7,
+    }
+    stage, actions = _stage_and_actions(
+        hardware={"supported_machine": True},
+        calibration_valid=True,
+        measurement_trust=measurement_trust,
+        lifecycle={"learning_lifecycle": "BASELINE_OBSERVATION"},
+        active_battery_epoch=1,
+        evidence_epoch=evidence_epoch,
+        frozen_reference_count=1,
+        active_investigation=None,
+        stable_readiness={
+            "ready": False,
+            "reasons": [
+                "total_valid_usage_below_minimum",
+                "net_benefit_validation_incomplete",
+            ],
+        },
+        scheduler={"eligible": False, "reasons": []},
+    )
+    assert stage["name"] == "STAGE_C_READY"
+    assert stage["status"] == "READY"
+    assert actions[0]["action"] == "begin_coarse_search"
+
+
+def test_agent_context_stale_selected_policy_suggests_reconcile_not_retest():
+    evidence_epoch = {
+        "epoch_id": "epoch-current",
+        "battery_epoch": 1,
+        "calibration_version": 2,
+        "evidence_semantics_version": 7,
+    }
+    measurement_trust = {
+        "status": "READY",
+        "evidence_epoch_id": "epoch-current",
+        "battery_epoch": 1,
+        "calibration_version": 2,
+        "evidence_semantics_version": 7,
+    }
+    stage, actions = _stage_and_actions(
+        hardware={"supported_machine": True},
+        calibration_valid=True,
+        measurement_trust=measurement_trust,
+        lifecycle={"learning_lifecycle": "VALIDATING"},
+        active_battery_epoch=1,
+        evidence_epoch=evidence_epoch,
+        frozen_reference_count=1,
+        active_investigation=None,
+        stable_readiness={
+            "ready": False,
+            "reasons": ["net_benefit_selected_runtime_mode_mismatch"],
+            "net_benefit": {
+                "selected_policy_mode": "DYNAMIC_CONTROLLER",
+                "selected_policy_fingerprint": "policy-dynamic",
+            },
+            "current_runtime_mode": {"mode": "FIXED_GOOD"},
+        },
+        scheduler={"eligible": False, "reasons": []},
+    )
+    assert stage["name"] == "STAGE_E_NET_BENEFIT"
+    assert actions[0]["action"] == "reconcile_selected_net_benefit_policy"
+    assert "selected=DYNAMIC_CONTROLLER" in actions[0]["reason"]
+    assert "current=FIXED_GOOD" in actions[0]["reason"]

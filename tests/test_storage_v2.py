@@ -126,7 +126,7 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
             battery_identity_hash="battery-a",
             hard_identity_hash="hard-a",
             calibration_version=3,
-            evidence_semantics_version=6,
+            evidence_semantics_version=7,
             envelope="INTERACTIVE_EFFICIENT",
             envelope_content_hash="env-hash",
             runtime_policy_fingerprint="policy-hash",
@@ -152,7 +152,7 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
         assert run["battery_identity_hash"] == "battery-a"
         assert run["hard_identity_hash"] == "hard-a"
         assert run["calibration_version"] == 3
-        assert run["evidence_semantics_version"] == 6
+        assert run["evidence_semantics_version"] == 7
         assert run["envelope"] == "INTERACTIVE_EFFICIENT"
         assert run["envelope_content_hash"] == "env-hash"
         assert run["runtime_policy_fingerprint"] == "policy-hash"
@@ -163,7 +163,7 @@ def test_minimal_meter_run_persists_capture_provenance(tmp_path: Path):
         db.close()
 
 
-def test_net_benefit_campaign_closes_after_three_distinct_comparisons(tmp_path: Path):
+def test_net_benefit_campaign_closes_after_monitoring_and_dynamic_comparisons(tmp_path: Path):
     db = Database(tmp_path / "db.sqlite3")
     try:
         campaign = db.create_net_benefit_campaign(
@@ -172,15 +172,12 @@ def test_net_benefit_campaign_closes_after_three_distinct_comparisons(tmp_path: 
             battery_epoch=1,
             hard_identity_hash="hard-a",
             calibration_version=1,
-            evidence_semantics_version=6,
+            evidence_semantics_version=7,
             fixed_baseline_envelope="INTERACTIVE_EFFICIENT",
             fixed_baseline_content_hash="fixed-hash",
         )
         assert campaign["status"] == "OPEN"
-        for index, mode in enumerate(
-            ("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB"),
-            start=1,
-        ):
+        for index, mode in enumerate(("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER"), start=1):
             campaign = db.record_net_benefit_campaign_comparison(
                 "campaign-a",
                 mode=mode,
@@ -192,12 +189,11 @@ def test_net_benefit_campaign_closes_after_three_distinct_comparisons(tmp_path: 
         assert set(campaign["payload"]["comparisons"]) == {
             "MONITORING_OVERHEAD",
             "DYNAMIC_CONTROLLER",
-            "FULL_POWERLAB",
         }
         with pytest.raises(ValueError, match="not OPEN"):
             db.record_net_benefit_campaign_comparison(
                 "campaign-a",
-                mode="FULL_POWERLAB",
+                mode="DYNAMIC_CONTROLLER",
                 overhead_run_id="overhead-late",
                 runtime_policy_fingerprint="policy-late",
             )

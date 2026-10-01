@@ -287,7 +287,7 @@ Stage D 的目标不是“先 freeze STABLE”，而是证明当前系统在代�
 - minimum distinct usage days；
 - minimum observation span；
 - 没有 unresolved UnexpectedPower/investigation；
-- 没有近期严重负面反馈。
+- 没有针对当前保留策略的未解决严重负面反馈；已 reject/rollback 的坏 candidate 不继续阻塞当前策略。
 
 `stable.coverage_days` 是 lookback window，不代表已经自动观察了这么久。
 
@@ -297,7 +297,15 @@ Stage D 的目标不是“先 freeze STABLE”，而是证明当前系统在代�
 
 PowerLab 自己也必须证明值得。
 
-正式 Net Benefit 不接受任意旧 JSONL 在比较时补贴 epoch/campaign 标签。每个 capture 在开始时固定：
+正式 Stage E 只保留三个有清晰物理意义的 runtime mode：
+
+- FIXED_GOOD：main service off，actual HWP 固定在同一个 VERIFIED envelope；
+- MONITORING：service live，Automation Level 0，HWP 仍固定；只测 observer overhead；
+- DYNAMIC_CONTROLLER：service live，Automation Level 1，CONTROL_ALLOWED。
+
+Level 2+ 的 Scheduler/Agent/自动实验不是必须长期常开的第四种 treatment。成熟系统需要学习时再按需启用。
+
+正式 Net Benefit 不接受任意旧 JSONL 后补 provenance。每个 capture 在开始时固定：
 
 - battery identity / epoch
 - current hard evidence epoch/fingerprint
@@ -308,29 +316,40 @@ PowerLab 自己也必须证明值得。
 - runtime policy fingerprint
 - validation campaign
 
-runtime policy fingerprint 代表 relevant runtime/config、Automation Level、VERIFIED envelope set/content hashes 和 manual override。B1/B2 如果 policy fingerprint 不同，即使 mode 名相同也不是同一 treatment。
+runtime policy fingerprint 还包含核心 PowerLab control/evidence code identity。改 controller/service/scheduler/
+Evidence 等核心代码后，旧 Stage E 不再给新代码背书。
 
-每一个 A1-B1-B2-A2 comparison 开始前，先把 Automation Level、verified envelope set 和 manual override
-设成该 comparison 要验证的 policy，并在四个 block 期间保持不变。FIXED_GOOD A block 只是停止 service，
-不是临时改 config；否则 A/B fingerprint 会不同。
+### 11.1 正式 capture 前先关掉 hourly background work
 
-### 11.1 一个 comparison 使用 A1-B1-B2-A2
-
-例如 monitoring：
+默认安装不会自动启用 hourly timer。Stage E 开始前仍显式确认：
 
 ```bash
-# A1：实际 HWP 回到选定的 fixed-good VERIFIED envelope，然后停止 service。
+systemctl --user disable --now sp7-powerlab-hourly.timer
+systemctl --user stop sp7-powerlab-hourly.service
+```
+
+MinimalMeter 每个 sample 都会验证它们没有 active；中途被启动会让 run INVALID。
+
+### 11.2 一个 comparison 使用 A1-B1-B2-A2
+
+每个 comparison 开始前先设定该 mode 的 Automation Level / verified envelope set / manual override，并在
+A1-B1-B2-A2 四个 block 内保持不变。A block 只停止 main service，不临时改 config，所以四个 block 的
+policy fingerprint 一致。
+
+例如 MONITORING（Automation Level 0）：
+
+```bash
+# A1
 systemctl --user stop sp7-powerlab.service
-# FIXED_GOOD 会拒绝仍然 fresh 的 service heartbeat；默认配置下等待 >30s。
 sleep 35
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 
-# B1/B2：Automation Level 0，启动 service，连续采两个 monitoring block。
+# B1 / B2
 systemctl --user start sp7-powerlab.service
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode MONITORING --count 60
 
-# A2：恢复同一个 fixed-good envelope，停止 service。
+# A2
 systemctl --user stop sp7-powerlab.service
 sleep 35
 sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
@@ -342,26 +361,19 @@ sp7-powerlab-meter --campaign sp7-net-benefit-01 --mode FIXED_GOOD --count 60
 sp7-powerlab overhead compare meter-a1 meter-b1 meter-b2 meter-a2
 ```
 
-再在**同一个 OPEN campaign** 中分别完成：
-
-- MONITORING
-- DYNAMIC_CONTROLLER
-- FULL_POWERLAB
-
-对应 runtime mode：
-
-- `MONITORING`：live service + Automation Level 0 + fixed HWP
-- `DYNAMIC_CONTROLLER`：live CONTROL_ALLOWED service + Automation Level 1
-- `FULL_POWERLAB`：live CONTROL_ALLOWED service + Automation Level >= 2
-- `FIXED_GOOD`：service stopped + actual HWP 每点匹配同一个 VERIFIED fixed envelope
+然后把 Automation Level 设为 1，在**同一个 OPEN campaign** 中用同样的 A1-B1-B2-A2 顺序完成
+DYNAMIC_CONTROLLER comparison。
 
 PowerLab 会检查：
 
 - BAT consistency / data quality
+- 整个 block 恰好是一段连续 Discharging observation
+- Charging/AC、resume、超限 gap、battery/evidence epoch change 会整块 fail closed
 - provenance
 - A1/B1/B2/A2 时间顺序和 inter-block gap
 - fixed baseline identity
 - runtime policy fingerprint
+- hourly background units inactive
 - brightness
 - active/media/remote fraction
 - network
@@ -371,7 +383,7 @@ PowerLab 会检查：
 
 明显不可比时结果不会进入 STABLE evidence。
 
-### 11.2 campaign 不是字符串标签
+### 11.3 campaign 不是字符串标签
 
 `--campaign` 对应数据库中的 validation campaign entity：
 
@@ -379,7 +391,7 @@ PowerLab 会检查：
 - 固定 hard/battery/calibration/semantics context 与 fixed baseline；
 - 受 `net_benefit.max_campaign_span_seconds` 限制；
 - context/baseline 变化或超时会 INVALID；
-- Monitoring/Dynamic/Full 三类有效 comparison 各完成一次后自动 COMPLETE/CLOSED；
+- Monitoring 与 Dynamic 两类有效 comparison 各完成一次后自动 COMPLETE/CLOSED；
 - CLOSED campaign 不能继续塞结果。
 
 查看：
@@ -392,20 +404,20 @@ sp7-powerlab lifecycle readiness
 
 可能结论：
 
-- KEEP_FULL_POWERLAB
-- KEEP_DYNAMIC_REDUCE_MONITORING
+- KEEP_DYNAMIC_CONTROLLER
 - FIXED_GOOD_ENVELOPE
 - NEED_MORE_DATA
 
-如果结果是 FIXED_GOOD_ENVELOPE，不要因为系统已经复杂就强行保留动态层。
+MONITORING 只解释 observer overhead，不是最终保留策略。最终选择只看 Dynamic Controller 相比 fixed-good
+是否至少有一个 practical threshold / MUE 的净收益。
 
 在进入 STABLE 前，把 runtime 恢复到 recommendation 对应、已经验证过的 policy identity：
 
-- KEEP_FULL_POWERLAB：恢复 Full comparison 的 policy/config；
-- KEEP_DYNAMIC_REDUCE_MONITORING：恢复 Dynamic comparison 的 policy/config；
-- FIXED_GOOD_ENVELOPE：恢复 Level-0/fixed-good policy，并确保 actual HWP 是固定 VERIFIED baseline。
+- KEEP_DYNAMIC_CONTROLLER：Automation Level 1，main service live，CONTROL_ALLOWED；
+- FIXED_GOOD_ENVELOPE：恢复 Level-0/fixed-good config，main service stopped，并确保 actual HWP 是固定 VERIFIED baseline。
 
-随后再次运行 readiness；不要用“最后采集的是 Full”代替“最终选择的是哪个 policy”。
+随后再次运行 readiness。它会同时检查 selected policy fingerprint 和 actual runtime mode。如果只是尚未恢复
+selected mode/config，先 reconcile，不需要自动重做 Stage E。
 
 ## 12. A–E 全部完成后才进入 STABLE
 
@@ -421,14 +433,15 @@ sp7-powerlab lifecycle readiness
 sp7-powerlab lifecycle freeze --reason "Stage A-E and current policy net benefit validated"
 ```
 
-STABLE 还会确认 recommendation 对应的 selected policy fingerprint 仍代表**当前** runtime。Stage E 后如果
-config、verified envelope set 或 override 改变，旧 Net Benefit 只能当历史记录，需要重新验证。
+STABLE 还会确认 recommendation 对应的 selected policy fingerprint 与 selected runtime mode 都代表
+**当前** runtime。核心 code/config/verified set/override 真正改变时，旧 Net Benefit 只能当历史记录。
 
 进入 STABLE 后：
 
-- core telemetry 继续；
-- drift / UnexpectedPower 继续；
-- expensive attribution 降频；
+- KEEP_DYNAMIC_CONTROLLER：main service 继续 core telemetry / drift / UnexpectedPower；
+- FIXED_GOOD_ENVELOPE：main service 可以保持停止，按需运行 observe/agent-context/hourly；
+- qualified fixed-good 会保留 freeze 时的 entry coverage，只要 epoch/policy/mode 不变，不因 rolling window 自然过期要求常驻采样；
+- hourly timer 默认仍关闭；
 - Scheduler 默认睡眠；
 - 不主动 trial；
 - 正常 Agent 结论应经常是 NO_CHANGE。
@@ -460,7 +473,6 @@ Level 4 还允许满足条件的自动 promotion。
 - 已找到最优省电参数；
 - 当前 noise/MUE 已被 SP7 真机充分校准；
 - Dynamic Controller 一定省电；
-- Full PowerLab 一定有净收益；
 - Level 3/4 已适合长期无人监督。
 
 当前实现/验证进度看 docs/PROJECT_STATUS.md。

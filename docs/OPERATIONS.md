@@ -175,7 +175,8 @@ sp7-powerlab envelope clear-override
 
 普通 Controller 只使用 VERIFIED envelope。
 
-注意：manual override 和 VERIFIED envelope set/content hash 都属于 Stage E runtime policy identity。修改它们后，旧 FULL_POWERLAB Net Benefit 可能不再代表当前 runtime。
+注意：manual override、VERIFIED envelope set/content hash 和核心 control/evidence code identity 都属于
+Stage E runtime policy identity。修改它们后，旧 Net Benefit 可能不再代表当前 runtime。
 
 ## 8. Scheduler
 
@@ -298,9 +299,9 @@ root helper 晚启动时，runtime hardware refresh 会重新 discovery/bind act
 
 已经绑定可用 backend 后：
 
-- 单次 probe failure 不会瞬时换成 unavailable backend；
-- 默认需要连续失败达到配置阈值才允许 downgrade；
-- active trial 期间 actuator backend identity 冻结，避免 transient helper restart 切断 candidate/rollback path。
+- 单次明确 probe failure 立即撤销 `hardware_writable` / 正常写权限；
+- reconnect-capable client object 可以保留，下一次 probe 成功后重新通过 Control Safety gate；
+- active trial 期间 actuator backend identity 冻结，不能静默切到另一个 backend。
 
 恢复写入仍必须重新通过 Control Safety gate。
 
@@ -346,7 +347,8 @@ Stage D 要证明当前 policy 在代表性真实使用中成立，而不是立�
 - current Reference/Noise；
 - no active trial；
 - no unresolved investigation/UnexpectedPower；
-- no recent severe negative feedback。
+- no unresolved severe negative feedback against the current retained policy；已 reject/rollback 的 candidate
+  反馈不继续阻塞当前策略。
 
 `stable.coverage_days` 是 lookback window，不等于已经观察够时长。
 
@@ -367,9 +369,27 @@ Stage D 要证明当前 policy 在代表性真实使用中成立，而不是立�
 - runtime policy fingerprint
 
 runtime policy fingerprint 覆盖 relevant runtime/config、Automation Level、VERIFIED envelope set/content hashes 和 manual override。
+它还包含核心 PowerLab control/evidence code identity；核心代码变更后旧 Stage E 不能继续为新 runtime 背书。
 
 每个 A1-B1-B2-A2 comparison 内必须先冻结该次要验证的 policy/config；四个 block 期间 Automation
 Level、VERIFIED envelope set 和 manual override 不得变化。FIXED_GOOD 只停止 service，不临时改 policy。
+
+正式 Stage E 只测：
+
+- FIXED_GOOD：main service off + fixed VERIFIED HWP；
+- MONITORING：live Level 0 + fixed HWP，只解释 observer overhead；
+- DYNAMIC_CONTROLLER：live Level 1 + CONTROL_ALLOWED。
+
+Level 2+ 的 Scheduler/Agent/自动实验不是必须长期常开的第四种 treatment。
+
+先关闭 hourly background work：
+
+```bash
+systemctl --user disable --now sp7-powerlab-hourly.timer
+systemctl --user stop sp7-powerlab-hourly.service
+```
+
+MinimalMeter 每个 sample 都会验证它们没有 active。
 
 ### 17.1 每一种 candidate mode 使用 A1-B1-B2-A2
 
@@ -400,7 +420,6 @@ runtime mode 不是标签：
 
 - MONITORING：live Level 0 + fixed HWP
 - DYNAMIC_CONTROLLER：live Level 1 + CONTROL_ALLOWED
-- FULL_POWERLAB：live Level >=2 + CONTROL_ALLOWED
 - FIXED_GOOD：service stopped + actual HWP 每点匹配同一个 VERIFIED fixed envelope
 
 A1/B1/B2/A2 四块必须具有同一 runtime policy fingerprint。B1/B2 中间发生 promotion/config/override/policy 修改时，该 comparison 作废。
@@ -408,6 +427,7 @@ A1/B1/B2/A2 四块必须具有同一 runtime policy fingerprint。B1/B2 中间�
 PowerLab 还检查：
 
 - BAT consistency/data quality
+- 每个 block 恰好一段连续 Discharging observation；Charging/resume/gap/epoch change 整块失败
 - provenance
 - inter-block gap
 - fixed baseline identity
@@ -425,7 +445,7 @@ PowerLab 还检查：
 - 固定 hard/battery/calibration/semantics context 与 fixed baseline；
 - 受 `net_benefit.max_campaign_span_seconds` 限制；
 - context/baseline 改变或超时会 INVALID；
-- Monitoring/Dynamic/Full 三类有效 comparison 各完成一次后自动 COMPLETE/CLOSED；
+- Monitoring 与 Dynamic 两类有效 comparison 各完成一次后自动 COMPLETE/CLOSED；
 - CLOSED campaign 不能继续复用名字写入新结果。
 
 查看：
@@ -438,15 +458,14 @@ sp7-powerlab lifecycle readiness
 
 可能结果：
 
-- KEEP_FULL_POWERLAB
-- KEEP_DYNAMIC_REDUCE_MONITORING
+- KEEP_DYNAMIC_CONTROLLER
 - FIXED_GOOD_ENVELOPE
 - NEED_MORE_DATA
 
-Full PowerLab 没有 practical net gain 时，应简化。
+Monitoring 只解释 observer overhead。Dynamic 相比 fixed-good 没有 practical net gain 时，应回到 fixed-good。
 
-Stage E 结束后，把当前 runtime 恢复为 recommendation 对应的**已验证 selected policy**：Full、Dynamic，
-或 Level-0/fixed-good。StableReadiness 校验的是 selected policy fingerprint，而不是无条件要求保留 Full。
+Stage E 结束后，把当前 runtime 恢复为 recommendation 对应的**已验证 selected policy**：Dynamic 或
+Level-0/fixed-good。StableReadiness 同时校验 selected policy fingerprint 和 actual runtime mode。
 
 ## 18. 进入和运行 STABLE
 
@@ -457,14 +476,16 @@ sp7-powerlab lifecycle readiness
 sp7-powerlab lifecycle freeze --reason "Stage A-E and current policy net benefit validated"
 ```
 
-STABLE readiness 会重新确认 recommendation 对应的 selected policy fingerprint 仍代表当前 runtime。
-Stage E 后若 selected policy identity 已变化，旧 Net Benefit 只能当历史记录。
+STABLE readiness 会重新确认 recommendation 对应的 selected policy fingerprint 和 actual runtime mode
+都代表当前 runtime。如果只是没恢复 selected mode/config，先 reconcile；核心 code/config/policy 真正改变
+时才需要重新验证。
 
 STABLE 下：
 
-- core telemetry 保留；
-- drift / UnexpectedPower detector 保留；
-- expensive attribution 降频；
+- selected=Dynamic：main service 保留 core telemetry / drift / UnexpectedPower；
+- selected=Fixed-good：main service 可保持停止，状态/调查按需执行；
+- qualified fixed-good 使用 freeze 时的 entry coverage；同 epoch/policy/mode 下 rolling coverage 自然过期不单独判 stale；
+- hourly timer 默认保持关闭；
 - Scheduler 睡眠；
 - 无主动 trial；
 - 正常 Agent 结论经常是 NO_CHANGE。

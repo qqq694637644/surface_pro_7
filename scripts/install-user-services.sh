@@ -20,6 +20,7 @@ cp "$ROOT/systemd/sp7-powerlab-hourly.timer" "$USER_DIR/sp7-powerlab-hourly.time
 
 systemctl --user daemon-reload
 systemctl --user enable --now sp7-powerlab.service
-systemctl --user enable --now sp7-powerlab-hourly.timer
+systemctl --user disable --now sp7-powerlab-hourly.timer || true
+systemctl --user stop sp7-powerlab-hourly.service || true
 
-echo "PowerLab user services installed."
+echo "PowerLab user service installed. Hourly analysis remains opt-in/manual."

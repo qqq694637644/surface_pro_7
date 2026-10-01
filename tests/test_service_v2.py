@@ -676,7 +676,7 @@ def test_hardware_refresh_rebinds_actuator_when_helper_becomes_available(
         db.close()
 
 
-def test_hardware_refresh_does_not_downgrade_live_reconnecting_actuator_on_one_failed_probe(
+def test_hardware_refresh_revokes_write_on_failed_probe_but_keeps_reconnecting_client(
     project_root: Path,
     monkeypatch,
 ):
@@ -690,6 +690,7 @@ def test_hardware_refresh_does_not_downgrade_live_reconnecting_actuator_on_one_f
     unavailable = SimpleNamespace(name="unavailable")
     controller = SimpleNamespace(hardware_writable=True, actuator=old_actuator)
     trials = SimpleNamespace(actuator=old_actuator)
+    control_states = []
     service.stack = {
         "machine": {"identity": {}, "calibration": {"version": 1}},
         "actuator": old_actuator,
@@ -697,7 +698,10 @@ def test_hardware_refresh_does_not_downgrade_live_reconnecting_actuator_on_one_f
         "actuator_mode": "root-helper",
         "controller": controller,
         "trials": trials,
-        "lifecycle": SimpleNamespace(set_control=lambda *_args, **_kwargs: None),
+        "lifecycle": SimpleNamespace(
+            control_state=lambda: "CONTROL_ALLOWED",
+            set_control=lambda state, *_args, **_kwargs: control_states.append(state),
+        ),
         "registry": SimpleNamespace(),
         "thermal_config": {},
         "fingerprint": "old",
@@ -713,13 +717,14 @@ def test_hardware_refresh_does_not_downgrade_live_reconnecting_actuator_on_one_f
     try:
         service._refresh_hardware_contract(400.0)
         assert service.stack["actuator"] is old_actuator
-        assert service.stack["actuator_available"] is True
+        assert service.stack["actuator_available"] is False
         assert service.stack["actuator_mode"] == "root-helper"
         assert controller.actuator is old_actuator
         assert trials.actuator is old_actuator
-        assert controller.hardware_writable is True
-        assert db.get_meta("actuator_probe_failures") == 1
+        assert controller.hardware_writable is False
+        assert control_states[-1] == "READ_ONLY"
         assert db.get_meta("actuator_probe_degraded")["probed_available"] is False
+        assert db.get_meta("actuator_probe_degraded")["hardware_writable"] is False
     finally:
         db.close()
 
@@ -762,9 +767,11 @@ def test_hardware_refresh_freezes_actuator_backend_during_active_trial(
     try:
         service._refresh_hardware_contract(400.0)
         assert service.stack["actuator"] is old_actuator
+        assert service.stack["actuator_available"] is False
         assert service.stack["actuator_mode"] == "root-helper"
         assert controller.actuator is old_actuator
         assert trials.actuator is old_actuator
+        assert controller.hardware_writable is False
         assert db.get_meta("actuator_probe_degraded")["active_trial"] is True
     finally:
         db.close()

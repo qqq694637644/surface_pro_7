@@ -28,7 +28,7 @@ from .evidence import NoiseTracker
 from .experiments import TrialError, TrialManager
 from .hardware import inspect_hardware, system_fingerprint, thermal_sensor_path
 from .helper import RootHelperClient
-from .lifecycle import CONTROL_ALLOWED, EMERGENCY, STABLE, LifecycleManager
+from .lifecycle import CONTROL_ALLOWED, EMERGENCY, READ_ONLY, STABLE, LifecycleManager
 from .longterm import DriftDetector
 from .measurement import measurement_trust_matches_epoch
 from .scheduler import CandidateScheduler
@@ -335,38 +335,32 @@ class PowerLabService:
         probed_available = actuator_available
         probed_mode = actuator_mode
         previous_actuator = self.stack.get("actuator")
-        previous_available = bool(self.stack.get("actuator_available"))
         previous_actuator_mode = str(self.stack.get("actuator_mode") or "read-only")
         active_trial = self.db.active_trial() is not None
-        failed_probes = int(self.db.get_meta("actuator_probe_failures", 0) or 0)
-        downgrade_after = max(
-            int(self.config.get("helper.downgrade_after_failed_probes", 3)),
-            1,
-        )
-        preserve_previous = False
-        if previous_available and active_trial:
-            preserve_previous = True
-        elif previous_available and not probed_available:
-            failed_probes += 1
-            self.db.set_meta("actuator_probe_failures", failed_probes)
-            preserve_previous = failed_probes < downgrade_after
-        elif probed_available:
-            failed_probes = 0
-            self.db.set_meta("actuator_probe_failures", 0)
+        preserve_backend = False
+        if previous_actuator is not None and active_trial:
+            preserve_backend = True
+            actuator_available = bool(probed_available and probed_mode == previous_actuator_mode)
+        elif (
+            previous_actuator is not None
+            and previous_actuator_mode != "read-only"
+            and not probed_available
+        ):
+            preserve_backend = True
+            actuator_available = False
 
-        if preserve_previous:
+        if preserve_backend:
             actuator = previous_actuator
-            actuator_available = previous_available
             actuator_mode = previous_actuator_mode
             self.db.set_meta(
                 "actuator_probe_degraded",
                 {
                     "ts": ts,
                     "active_trial": active_trial,
-                    "failed_probes": failed_probes,
                     "probed_mode": probed_mode,
                     "probed_available": probed_available,
                     "preserved_mode": previous_actuator_mode,
+                    "hardware_writable": actuator_available,
                 },
             )
         else:
@@ -378,7 +372,7 @@ class PowerLabService:
             self.stack["actuator_mode"] = actuator_mode
             self.stack["controller"].actuator = actuator
             self.stack["trials"].actuator = actuator
-        if not preserve_previous and actuator_mode != previous_actuator_mode:
+        if not preserve_backend and actuator_mode != previous_actuator_mode:
             self.db.set_meta(
                 "actuator_rebind",
                 {
@@ -388,8 +382,8 @@ class PowerLabService:
                     "available": actuator_available,
                 },
             )
-        if preserve_previous:
-            self.stack["actuator_available"] = previous_available
+        if preserve_backend:
+            self.stack["actuator_available"] = actuator_available
         self.stack["report"] = report
         self.stack["controller"].hardware_writable = bool(
             report.control_capable and actuator_available
@@ -404,6 +398,18 @@ class PowerLabService:
                     "runtime hardware/control ownership degraded",
                     {"errors": current_errors},
                 )
+        lifecycle = self.stack["lifecycle"]
+        current_control = lifecycle.control_state() if hasattr(lifecycle, "control_state") else None
+        if not actuator_available and current_control != EMERGENCY:
+            lifecycle.set_control(
+                READ_ONLY,
+                "actuator probe is unavailable; normal writes disabled",
+                {
+                    "actuator_mode": actuator_mode,
+                    "probed_mode": probed_mode,
+                    "active_trial": active_trial,
+                },
+            )
         self.stack["fingerprint"] = _refresh_fingerprint_state(
             db=self.db,
             registry=self.stack["registry"],

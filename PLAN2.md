@@ -48,7 +48,7 @@ Surface Pro 7 持续高本地功耗会快速积热并可能降频。
 
 - fixed-good verified envelope 已足够好；
 - dynamic controller 有价值，但高开销 monitoring 没价值；
-- full PowerLab 有明确净收益；
+- dynamic controller 有明确净收益；
 - 多个 envelope 可以合并；
 - Scheduler 已没有值得继续搜索的 headroom。
 
@@ -580,10 +580,10 @@ STABLE 是正常目标状态。
 
 STABLE 下：
 
-- Controller 继续工作
-- core telemetry 继续
-- drift / UnexpectedPower detector 继续
-- expensive attribution 降频
+- selected=Dynamic 时 Controller / main service / core telemetry / drift / UnexpectedPower 继续
+- selected=Fixed-good 时 main service 可以保持停止，实际 HWP 固定在 verified envelope
+- fixed-good 的状态检查、diagnostic / attribution 按需运行
+- hourly timer 默认关闭
 - Scheduler 默认睡眠
 - 不主动 trial
 - AI 最常见结论应是 NO_CHANGE
@@ -608,13 +608,18 @@ transitional rollup 的 valid seconds 仍属于真实 usage 分母，但只能�
 `coverage_days` 只定义 lookback window，不表示系统已经实际观察了这么久。目标是要求足量真实使用，
 并且这些使用分散在足够长的时间范围内，而不是机械等待完整自然月。
 
+如果 Stage E 最终选择 FIXED_GOOD，并且系统是通过完整 readiness 正常进入 STABLE，则 freeze 时保存
+entry coverage snapshot。只要 evidence epoch、selected policy fingerprint 和 actual FIXED_GOOD mode 都未变，
+后续 rolling coverage 自然过期不单独使 STABLE 失效；否则 fixed-good 会因为“必须持续采样才能证明不采样”
+而被迫重新引入常驻 observer。任何 identity/mode 变化仍按正常 readiness/reopen 规则处理。
+
 还需要：
 
 - Measurement Trust READY
 - reference/noise 可用
 - 无 active trial
 - 无 unresolved investigation/UnexpectedPower
-- 无近期严重负面反馈
+- 无针对当前 selected policy 的未解决严重负面反馈
 - Net Benefit 已评估
 
 稀有 workload 可以 fallback 到安全 verified envelope。
@@ -718,7 +723,7 @@ measurement confidence
 - battery 太低
 - STABLE
 - active investigation
-- full system Net Benefit 已不值得继续增加复杂度
+- end-to-end Net Benefit 已不值得继续增加复杂度
 
 ---
 
@@ -830,13 +835,16 @@ PowerLab 自己也耗电。
 
 采样分层：
 
-**Always-on core**
+**Service core（main service 运行时）**
 
 - BAT
 - temperature
 - HWP state
 - aggregate CPU
 - drift essentials
+
+如果 Stage E 最终选择 fixed-good，main service 可以停止；此时不为了“维持监控”强制常驻上述采样，
+状态检查、Agent review 和 diagnostic 按需执行。只有 selected=Dynamic 时这些信号属于长期 runtime 成本。
 
 **Expensive attribution**
 
@@ -949,11 +957,9 @@ MinimalMeter + PowerLab monitoring + fixed configuration
 MinimalMeter + dynamic controller
 ~~~
 
-### D. full PowerLab
-
-~~~
-MinimalMeter + full PowerLab
-~~~
+Automation Level 2+ 的 Scheduler / Agent / autonomous trial 能力是按需学习层，不定义为必须长期常开的
+第四种 Net Benefit treatment。若未来明确决定长期运行 autonomous learning，再为那个实际 runtime mode
+单独建立新的 treatment 和验证合同。
 
 Net Benefit 直接来自 end-to-end paired comparison，而不是两个任意历史小时均值相减。
 
@@ -962,19 +968,21 @@ capture mode、battery identity/epoch、hard evidence epoch/fingerprint、calibr
 semantics、起始 verified envelope 和 runtime policy fingerprint。比较时只能读取 capture-time provenance；
 禁止读取“当前 epoch”后给旧采集文件事后贴标签。
 
-runtime policy fingerprint 至少覆盖会改变 Dynamic/Full 行为的 controller/runtime config、Automation
-Level、VERIFIED envelope names/content hashes 和 manual override state。一个 A1-B1-B2-A2 comparison 的
-四个 block 必须具有同一个 policy fingerprint；尤其 B1/B2 不能只是 mode 名相同而实际 treatment 已变。
+runtime policy fingerprint 至少覆盖会改变实际 runtime 行为的 controller/runtime config、Automation
+Level、VERIFIED envelope names/content hashes、manual override state，以及核心 PowerLab control/evidence
+代码 identity。一个 A1-B1-B2-A2 comparison 的四个 block 必须具有同一个 policy fingerprint；核心代码、
+config、verified set 或 override 在中途变化都使该 comparison 失效。
 
 Net Benefit 使用 gap-aware integrated BAT energy / valid discharge duration 计算 time-weighted mean
-power。reference 或 candidate 的 BAT consistency / provenance / data-quality gate 失败时，不产生可供
-STABLE 使用的 `candidate_minus_reference_w`。
+power，但**一个正式 block 必须恰好是一段连续 Discharging observation**。block 中出现 Charging/AC、
+suspend/resume、超限 sample gap、battery epoch change 或 evidence epoch change 时，整个 block
+`DATA_QUALITY_FAILURE`；不能过滤无效段后把多个 discharge segment 重新拼成一个有效 block。
 
 正式 comparison 使用：
 
 ~~~
 A1 = FIXED_GOOD
-B1 = MONITORING / DYNAMIC_CONTROLLER / FULL_POWERLAB
+B1 = MONITORING / DYNAMIC_CONTROLLER
 B2 = 同一个 candidate mode 的第二个独立 block
 A2 = FIXED_GOOD
 ~~~
@@ -993,30 +1001,40 @@ capture mode 不能只是用户标签。正式 capture 必须验证：
 - FIXED_GOOD：PowerLab service 停止，且每个 sample 的实际 HWP 都匹配同一个 VERIFIED envelope
 - MONITORING：service 正在运行、Automation Level 0，且每个 sample 的实际 HWP 仍匹配 fixed envelope
 - DYNAMIC_CONTROLLER：service 正在运行、Automation Level 1、ControlSafety=CONTROL_ALLOWED
-- FULL_POWERLAB：service 正在运行、Automation Level >= 2、ControlSafety=CONTROL_ALLOWED
 
-capture 中发生 trial/calibration、hard context 改变、fixed-mode HWP 改变或 service mode 失真时，整个
-run 标记 INVALID。
+所有正式 Stage E capture 期间，`sp7-powerlab-hourly.timer` 和 `sp7-powerlab-hourly.service` 都必须停止，
+避免 PowerLab 自己的 slow-review/knowledge-pack 工作污染 treatment。默认安装不自动启用 hourly timer。
 
-用于 STABLE readiness 的 monitoring / dynamic / full 三种结果必须来自同一个 hard evidence
-epoch、同一个显式 validation campaign、同一个 fixed baseline content hash，并且每种结果本身都已经
+capture 中发生 trial/calibration、hard context 改变、fixed-mode HWP 改变、service mode 失真或 hourly
+background unit 运行时，整个 run 标记 INVALID。
+
+用于 STABLE readiness 的 monitoring / dynamic 两种结果必须来自同一个 hard evidence epoch、同一个
+显式 validation campaign、同一个 fixed baseline content hash，并且每种结果本身都已经
 通过 A1-B1-B2-A2 comparability gate。不能把不同周、不同 fixed reference 或不同系统条件下各自最新的
 一次结果拼成“完整比较”。
 
 validation campaign 是有生命周期的 DB entity，不是可无限复用的字符串。campaign 从 OPEN 开始，
 固定 hard/battery/calibration/semantics context 与 fixed baseline identity；超过 `max_campaign_span_seconds`
-或 context/baseline 变化时 INVALID。三种有效 comparison 各完成一次后自动 COMPLETE/CLOSED，禁止继续
-往旧 campaign 塞新结果。Net Benefit 必须把 recommendation 映射到一个 selected policy fingerprint：
-KEEP_FULL_POWERLAB 对应 Full policy，KEEP_DYNAMIC_REDUCE_MONITORING 对应 Dynamic policy，
-FIXED_GOOD_ENVELOPE 对应 Level-0/fixed-good policy。STABLE 必须验证这个**被选中的** policy fingerprint
-与当前 runtime 一致；当前 policy 已改变时旧 Net Benefit 只能作为历史记录，不能继续为当前系统背书。
+或 context/baseline 变化时 INVALID。Monitoring 与 Dynamic 两种有效 comparison 各完成一次后自动
+COMPLETE/CLOSED，禁止继续往旧 campaign 塞新结果。
 
-MonitoringOverhead 只用于解释，不从已经包含 monitoring 的结果中重复扣除。
+MonitoringOverhead 只解释 observer 成本。最终复杂度选择只问一个问题：
+
+~~~
+Dynamic Controller 相比 Fixed-good 是否至少节省一个 practical threshold / MUE？
+~~~
+
+- 是：KEEP_DYNAMIC_CONTROLLER
+- 否：FIXED_GOOD_ENVELOPE
+- evidence 不完整：NEED_MORE_DATA
+
+STABLE 必须同时验证 recommendation 对应的 selected policy fingerprint 与**实际 selected runtime mode**
+仍匹配当前系统。仅 fingerprint 相同不够；service stopped/live、Automation Level 和 CONTROL_ALLOWED
+必须符合 selected mode。如果只是 Stage E 后尚未恢复 selected mode/config，应先 reconcile，而不是默认重测。
 
 允许结论：
 
-- KEEP_FULL_POWERLAB
-- KEEP_DYNAMIC_REDUCE_MONITORING
+- KEEP_DYNAMIC_CONTROLLER
 - FIXED_GOOD_ENVELOPE
 - NEED_MORE_DATA
 
@@ -1032,7 +1050,7 @@ MonitoringOverhead 只用于解释，不从已经包含 monitoring 的结果中�
 - high-frequency attribution
 - Agent review cadence
 - thermal model 的非安全部分
-- full PowerLab
+- always-on autonomous learning
 
 fixed-good 与复杂系统实际续航/UX 等价时，删掉复杂度是成功结果。
 
@@ -1060,6 +1078,8 @@ fixed-good 与复杂系统实际续航/UX 等价时，删掉复杂度是成功�
 - MinimalMeter capture provenance
 - Net Benefit campaign lifecycle
 - runtime policy fingerprint
+- runtime mode validation
+- core control/evidence code identity
 
 详细字段属于实现，不复制进 PLAN2。
 
@@ -1121,9 +1141,9 @@ Git 保存：
 - fixed-good
 - monitoring
 - dynamic
-- full PowerLab
 - complete one bounded validation campaign
 - selected/recommended policy fingerprint still matches runtime
+- selected runtime mode still matches live service/Automation Level/Control state
 
 完成 Stage E 后，只有 deterministic StableReadiness 的全部 gate 都通过，才进入 STABLE。
 STABLE 是 A–E 完成后的收敛状态，不是 Stage E 之前的 burn-in 状态。
@@ -1180,9 +1200,9 @@ STABLE 是 A–E 完成后的收敛状态，不是 Stage E 之前的 burn-in 状
 - 稀有 workload 有安全 fallback
 - 无 active trial/investigation
 - reference/noise 可用
-- monitoring/dynamic/full 来自同一 bounded COMPLETE campaign
-- selected/recommended policy fingerprint 仍代表当前 runtime
-- full PowerLab 无 practical net gain 时允许退回 fixed-good
+- monitoring/dynamic 来自同一 bounded COMPLETE campaign
+- selected/recommended policy fingerprint 与 actual runtime mode 都代表当前系统
+- dynamic controller 无 practical net gain 时退回 fixed-good
 
 ### 12.5 当前明确不做
 

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from sp7_powerlab.envelopes import EnvelopeRegistry
 from sp7_powerlab.evidence import reference_strata_key
+from sp7_powerlab.lifecycle import LifecycleManager
 from sp7_powerlab.longterm import (
     DriftDetector,
     StableReadiness,
@@ -13,7 +14,10 @@ from sp7_powerlab.longterm import (
     compare_meter_runs,
     compare_paired_meter_runs,
     minutes_gained_per_charge,
+    negative_feedback_blocks_current_policy,
+    runtime_mode_status,
     runtime_policy_snapshot,
+    summarize_minimal_meter_samples,
 )
 from sp7_powerlab.storage import Database
 
@@ -281,9 +285,8 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
             fixed_baseline_content_hash=fixed_hash,
         )
         mode_results = {
-            "MONITORING_OVERHEAD": (0.18, "monitoring-policy"),
-            "DYNAMIC_CONTROLLER": (-0.28, policy_fingerprint),
-            "FULL_POWERLAB": (-0.05, "full-policy"),
+            "MONITORING_OVERHEAD": (0.18, policy_fingerprint),
+            "DYNAMIC_CONTROLLER": (-0.05, "dynamic-policy"),
         }
         for mode, (delta_w, run_policy_fingerprint) in mode_results.items():
             run_id = db.start_monitoring_overhead_run(mode=mode)
@@ -325,13 +328,43 @@ def test_stable_readiness_requires_measurement_coverage_and_system_value_evidenc
 
         ready = StableReadiness(config, db).assess(now=now)
         assert ready["ready"] is True
-        assert ready["net_benefit"]["recommendation"] == "KEEP_DYNAMIC_REDUCE_MONITORING"
-        assert ready["net_benefit"]["selected_policy_mode"] == "DYNAMIC_CONTROLLER"
+        assert ready["net_benefit"]["recommendation"] == "FIXED_GOOD_ENVELOPE"
+        assert ready["net_benefit"]["selected_policy_mode"] == "FIXED_GOOD"
         assert ready["net_benefit"]["selected_policy_fingerprint"] == policy_fingerprint
+        assert ready["current_runtime_mode"]["mode"] == "FIXED_GOOD"
         assert ready["usage_coverage"]["trusted_fraction"] == 1.0
         assert ready["usage_coverage"]["distinct_usage_days"] == 5
         assert ready["usage_coverage"]["observation_span_seconds"] >= 7 * 86400.0
 
+        LifecycleManager(db).freeze("qualified fixed-good stable")
+        db.set_meta(
+            "stable_entry_readiness",
+            {
+                "qualified": True,
+                "evidence_epoch_id": epoch,
+                "selected_policy_mode": "FIXED_GOOD",
+                "selected_policy_fingerprint": policy_fingerprint,
+                "usage_coverage": ready["usage_coverage"],
+            },
+        )
+        aged_fixed = StableReadiness(config, db).assess(now=now + 40 * 86400.0)
+        assert aged_fixed["ready"] is True
+        assert aged_fixed["using_stable_entry_coverage"] is True
+        assert "total_valid_usage_below_minimum" in aged_fixed["coverage_reasons"]
+
+        db.set_meta(
+            "service_heartbeat",
+            {
+                "ts": now,
+                "automation_level": 0,
+                "control_state": "READ_ONLY",
+            },
+        )
+        wrong_mode = StableReadiness(config, db).assess(now=now)
+        assert wrong_mode["ready"] is False
+        assert "net_benefit_selected_runtime_mode_mismatch" in wrong_mode["reasons"]
+
+        db.set_meta("service_heartbeat", {"ts": 0.0})
         config.data["automation"]["level"] = 4
         stale = StableReadiness(config, db).assess(now=now)
         assert stale["ready"] is False
@@ -364,19 +397,18 @@ def _completed_run(
     }
 
 
-def test_net_benefit_recommends_full_when_full_system_clears_threshold():
+def test_net_benefit_keeps_dynamic_when_dynamic_clears_threshold():
     result = assess_net_benefit(
         [
             _completed_run("MONITORING_OVERHEAD", 0.05, 100, policy_fingerprint="monitoring"),
             _completed_run("DYNAMIC_CONTROLLER", -0.30, 110, policy_fingerprint="dynamic"),
-            _completed_run("FULL_POWERLAB", -0.20, 120, policy_fingerprint="full"),
         ],
         practical_threshold_w=0.10,
     )
     assert result["complete"] is True
-    assert result["recommendation"] == "KEEP_FULL_POWERLAB"
-    assert result["selected_policy_mode"] == "FULL_POWERLAB"
-    assert result["selected_policy_fingerprint"] == "full"
+    assert result["recommendation"] == "KEEP_DYNAMIC_CONTROLLER"
+    assert result["selected_policy_mode"] == "DYNAMIC_CONTROLLER"
+    assert result["selected_policy_fingerprint"] == "dynamic"
 
 
 def test_net_benefit_prefers_dynamic_when_monitoring_consumes_controller_savings():
@@ -384,11 +416,10 @@ def test_net_benefit_prefers_dynamic_when_monitoring_consumes_controller_savings
         [
             _completed_run("MONITORING_OVERHEAD", 0.18, 100, policy_fingerprint="monitoring"),
             _completed_run("DYNAMIC_CONTROLLER", -0.28, 110, policy_fingerprint="dynamic"),
-            _completed_run("FULL_POWERLAB", -0.05, 120, policy_fingerprint="full"),
         ],
         practical_threshold_w=0.10,
     )
-    assert result["recommendation"] == "KEEP_DYNAMIC_REDUCE_MONITORING"
+    assert result["recommendation"] == "KEEP_DYNAMIC_CONTROLLER"
     assert result["selected_policy_mode"] == "DYNAMIC_CONTROLLER"
     assert result["selected_policy_fingerprint"] == "dynamic"
     assert "monitoring overhead consumes part" in " ".join(result["reasons"])
@@ -399,7 +430,6 @@ def test_net_benefit_prefers_fixed_good_when_complexity_has_no_practical_gain():
         [
             _completed_run("MONITORING_OVERHEAD", 0.04, 100, policy_fingerprint="monitoring"),
             _completed_run("DYNAMIC_CONTROLLER", -0.03, 110, policy_fingerprint="dynamic"),
-            _completed_run("FULL_POWERLAB", 0.02, 120, policy_fingerprint="full"),
         ],
         practical_threshold_w=0.10,
     )
@@ -576,13 +606,6 @@ def test_net_benefit_filters_runs_by_current_evidence_epoch():
                 "evidence_epoch_id": "old",
             },
         },
-        {
-            **_completed_run("FULL_POWERLAB", -0.2, 120),
-            "result": {
-                **_completed_run("FULL_POWERLAB", -0.2, 120)["result"],
-                "evidence_epoch_id": "old",
-            },
-        },
     ]
     result = assess_net_benefit(
         runs,
@@ -611,14 +634,6 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
                 "campaign_id": "b",
             },
         },
-        {
-            **_completed_run("FULL_POWERLAB", -0.2, 120),
-            "result": {
-                **_completed_run("FULL_POWERLAB", -0.2, 120)["result"],
-                "evidence_epoch_id": "current",
-                "campaign_id": "c",
-            },
-        },
     ]
     result = assess_net_benefit(
         runs,
@@ -631,7 +646,7 @@ def test_net_benefit_requires_one_complete_campaign_within_epoch():
 
 def test_net_benefit_rejects_same_campaign_with_different_fixed_baselines():
     runs = []
-    for index, mode in enumerate(("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER", "FULL_POWERLAB")):
+    for index, mode in enumerate(("MONITORING_OVERHEAD", "DYNAMIC_CONTROLLER")):
         run = _completed_run(mode, -0.2, 100 + index * 10)
         run["result"] = {
             **run["result"],
@@ -653,7 +668,6 @@ def test_net_benefit_rejects_same_campaign_string_across_long_time_span():
     runs = [
         _completed_run("MONITORING_OVERHEAD", 0.02, 100.0),
         _completed_run("DYNAMIC_CONTROLLER", -0.2, 8 * 86400.0),
-        _completed_run("FULL_POWERLAB", -0.25, 16 * 86400.0),
     ]
     result = assess_net_benefit(
         runs,
@@ -663,6 +677,104 @@ def test_net_benefit_rejects_same_campaign_string_across_long_time_span():
     )
     assert result["complete"] is False
     assert result["recommendation"] == "NEED_MORE_DATA"
+
+
+def test_runtime_policy_snapshot_changes_when_core_control_code_changes(project_root: Path):
+    from sp7_powerlab.config import load_config
+
+    package_root = project_root / "src" / "sp7_powerlab"
+    package_root.mkdir(parents=True)
+    controller = package_root / "controller.py"
+    controller.write_text("CONTROL_VERSION = 1\n", encoding="utf-8")
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/policy-code.sqlite3")
+    try:
+        first = runtime_policy_snapshot(config, db)
+        controller.write_text("CONTROL_VERSION = 2\n", encoding="utf-8")
+        second = runtime_policy_snapshot(config, db)
+        assert first["payload"]["code_identity"]["aggregate_sha256"]
+        assert first["fingerprint"] != second["fingerprint"]
+    finally:
+        db.close()
+
+
+def test_runtime_mode_status_is_independent_of_policy_fingerprint(project_root: Path):
+    from sp7_powerlab.config import load_config
+
+    config = load_config(project_root)
+    config.data["automation"]["level"] = 0
+    db = Database(project_root / "runtime/runtime-mode.sqlite3")
+    try:
+        assert runtime_mode_status(config, db)["mode"] == "FIXED_GOOD"
+        now = time.time()
+        db.set_meta(
+            "service_heartbeat",
+            {"ts": now, "automation_level": 0, "control_state": "READ_ONLY"},
+        )
+        assert runtime_mode_status(config, db, now=now)["mode"] == "MONITORING"
+
+        config.data["automation"]["level"] = 1
+        db.set_meta(
+            "service_heartbeat",
+            {"ts": now, "automation_level": 1, "control_state": "CONTROL_ALLOWED"},
+        )
+        assert runtime_mode_status(config, db, now=now)["mode"] == "DYNAMIC_CONTROLLER"
+    finally:
+        db.close()
+
+
+def test_resolved_negative_feedback_does_not_block_current_policy(project_root: Path):
+    db = Database(project_root / "runtime/feedback-scope.sqlite3")
+    registry = EnvelopeRegistry(project_root, db)
+    registry.load()
+    try:
+        envelope = db.envelope("INTERACTIVE_EFFICIENT")
+        assert envelope is not None
+        envelope["status"] = "VERIFIED"
+        db.upsert_envelope(envelope)
+        db.set_meta("current_envelope", "INTERACTIVE_EFFICIENT")
+
+        assert negative_feedback_blocks_current_policy(
+            db,
+            {"rating": "sluggish", "envelope": "INTERACTIVE_EFFICIENT"},
+            current_envelope="INTERACTIVE_EFFICIENT",
+        )
+
+        db.create_trial(
+            {
+                "trial_id": "trial-rejected-feedback",
+                "state": "ROLLED_BACK",
+                "candidate": {},
+            }
+        )
+        assert not negative_feedback_blocks_current_policy(
+            db,
+            {"rating": "bad", "trial_id": "trial-rejected-feedback"},
+            current_envelope="INTERACTIVE_EFFICIENT",
+        )
+
+        db.create_trial(
+            {
+                "trial_id": "trial-equivalent-feedback",
+                "state": "EQUIVALENT",
+                "candidate": {},
+            }
+        )
+        assert not negative_feedback_blocks_current_policy(
+            db,
+            {"rating": "sluggish", "trial_id": "trial-equivalent-feedback"},
+            current_envelope="INTERACTIVE_EFFICIENT",
+        )
+
+        envelope["status"] = "BLOCKED"
+        db.upsert_envelope(envelope)
+        assert not negative_feedback_blocks_current_policy(
+            db,
+            {"rating": "sluggish", "envelope": "INTERACTIVE_EFFICIENT"},
+            current_envelope="INTERACTIVE_EFFICIENT",
+        )
+    finally:
+        db.close()
 
 
 def test_meter_comparison_uses_time_weighted_power_and_fails_closed_on_mismatch():
@@ -689,6 +801,31 @@ def test_meter_comparison_uses_time_weighted_power_and_fails_closed_on_mismatch(
     failed = compare_meter_runs(reference, mismatched, max_gap_seconds=120.0)
     assert failed["comparison_quality"] == "DATA_QUALITY_FAILURE"
     assert failed["candidate_minus_reference_w"] is None
+
+
+def test_paired_meter_comparison_rejects_discontinuous_candidate_block():
+    before = paired_meter_rows(5.0)
+    discontinuous = paired_meter_rows(4.8)
+    discontinuous[5]["battery_status"] = "Charging"
+    after = paired_meter_rows(5.0)
+
+    summary = summarize_minimal_meter_samples(discontinuous)
+    assert summary["consistency_status"] == "DISCONTINUOUS_OBSERVATION"
+    assert summary["energy_valid_seconds"] >= 300.0
+    assert summary["data_quality"] == "DATA_QUALITY_FAILURE"
+    assert "discontinuous_observation" in summary["data_quality_reasons"]
+    assert "multiple_or_missing_discharge_segments" in summary["data_quality_reasons"]
+
+    result = compare_paired_meter_runs(
+        before,
+        discontinuous,
+        paired_meter_rows(4.85),
+        after,
+        minimum_block_seconds=300.0,
+    )
+    assert result["comparison_quality"] == "DATA_QUALITY_FAILURE"
+    assert "candidate_first_data_quality_failed" in result["comparison_quality_reasons"]
+    assert result["candidate_minus_reference_w"] is None
 
 
 def test_paired_meter_comparison_requires_comparable_a_b_b_a_blocks():

@@ -33,8 +33,7 @@ PowerLab 是一个只针对 **Microsoft Surface Pro 7 / Intel Core i5-1035G4 / L
 
 - 已找到 SP7 最省电参数；
 - 已真机校准 noise / minimum arm duration；
-- Dynamic Controller 一定优于 fixed envelope；
-- Full PowerLab 一定有净续航收益。
+- Dynamic Controller 一定优于 fixed envelope。
 
 完整进度：
 
@@ -327,14 +326,14 @@ sp7-powerlab overhead summary
 需要用 MinimalMeter 对照：
 
 - fixed-good
-- monitoring
+- monitoring-only observer overhead
 - dynamic controller
-- full PowerLab
+
+Automation Level 2+ 的 Scheduler/Agent 学习能力按需运行，不作为必须长期常开的第四种 Stage E treatment。
 
 系统允许得出：
 
-- KEEP_FULL_POWERLAB
-- KEEP_DYNAMIC_REDUCE_MONITORING
+- KEEP_DYNAMIC_CONTROLLER
 - FIXED_GOOD_ENVELOPE
 - NEED_MORE_DATA
 

@@ -133,9 +133,9 @@ Agent 在复用历史 evidence 前必须先判断它属于哪个 identity：
 - trial evidence_scope_key
 - Stage E runtime policy fingerprint / Net Benefit campaign
 
-同名 envelope promotion 后可能已经是新 policy revision；同样叫 FULL_POWERLAB 的 B1/B2 也可能因为
-config、Automation Level、verified envelope set 或 manual override 变化而不是同一个 treatment。
-名称相同不是兼容性证明。
+同名 envelope promotion 后可能已经是新 policy revision；同样叫 DYNAMIC_CONTROLLER 的 B1/B2 也可能
+因为 core code、config、Automation Level、verified envelope set 或 manual override 变化而不是同一个
+treatment。名称相同不是兼容性证明。
 
 ## 6. UnexpectedPower 先调查
 
@@ -232,13 +232,17 @@ i5-1035G4 的持续高功耗会快速增加机身/CPU 热量，并可能造成�
 
 用户明确给出 sluggish / bad / unstable 反馈时，把它作为重要反证，而不是解释为“用户主观”。
 
+但 feedback 也有 scope：已经被 reject/rollback 的坏 candidate，或已经 BLOCKED/RETIRED 的 envelope，
+不应继续作为当前 selected policy 的 STABLE blocker。当前保留策略本身的未解决负面体验仍然 veto。
+
 ## 11. STABLE 与停止
 
 达到 STABLE 后：
 
 - 不主动寻找更细参数；
-- 保持低开销 core telemetry；
-- expensive attribution 降频；
+- selected=Dynamic 时保持低开销 core telemetry；
+- selected=Fixed-good 时 main service 可以保持停止，调查按需运行；
+- hourly timer 默认关闭；
 - 只有异常/漂移时 diagnostic burst；
 - 只有明确 reopen 条件才重新搜索。
 
@@ -254,7 +258,7 @@ recommendation 对应的 selected policy identity 仍与 Net Benefit evidence �
 - 多个 envelope 实际等价；
 - monitoring overhead 接近优化收益；
 - dynamic controller 没有实际净收益；
-- Full PowerLab 相比 fixed-good 没有足够价值。
+- always-on learning 没有经过独立净收益验证。
 
 正确结论可以是：
 

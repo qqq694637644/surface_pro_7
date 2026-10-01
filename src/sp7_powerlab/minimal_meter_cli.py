@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -15,13 +16,17 @@ from .config import load_config, load_machine
 from .demand import remote_process_tags
 from .envelopes import snapshot_matches_envelope
 from .hardware import thermal_sensor_path
-from .longterm import runtime_policy_snapshot
+from .longterm import runtime_mode_status, runtime_policy_snapshot
 from .measurement import MinimalMeter, measurement_trust_matches_epoch
 from .service import build_actuator
 from .storage import Database
 from .telemetry import _brightness, _media_playing, _network_bytes, _temperature_c, _user_active
 
-CAPTURE_MODES = ("FIXED_GOOD", "MONITORING", "DYNAMIC_CONTROLLER", "FULL_POWERLAB")
+CAPTURE_MODES = ("FIXED_GOOD", "MONITORING", "DYNAMIC_CONTROLLER")
+NET_BENEFIT_BACKGROUND_UNITS = (
+    "sp7-powerlab-hourly.timer",
+    "sp7-powerlab-hourly.service",
+)
 
 
 def _default_root() -> Path:
@@ -52,54 +57,55 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def _hourly_units_status() -> dict[str, str]:
+    states: dict[str, str] = {}
+    for unit in NET_BENEFIT_BACKGROUND_UNITS:
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", unit],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"cannot verify background PowerLab unit {unit}: {exc}") from exc
+        state = result.stdout.strip() or "unknown"
+        if result.returncode not in {0, 3, 4}:
+            detail = result.stderr.strip() or state
+            raise RuntimeError(f"cannot verify background PowerLab unit {unit}: {detail}")
+        states[unit] = state
+    return states
+
+
 def _service_mode_status(config: Any, db: Database, mode: str) -> dict[str, Any]:
-    heartbeat = db.get_meta("service_heartbeat", {})
-    heartbeat_ts = float(heartbeat.get("ts") or 0.0) if isinstance(heartbeat, dict) else 0.0
-    heartbeat_limit = max(float(config.get("collector.sample_seconds", 10.0)) * 3.0, 30.0)
-    heartbeat_fresh = heartbeat_ts > 0 and time.time() - heartbeat_ts <= heartbeat_limit
-    configured_level = int(config.get("automation.level", 0))
-    runtime_level = (
-        int(heartbeat.get("automation_level", -1))
-        if heartbeat_fresh and isinstance(heartbeat, dict)
-        else None
-    )
-    control_state = str(heartbeat.get("control_state") or "") if heartbeat_fresh else ""
+    status = runtime_mode_status(config, db)
+    actual_mode = str(status["mode"])
     if mode == "FIXED_GOOD":
-        if heartbeat_fresh:
+        if actual_mode != "FIXED_GOOD":
             raise RuntimeError("FIXED_GOOD capture requires the PowerLab service to be stopped")
     elif mode == "MONITORING":
-        if not heartbeat_fresh or configured_level != 0 or runtime_level != 0:
+        if actual_mode != "MONITORING":
             raise RuntimeError("MONITORING capture requires a live service with automation.level=0")
     elif mode == "DYNAMIC_CONTROLLER":
-        if (
-            not heartbeat_fresh
-            or configured_level != 1
-            or runtime_level != 1
-            or control_state != "CONTROL_ALLOWED"
-        ):
+        if actual_mode != "DYNAMIC_CONTROLLER":
             raise RuntimeError(
                 "DYNAMIC_CONTROLLER capture requires a live CONTROL_ALLOWED service at automation.level=1"
             )
-    elif mode == "FULL_POWERLAB":
-        if (
-            not heartbeat_fresh
-            or configured_level < 2
-            or runtime_level is None
-            or runtime_level < 2
-            or control_state != "CONTROL_ALLOWED"
-        ):
-            raise RuntimeError(
-                "FULL_POWERLAB capture requires a live CONTROL_ALLOWED service at automation.level>=2"
-            )
     else:  # pragma: no cover - argparse prevents this
         raise RuntimeError(f"unknown capture mode: {mode}")
-    return {
-        "service_heartbeat_fresh": heartbeat_fresh,
-        "service_heartbeat": heartbeat if isinstance(heartbeat, dict) else {},
-        "configured_automation_level": configured_level,
-        "runtime_automation_level": runtime_level,
-        "control_state": control_state or None,
-    }
+    hourly_units = _hourly_units_status()
+    active_units = [
+        unit
+        for unit, state in hourly_units.items()
+        if state in {"active", "activating", "reloading", "deactivating"}
+    ]
+    if active_units:
+        raise RuntimeError(
+            "Net Benefit capture requires hourly background units to be stopped: "
+            + ", ".join(active_units)
+        )
+    return {**status, "hourly_units": hourly_units}
 
 
 def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dict[str, Any]:
@@ -147,6 +153,9 @@ def _capture_context(root: Path, config: Any, db: Database, *, mode: str) -> dic
         "envelope": envelope,
         "envelope_content_hash": str(envelope_record.get("content_hash") or ""),
         "runtime_policy_fingerprint": str(policy["fingerprint"]),
+        "runtime_code_identity": str(
+            ((policy.get("payload") or {}).get("code_identity") or {}).get("aggregate_sha256") or ""
+        ),
         "runtime_policy": policy["payload"],
         "service_mode": service_mode,
     }
@@ -199,7 +208,10 @@ def _prepare_campaign(
             evidence_semantics_version=int(context["evidence_semantics_version"]),
             fixed_baseline_envelope=str(context["envelope"]),
             fixed_baseline_content_hash=str(context["envelope_content_hash"]),
-            payload={"comparisons": {}},
+            payload={
+                "comparisons": {},
+                "runtime_code_identity": str(context["runtime_code_identity"]),
+            },
         )
     if campaign.get("status") != "OPEN":
         raise RuntimeError(f"Net Benefit campaign is not OPEN: {campaign.get('status')}")
@@ -222,6 +234,12 @@ def _prepare_campaign(
             "campaign_context_changed:" + ",".join(sorted(mismatched)),
         )
         raise RuntimeError("Net Benefit campaign context changed: " + ", ".join(sorted(mismatched)))
+    campaign_code_identity = str(
+        ((campaign.get("payload") or {}).get("runtime_code_identity")) or ""
+    )
+    if campaign_code_identity != str(context.get("runtime_code_identity") or ""):
+        db.invalidate_net_benefit_campaign(campaign_id, "runtime_code_identity_changed")
+        raise RuntimeError("Net Benefit campaign runtime code identity changed")
     if mode == "FIXED_GOOD" and (
         str(campaign.get("fixed_baseline_envelope") or "") != str(context.get("envelope") or "")
         or str(campaign.get("fixed_baseline_content_hash") or "")

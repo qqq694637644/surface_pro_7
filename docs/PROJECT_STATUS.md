@@ -17,7 +17,7 @@ sp7-powerlab agent-context
 当前 runtime：
 
 - SQLite schema v8
-- evidence semantics v6
+- evidence semantics v7
 - 旧 runtime schema fail-fast，不维护兼容迁移
 - AI 入口：AGENTS.md + sp7-powerlab agent-context
 - 设计合同：PLAN2.md
@@ -156,7 +156,7 @@ Investigation：
 - single-writer ownership
 - limited root helper
 - runtime hardware refresh 会重新 discovery/bind root helper；helper 晚启动不再永久锁死为 READ_ONLY
-- 已绑定可用 helper 时，单次 probe failure 不瞬时 downgrade；active trial 冻结 actuator backend identity
+- 已绑定可用 helper 时，单次明确 probe failure 立即撤销 hardware_writable；保留 reconnect client，active trial 冻结 backend identity
 - STABLE readiness / usage coverage
 - dirty/transitional rollup 保留在 usage 分母，但不计 trusted coverage
 - STABLE readiness 有 minimum valid/trusted usage、distinct usage days、observation span floor
@@ -259,6 +259,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED
 - Bash/workspace Agent 信任模型
 - task-mode-aware Agent 入口：仓库工程与真实 SP7 运维不再共用一套机械启动流程
 - Agent 入口统一 Stage A→B→C→D→E→STABLE 生命周期与 evidence identity 模型
+- agent-context 在 BASELINE_OBSERVATION + current reference 时报告 STAGE_C_READY，不再直接跳到 Stage D
 
 AI 不进入 10 秒级实时控制链。
 
@@ -270,7 +271,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 
 已实现：
 
-- always-on core telemetry
+- dynamic mode 下的 core telemetry；fixed-good 最终策略允许 main service 停止
 - STABLE 下 expensive attribution 降频
 - trial/calibration 高密度采样
 - diagnostic burst
@@ -278,15 +279,18 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - MinimalMeter capture-time provenance（epoch/battery/fingerprint/calibration/campaign/mode）
 - natural Reference/Noise identity 包含 frozen envelope content hash；只接受 VERIFIED + matching hash
 - STABLE coverage 有真实 usage/trusted time、distinct days、observation span 的 denominator floor
+- qualified FIXED_GOOD 在 freeze 时保存 entry coverage；同 epoch/policy/mode 下 rolling coverage 自然过期不强迫 daemon 常驻
+- STABLE negative feedback 只阻塞当前保留策略的未解决负面证据；已 reject/rollback 的 candidate 不继续冷却当前策略
+- Net Benefit block 必须是单一 contiguous Discharging observation；Charging/resume/gap/epoch change 整块 fail-closed
 - Net Benefit 使用 time-weighted integrated BAT power，并对 data quality fail-closed
 - capture mode 验证真实 service Automation Level / ControlSafety；FIXED/MONITORING 每点核对实际 HWP
+- formal capture 每个 sample 都要求 hourly timer/service inactive；默认安装不启用 hourly timer
 - brightness/active/media/remote/network/temperature 作为低成本 comparability veto
 - 正式 Net Benefit 使用 A1-B1-B2-A2 paired campaign，检查两个 candidate delta 的方向/spread
-- runtime policy fingerprint 固定 controller/config、Automation Level、VERIFIED envelope set/hash 与 override
-- Net Benefit campaign 是 OPEN/COMPLETE/INVALID 实体，限制最大 campaign span，完成后三类结果即关闭
-- STABLE 只接受同 hard epoch/campaign/fixed baseline content hash 的三类完整 comparison，并验证 recommendation 对应的 selected policy 仍代表当前 runtime
-- KEEP_FULL_POWERLAB
-- KEEP_DYNAMIC_REDUCE_MONITORING
+- runtime policy fingerprint 固定 controller/config、Automation Level、VERIFIED envelope set/hash、override 与核心 control/evidence code identity
+- Net Benefit campaign 是 OPEN/COMPLETE/INVALID 实体，限制最大 campaign span，Monitoring + Dynamic 完成后即关闭
+- STABLE 同时验证 selected policy fingerprint 与实际 selected runtime mode
+- KEEP_DYNAMIC_CONTROLLER
 - FIXED_GOOD_ENVELOPE
 - NEED_MORE_DATA
 
@@ -295,7 +299,6 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - monitoring overhead
 - probe/DB write 成本
 - dynamic controller 实际净收益
-- full PowerLab 实际净收益
 - 真机 A1-B1-B2-A2 block 时长和 comparability 阈值是否合适
 
 ## 当前最重要的未完成里程碑
@@ -317,7 +320,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 9. 收集只属于当前 evidence epoch、稳定 brightness/envelope 的自然 baseline/noise
 10. coarse optimization
 11. Stage D independent validation + representative real-usage burn-in
-12. Stage E fixed-good / monitoring / dynamic / full Net Benefit campaign
+12. Stage E fixed-good / monitoring / dynamic Net Benefit campaign
 13. deterministic readiness 全部通过后 freeze STABLE
 
 ## 当前不能声称
@@ -328,7 +331,6 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - 当前 noise/MUE 已真机充分校准
 - 当前 minimum arm duration 已真机确认
 - Dynamic Controller 一定优于 fixed envelope
-- Full PowerLab 一定有净收益
 - Level 3/4 已适合长期无人监督
 
 ## 刻意不做
