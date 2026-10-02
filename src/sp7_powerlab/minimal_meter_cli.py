@@ -53,10 +53,7 @@ def parser() -> argparse.ArgumentParser:
         prog="sp7-powerlab-meter",
         description="Minimal provenance-bound Surface Pro 7 battery meter for Net Benefit runs.",
     )
-    p.add_argument("--interval", type=float, default=60.0)
     p.add_argument("--count", type=int)
-    p.add_argument("--sys-root", default="/sys")
-    p.add_argument("--proc-root", default="/proc")
     p.add_argument("--config")
     p.add_argument("--campaign", required=True)
     p.add_argument("--mode", required=True, choices=CAPTURE_MODES)
@@ -363,12 +360,13 @@ def main(argv: list[str] | None = None) -> int:
     root = _default_root()
     config_path = Path(args.config).expanduser() if args.config else None
     config = load_config(root, config_path)
-    interval = float(args.interval)
-    if interval <= 0:
-        raise SystemExit("--interval must be > 0")
+    interval = float(config.get("net_benefit.sample_seconds", 60.0))
+    minimum_samples = int(config.get("net_benefit.minimum_samples_per_block", 6))
+    if interval <= 0 or minimum_samples < 2:
+        raise SystemExit("invalid local Net Benefit cadence contract")
     db = Database(config.path("storage.database"))
-    sys_root = Path(args.sys_root)
-    proc_root = Path(args.proc_root)
+    sys_root = Path("/sys")
+    proc_root = Path("/proc")
     meter = MinimalMeter(sys_root)
     context_sampler = _MinimalContextSampler(
         sys_root=sys_root,
@@ -495,7 +493,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             terminal_status = "INVALID"
             terminal_reason = f"capture_context_invalid:{exc}"
-        if count < 2:
+        if count < minimum_samples:
             terminal_status = "INVALID"
             terminal_reason = terminal_reason or "insufficient_samples"
         runtime_activity = _intervening_runtime_activity(db, capture_start_ts)

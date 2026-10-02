@@ -64,6 +64,7 @@ def _meter_run(
             "capture_contract_version": 4,
             "stage_e_contract_identity": stage_e_contract_identity,
             "media_compatibility_generation": media_generation,
+            "interval_seconds": 60.0,
         },
     )
     db.finish_minimal_meter_run(run_id, {"sample_count": 2})
@@ -561,6 +562,11 @@ def test_fixed_apply_uses_verified_envelope_without_setting_override(
     monkeypatch.setattr(cli_module, "systemd_user_unit_state", lambda _unit: "inactive")
     monkeypatch.setattr(
         cli_module,
+        "validate_live_fixed_context_before_write",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        cli_module,
         "inspect_hardware",
         lambda **_kwargs: SimpleNamespace(writable=True),
     )
@@ -642,6 +648,45 @@ def test_fixed_good_rejects_stale_heartbeat_if_service_is_actually_active(
             _service_mode_status(config, db, "FIXED_GOOD")
     finally:
         db.close()
+
+
+def test_production_meter_does_not_expose_evidence_relaxation_or_fake_root_flags():
+    parser = meter_cli_module.parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--campaign",
+                "formal",
+                "--mode",
+                "FIXED_GOOD",
+                "--interval",
+                "300",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--campaign",
+                "formal",
+                "--mode",
+                "FIXED_GOOD",
+                "--sys-root",
+                "/tmp/fake-sys",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        cli_module.parser().parse_args(
+            [
+                "net-benefit",
+                "compare",
+                "a1",
+                "b1",
+                "b2",
+                "a2",
+                "--max-gap-seconds",
+                "301",
+            ]
+        )
 
 
 def test_service_run_returns_non_restartable_exit_for_legacy_schema(monkeypatch, capsys):

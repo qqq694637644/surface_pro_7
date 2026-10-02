@@ -27,10 +27,18 @@ from .longterm import (
     UsageCoverage,
     assess_current_net_benefit,
     compare_paired_meter_runs,
+    dynamic_runtime_code_identity,
+    dynamic_runtime_config_identity,
+    runtime_mode_status,
     stage_e_contract_identity,
 )
 from .measurement import assess_measurement_trust, characterize_battery_gauge
-from .runtime_audit import live_media_compatibility
+from .runtime_audit import (
+    FixedContextStaleError,
+    FixedContextTransientError,
+    live_media_compatibility,
+    validate_live_fixed_context_before_write,
+)
 from .scheduler import CandidateScheduler
 from .service import PowerLabService, build_actuator, prepare_stack, service_status
 from .storage import Database, LegacyDatabaseError
@@ -805,6 +813,11 @@ def _meter_campaign(
         values = {str((run.get("payload") or {}).get(field) or "") for run in runs}
         if len(values) != 1 or "" in values:
             raise SystemExit(f"MinimalMeter {field} changed within A-B-B-A")
+    cadence_values = {
+        float((run.get("payload") or {}).get("interval_seconds") or 0.0) for run in runs
+    }
+    if len(cadence_values) != 1 or 0.0 in cadence_values:
+        raise SystemExit("MinimalMeter formal cadence changed within A-B-B-A")
     before_end = float(reference_before.get("end_ts") or 0.0)
     first_start = float(candidate_first.get("start_ts") or 0.0)
     first_end = float(candidate_first.get("end_ts") or 0.0)
@@ -895,6 +908,19 @@ def cmd_net_benefit_compare(args: argparse.Namespace) -> int:
         )
         current_contract = stage_e_contract_identity(config)
         current_media = live_media_compatibility(config)
+        formal_sample_seconds = float(config.get("net_benefit.sample_seconds", 60.0))
+        if any(
+            float((run.get("payload") or {}).get("interval_seconds") or 0.0)
+            != formal_sample_seconds
+            for run in (reference_before, candidate_first, candidate_second, reference_after)
+        ):
+            db.invalidate_net_benefit_campaign(
+                str(candidate_first["campaign_id"]),
+                "formal_cadence_mismatch",
+            )
+            raise SystemExit(
+                "Net Benefit capture cadence does not match the current formal contract"
+            )
         captured_contract = str(
             (candidate_first.get("payload") or {}).get("stage_e_contract_identity") or ""
         )
@@ -924,12 +950,13 @@ def cmd_net_benefit_compare(args: argparse.Namespace) -> int:
             candidate_second.get("samples") or [],
             reference_after.get("samples") or [],
             usable_battery_wh=args.usable_battery_wh,
-            max_gap_seconds=float(args.max_gap_seconds),
+            max_gap_seconds=float(config.get("net_benefit.max_sample_gap_seconds", 90.0)),
             max_consistency_ratio=float(config.get("evidence.max_energy_consistency_ratio", 0.35)),
             max_consistency_abs_wh=float(
                 config.get("evidence.max_energy_consistency_abs_wh", 0.05)
             ),
             minimum_block_seconds=minimum_block_seconds,
+            minimum_samples_per_block=int(config.get("net_benefit.minimum_samples_per_block", 6)),
             max_brightness_delta_pct=float(
                 config.get("net_benefit.max_brightness_delta_pct", 10.0)
             ),
@@ -1194,6 +1221,33 @@ def _fixed_good_selection(db: Database) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _preflight_verified_fixed_envelope(
+    config: Any,
+    db: Database,
+    registry: EnvelopeRegistry,
+    name: str,
+) -> tuple[dict[str, Any], Any, str]:
+    if db.active_trial():
+        raise FixedContextStaleError("fixed apply is forbidden during an active trial")
+    if db.active_calibration():
+        raise FixedContextStaleError("fixed apply is forbidden during calibration")
+    validate_live_fixed_context_before_write(config, db)
+    envelope = registry.get(name)
+    if not envelope or envelope.get("status") != "VERIFIED":
+        raise FixedContextStaleError(
+            "fixed-good evidence is stale: target envelope is not VERIFIED"
+        )
+    actuator, available, actuator_mode = build_actuator(config)
+    if actuator_mode == "root-helper-mismatch":
+        raise FixedContextStaleError(
+            "root helper implementation does not match current runtime; "
+            "rerun scripts/install-root-helper.sh"
+        )
+    if not available or actuator_mode != "root-helper":
+        raise FixedContextTransientError("restricted root helper is not available yet")
+    return envelope, actuator, actuator_mode
+
+
 def _apply_verified_fixed_envelope(
     config: Any,
     db: Database,
@@ -1206,28 +1260,9 @@ def _apply_verified_fixed_envelope(
         raise SystemExit("fixed apply is forbidden during an active trial")
     if db.active_calibration():
         raise SystemExit("fixed apply is forbidden during calibration")
-    machine = load_machine(ROOT)
-    identity = machine.get("identity") or {}
-    report = inspect_hardware(
-        expected_product=str(identity.get("expected_product", "Surface Pro 7")),
-        expected_cpu_substring=str(identity.get("expected_cpu_substring", "i5-1035G4")),
-        configured_thermal_sensor=str((machine.get("thermal") or {}).get("sensor_path") or "")
-        or None,
-        include_versions=False,
+    envelope, actuator, actuator_mode = _preflight_verified_fixed_envelope(
+        config, db, registry, name
     )
-    if not report.writable:
-        raise SystemExit("fixed apply requires the live hardware/thermald/ownership contract")
-    envelope = registry.get(name)
-    if not envelope or envelope.get("status") != "VERIFIED":
-        raise SystemExit("fixed apply requires a VERIFIED envelope")
-    actuator, available, actuator_mode = build_actuator(config)
-    if actuator_mode == "root-helper-mismatch":
-        raise SystemExit(
-            "root helper implementation does not match current runtime; "
-            "rerun scripts/install-root-helper.sh"
-        )
-    if not available or actuator_mode != "root-helper":
-        raise SystemExit("fixed apply requires the current restricted root helper")
     result = actuator.apply_envelope(envelope)
     snapshot = actuator.snapshot()
     if not snapshot_matches_envelope(snapshot, envelope):
@@ -1247,7 +1282,10 @@ def _apply_verified_fixed_envelope(
 def cmd_fixed_apply(args: argparse.Namespace) -> int:
     config, db, registry = _registry(args)
     try:
-        emit(_apply_verified_fixed_envelope(config, db, registry, args.name))
+        try:
+            emit(_apply_verified_fixed_envelope(config, db, registry, args.name))
+        except (FixedContextStaleError, FixedContextTransientError) as exc:
+            raise SystemExit(str(exc)) from exc
     finally:
         db.close()
     return 0
@@ -1271,7 +1309,22 @@ def cmd_envelope_apply_fixed(args: argparse.Namespace) -> int:
         envelope = registry.get(name)
         if not envelope or str(envelope.get("content_hash") or "") != content_hash:
             raise SystemExit("persistent fixed-good envelope content hash changed")
-        emit(_apply_verified_fixed_envelope(config, db, registry, name))
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                emit(_apply_verified_fixed_envelope(config, db, registry, name))
+                last_error = None
+                break
+            except FixedContextTransientError as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(10.0)
+        if last_error is not None:
+            raise SystemExit(
+                f"persistent fixed-good apply transient preflight failed: {last_error}"
+            )
+    except FixedContextStaleError as exc:
+        raise SystemExit(str(exc)) from exc
     finally:
         db.close()
     return 0
@@ -1294,9 +1347,20 @@ def cmd_envelope_activate_fixed(args: argparse.Namespace) -> int:
             raise SystemExit("selected fixed-good baseline is not currently VERIFIED")
         if str(envelope.get("content_hash") or "") != content_hash:
             raise SystemExit("selected fixed-good baseline content hash is stale")
+        try:
+            _preflight_verified_fixed_envelope(config, db, registry, name)
+        except (FixedContextStaleError, FixedContextTransientError) as exc:
+            raise SystemExit(str(exc)) from exc
 
         _systemctl_user("disable", "--now", "sp7-powerlab.service")
-        applied = _apply_verified_fixed_envelope(config, db, registry, name)
+        try:
+            applied = _apply_verified_fixed_envelope(config, db, registry, name)
+        except (FixedContextStaleError, FixedContextTransientError) as exc:
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            raise SystemExit(str(exc)) from exc
+        except BaseException:
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            raise
         selection = {
             "ts": time.time(),
             "evidence_epoch_id": epoch.get("epoch_id"),
@@ -1307,7 +1371,20 @@ def cmd_envelope_activate_fixed(args: argparse.Namespace) -> int:
         db.set_meta("fixed_good_selection", selection)
         db.set_meta("current_envelope", name)
         db.set_meta("manual_override", None)
-        _systemctl_user("enable", "--now", "sp7-powerlab-fixed.service")
+        try:
+            _systemctl_user("enable", "--now", "sp7-powerlab-fixed.service")
+            if systemd_user_unit_state("sp7-powerlab-fixed.service") != "active":
+                raise RuntimeError("fixed oneshot did not reach active (exited) state")
+        except RuntimeError as exc:
+            db.set_meta("fixed_good_selection", None)
+            _systemctl_user("disable", "--now", "sp7-powerlab-fixed.service")
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            raise SystemExit(str(exc)) from exc
+        except BaseException:
+            db.set_meta("fixed_good_selection", None)
+            _systemctl_user("disable", "--now", "sp7-powerlab-fixed.service")
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            raise
         emit(
             {
                 "activated": True,
@@ -1334,9 +1411,41 @@ def cmd_envelope_activate_dynamic(args: argparse.Namespace) -> int:
             raise SystemExit("current Net Benefit evidence does not select DYNAMIC_CONTROLLER")
         if int(config.get("automation.level", 0)) != 1:
             raise SystemExit("DYNAMIC_CONTROLLER activation requires automation.level=1")
+        previous_selection = db.get_meta("fixed_good_selection")
         _systemctl_user("disable", "--now", "sp7-powerlab-fixed.service")
+        try:
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            expected_code = str(dynamic_runtime_code_identity(config).get("aggregate_sha256") or "")
+            expected_config = str(dynamic_runtime_config_identity(config).get("identity") or "")
+            deadline = time.time() + max(
+                float(config.get("collector.sample_seconds", 10.0)) * 4.0, 30.0
+            )
+            ready = False
+            while time.time() < deadline:
+                status = runtime_mode_status(config, db)
+                if (
+                    status.get("mode") == "DYNAMIC_CONTROLLER"
+                    and str(status.get("runtime_code_identity") or "") == expected_code
+                    and str(status.get("runtime_config_identity") or "") == expected_config
+                ):
+                    ready = True
+                    break
+                time.sleep(1.0)
+            if not ready:
+                raise RuntimeError("dynamic service did not reach fresh Level-1 runtime identity")
+        except RuntimeError as exc:
+            _systemctl_user("disable", "--now", "sp7-powerlab.service")
+            if isinstance(previous_selection, dict) and previous_selection:
+                db.set_meta("fixed_good_selection", previous_selection)
+                _systemctl_user("enable", "--now", "sp7-powerlab-fixed.service")
+            raise SystemExit(str(exc)) from exc
+        except BaseException:
+            _systemctl_user("disable", "--now", "sp7-powerlab.service")
+            if isinstance(previous_selection, dict) and previous_selection:
+                db.set_meta("fixed_good_selection", previous_selection)
+                _systemctl_user("enable", "--now", "sp7-powerlab-fixed.service")
+            raise
         db.set_meta("fixed_good_selection", None)
-        _systemctl_user("enable", "--now", "sp7-powerlab.service")
         emit(
             {
                 "activated": True,
@@ -1629,7 +1738,6 @@ def parser() -> argparse.ArgumentParser:
     net_benefit_compare.add_argument("candidate_second_run")
     net_benefit_compare.add_argument("reference_after_run")
     net_benefit_compare.add_argument("--usable-battery-wh", type=float)
-    net_benefit_compare.add_argument("--max-gap-seconds", type=float, default=90.0)
     net_benefit_compare.set_defaults(func=cmd_net_benefit_compare)
     net_benefit_history = net_benefit_sub.add_parser("history")
     net_benefit_history.add_argument("--limit", type=int, default=20)

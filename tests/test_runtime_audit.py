@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from sp7_powerlab.config import load_config, load_machine, load_thermal_config
 from sp7_powerlab.envelopes import EnvelopeRegistry
 from sp7_powerlab.hardware import hard_control_identity
-from sp7_powerlab.runtime_audit import audit_fixed_runtime
+from sp7_powerlab.runtime_audit import (
+    FixedContextStaleError,
+    audit_fixed_runtime,
+    validate_live_fixed_context_before_write,
+)
 from sp7_powerlab.storage import Database
 
 
@@ -62,7 +68,11 @@ def test_fixed_runtime_audit_proves_live_physical_state(project_root, monkeypatc
         monkeypatch.setattr("sp7_powerlab.runtime_audit.inspect_hardware", lambda **_kwargs: report)
         monkeypatch.setattr(
             "sp7_powerlab.runtime_audit.systemd_user_unit_state",
-            lambda unit: "inactive" if unit == "sp7-powerlab.service" else "unavailable",
+            lambda unit: (
+                "inactive"
+                if unit == "sp7-powerlab.service"
+                else ("active" if unit == "sp7-powerlab-fixed.service" else "unavailable")
+            ),
         )
         monkeypatch.setattr(
             "sp7_powerlab.runtime_audit.HWPActuator",
@@ -122,6 +132,24 @@ def test_fixed_runtime_audit_proves_live_physical_state(project_root, monkeypatc
         assert "fixed_oneshot_not_enabled" in missing_boot_apply["reasons"]
 
         monkeypatch.setattr(
+            "sp7_powerlab.runtime_audit.systemd_user_unit_enabled",
+            lambda unit: "disabled" if unit == "sp7-powerlab.service" else "enabled",
+        )
+        monkeypatch.setattr(
+            "sp7_powerlab.runtime_audit.systemd_user_unit_state",
+            lambda unit: "inactive" if unit == "sp7-powerlab.service" else "failed",
+        )
+        failed_oneshot = audit_fixed_runtime(
+            config,
+            db,
+            evidence_epoch=epoch,
+            fixed_baseline_envelope=envelope["name"],
+            fixed_baseline_content_hash=envelope["content_hash"],
+            require_persistent_selection=True,
+        )
+        assert "fixed_oneshot_not_active" in failed_oneshot["reasons"]
+
+        monkeypatch.setattr(
             "sp7_powerlab.runtime_audit.systemd_user_unit_state",
             lambda unit: "active" if unit == "sp7-powerlab.service" else "unavailable",
         )
@@ -134,6 +162,60 @@ def test_fixed_runtime_audit_proves_live_physical_state(project_root, monkeypatc
         )
         assert active_service["ready"] is False
         assert "main_service_not_inactive" in active_service["reasons"]
+    finally:
+        db.close()
+
+
+def test_live_fixed_context_rejects_stale_hard_or_battery_epoch(project_root, monkeypatch):
+    config = load_config(project_root)
+    db = Database(project_root / "runtime/live-fixed-context.sqlite3")
+    try:
+        report = fake_report()
+        machine = load_machine(project_root)
+        calibration_version = int((machine.get("calibration") or {}).get("version") or 0)
+        hard_hash, _payload = hard_control_identity(
+            report,
+            thermal_config=load_thermal_config(project_root),
+            calibration_version=calibration_version,
+        )
+        battery_epoch = db.ensure_battery_epoch(
+            identity_hash="battery-a",
+            energy_full_wh=40.0,
+            payload={"identity_hash": "battery-a", "energy_full_wh": 40.0},
+        )
+        db.ensure_evidence_epoch(
+            hard_identity_hash=hard_hash,
+            battery_epoch=battery_epoch,
+            calibration_version=calibration_version,
+            evidence_semantics_version=int(config.get("evidence.semantics_version", 0)),
+            payload={},
+        )
+        monkeypatch.setattr("sp7_powerlab.runtime_audit.inspect_hardware", lambda **_kwargs: report)
+        battery = {"identity_hash": "battery-a", "energy_full_wh": 40.0}
+        monkeypatch.setattr(
+            "sp7_powerlab.runtime_audit.battery_snapshot", lambda _root: dict(battery)
+        )
+
+        context = validate_live_fixed_context_before_write(config, db)
+        assert context["battery_epoch"] == battery_epoch
+
+        battery["identity_hash"] = "battery-b"
+        with pytest.raises(FixedContextStaleError, match="battery identity changed"):
+            validate_live_fixed_context_before_write(config, db)
+
+        battery["identity_hash"] = "battery-a"
+        battery["energy_full_wh"] = 30.0
+        with pytest.raises(FixedContextStaleError, match="energy_full changed"):
+            validate_live_fixed_context_before_write(config, db)
+
+        battery["energy_full_wh"] = 40.0
+        changed = fake_report()
+        changed.kernel = "new-kernel"
+        monkeypatch.setattr(
+            "sp7_powerlab.runtime_audit.inspect_hardware", lambda **_kwargs: changed
+        )
+        with pytest.raises(FixedContextStaleError, match="hard identity"):
+            validate_live_fixed_context_before_write(config, db)
     finally:
         db.close()
 

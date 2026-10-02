@@ -18,6 +18,7 @@ def helper_implementation_identity() -> str:
     package_root = Path(__file__).resolve().parent
     paths = (
         package_root / "helper.py",
+        package_root / "actuators" / "base.py",
         package_root / "actuators" / "hwp.py",
     )
     digest = hashlib.sha256()

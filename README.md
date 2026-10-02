@@ -333,6 +333,10 @@ A1/A2 通过 `sp7-powerlab fixed apply <VERIFIED envelope>` 明确恢复同一�
 override。Dynamic block 绑定 daemon 实际加载的 code/config identity；已完成结果还必须匹配当前 Stage-E
 contract identity 和现场 media generation。
 
+所有 fixed write 在写 HWP 前还会重新验证 live hard identity 与真实 BAT identity/energy_full 是否仍属于
+stored evidence epoch。fixed oneshot 不会自行创建新 epoch；kernel/BIOS/battery 等事实变化会 fail-closed。
+Formal Stage E cadence/gap/sample floor 由本地 `[net_benefit]` 合同固定，不提供 production CLI 放宽参数。
+
 Automation Level 2+ 的 Scheduler/Agent 学习能力按需运行，不作为必须长期常开的第四种 Stage E treatment。
 
 系统允许得出：

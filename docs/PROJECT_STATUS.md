@@ -17,7 +17,7 @@ sp7-powerlab agent-context
 当前 runtime：
 
 - SQLite schema v10
-- evidence semantics v9
+- evidence semantics v10
 - 旧 runtime schema fail-fast，不维护兼容迁移
 - AI 入口：AGENTS.md + sp7-powerlab agent-context
 - 设计合同：PLAN2.md
@@ -295,6 +295,11 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - formal capture 开始时拒绝 active investigation / unresolved UnexpectedPower / Diagnostic Burst；capture 期间新 investigation/event 或非 thermal 的 Control Safety interruption 会使 block INVALID，thermal intervention 作为 outcome 记录
 - restricted root helper 暴露 protocol/implementation identity；主 runtime 与 root-owned wheel 不一致时直接 READ_ONLY，不兼容旧 helper
 - `sp7-powerlab fixed apply <VERIFIED>` 提供不写 manual override 的 baseline 恢复原语；最终 fixed-good 用 `sp7-powerlab-fixed.service` 在 login/reboot one-shot 重应用选中的 envelope
+- fixed/manual fixed write 在任何 HWP write 前现场重算 hard identity，并直接读取 live BAT identity/energy_full 与 stored battery epoch 比较；发现 kernel/BIOS/thermal/calibration/battery 漂移时 fail-closed，oneshot 不创建新 epoch
+- Formal Stage E cadence 由 `[net_benefit] sample_seconds/max_sample_gap_seconds/minimum_samples_per_block` 本地合同拥有；production meter 不暴露 interval/sys-root/proc-root 或 compare gap override
+- persistent fixed audit 要求 fixed oneshot 本 session 为 `active (exited)`，不仅是 enabled；oneshot 只对 helper/thermald 暂未就绪做有限重试
+- Dynamic/Fixed runtime activation 使用 preflight + rollback 顺序，失败不会先永久拆掉原 selected runtime
+- runtime code identity 始终 hash 当前实际 imported package；root helper identity 覆盖 helper.py、actuators/hwp.py、actuators/base.py
 - Net Benefit campaign 是 OPEN/COMPLETE/INVALID 实体；一个有效 Dynamic A1-B1-B2-A2 即可 COMPLETE
 - 两个 Dynamic candidate block 都必须达到 practical saving；只有一个达到时 NEED_MORE_DATA
 - MONITORING 仅为按需诊断，不进入 StableReadiness

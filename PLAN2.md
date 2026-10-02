@@ -1030,6 +1030,11 @@ campaign COMPLETE 不是永久证书。每次 Net Benefit summary / StableReadin
 contract identity 与**当前** contract identity 比较，并现场刷新 browser/Mesa media generation；任一变化，
 旧结果只保留作历史，不继续背书 STABLE。
 
+Formal Stage E 的采样规则属于 deterministic local contract，不属于 Agent/CLI 可调参数。至少固定
+`sample_seconds`、`max_sample_gap_seconds`、`minimum_samples_per_block`，并全部进入 Stage-E contract
+identity。产生正式 evidence 的 production meter 不暴露 interval/max-gap/sys-root/proc-root 放宽入口；
+A1/B1/B2/A2 必须使用同一 formal cadence，同时满足最小时长、样本数 floor 与 gap 上限。
+
 最终复杂度选择只问一个问题：
 
 ~~~
@@ -1049,7 +1054,17 @@ one-shot audit：main service inactive、thermald active、无 ownership conflic
 evidence epoch 一致、现场 media compatibility 仍匹配、fixed baseline 仍 VERIFIED/hash 匹配、actual HWP
 snapshot 匹配 envelope。若 FIXED_GOOD 是最终 selected runtime，还必须证明 main service 已 disabled、
 `sp7-powerlab-fixed.service` 已 enabled，并且持久 selection 绑定当前 epoch/baseline；login/reboot 时由该
-oneshot 重应用 fixed envelope 后退出。
+oneshot 重应用 fixed envelope 后退出。persistent audit 还必须看到 oneshot 本 session 为 active/exited；
+enabled 只代表“会尝试”，不能证明本次已经成功应用。
+
+任何 manual/persistent fixed write 在 HWP write 前必须现场重算 live hard identity，并直接读取 BAT identity
+与 energy_full，使用 battery epoch 相同的 identity/20% energy_full 语义与 stored evidence 比较。fixed
+oneshot **只验证，不创建 epoch**；发现新 kernel/BIOS/battery/hard context 后 fail-closed，回到 main
+PowerLab/Stage A-B revalidation。只对 helper/thermald 启动时暂不可用做短暂有限重试。
+
+runtime identity 的 production 语义是“当前 Python 实际 import 的 package files”，而不是 WorkingDirectory
+里恰好存在的 repo source。restricted root helper 的 implementation identity 覆盖 helper.py、
+actuators/base.py、actuators/hwp.py。
 
 允许结论：
 

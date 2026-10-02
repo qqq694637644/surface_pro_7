@@ -61,7 +61,7 @@ DEFAULTS: dict[str, Any] = {
         "max_sustained_compute_delta": 0.10,
     },
     "evidence": {
-        "semantics_version": 9,
+        "semantics_version": 10,
         "practical_threshold_w": 0.10,
         "min_crossover_episodes": 2,
         "medium_effect_min_crossover_episodes": 3,
@@ -78,6 +78,9 @@ DEFAULTS: dict[str, Any] = {
         "noise_arm_confidence_multiplier": 2.0,
     },
     "net_benefit": {
+        "sample_seconds": 60.0,
+        "max_sample_gap_seconds": 90.0,
+        "minimum_samples_per_block": 6,
         "max_brightness_delta_pct": 10.0,
         "max_active_fraction_delta": 0.15,
         "max_media_fraction_delta": 0.10,

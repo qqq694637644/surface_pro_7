@@ -731,11 +731,15 @@ def test_net_benefit_requires_campaign_marked_complete_by_capture_contract():
     assert result["recommendation"] == "NEED_MORE_DATA"
 
 
-def test_runtime_policy_snapshot_changes_when_core_control_code_changes(project_root: Path):
+def test_runtime_policy_snapshot_changes_when_core_control_code_changes(
+    project_root: Path, monkeypatch
+):
+    import sp7_powerlab.longterm as longterm_module
     from sp7_powerlab.config import load_config
 
     package_root = project_root / "src" / "sp7_powerlab"
     package_root.mkdir(parents=True)
+    monkeypatch.setattr(longterm_module, "IMPORTED_PACKAGE_ROOT", package_root)
     controller = package_root / "controller.py"
     controller.write_text("CONTROL_VERSION = 1\n", encoding="utf-8")
     config = load_config(project_root)
@@ -750,11 +754,15 @@ def test_runtime_policy_snapshot_changes_when_core_control_code_changes(project_
         db.close()
 
 
-def test_runtime_policy_snapshot_ignores_scheduler_code_for_level_one_runtime(project_root: Path):
+def test_runtime_policy_snapshot_ignores_scheduler_code_for_level_one_runtime(
+    project_root: Path, monkeypatch
+):
+    import sp7_powerlab.longterm as longterm_module
     from sp7_powerlab.config import load_config
 
     package_root = project_root / "src" / "sp7_powerlab"
     package_root.mkdir(parents=True)
+    monkeypatch.setattr(longterm_module, "IMPORTED_PACKAGE_ROOT", package_root)
     scheduler = package_root / "scheduler.py"
     scheduler.write_text("SEARCH_VERSION = 1\n", encoding="utf-8")
     config = load_config(project_root)
@@ -768,11 +776,13 @@ def test_runtime_policy_snapshot_ignores_scheduler_code_for_level_one_runtime(pr
         db.close()
 
 
-def test_runtime_policy_snapshot_includes_level_one_evidence_path(project_root: Path):
+def test_runtime_policy_snapshot_includes_level_one_evidence_path(project_root: Path, monkeypatch):
+    import sp7_powerlab.longterm as longterm_module
     from sp7_powerlab.config import load_config
 
     package_root = project_root / "src" / "sp7_powerlab"
     package_root.mkdir(parents=True)
+    monkeypatch.setattr(longterm_module, "IMPORTED_PACKAGE_ROOT", package_root)
     evidence = package_root / "evidence.py"
     evidence.write_text("NOISE_VERSION = 1\n", encoding="utf-8")
     config = load_config(project_root)
@@ -786,11 +796,15 @@ def test_runtime_policy_snapshot_includes_level_one_evidence_path(project_root: 
         db.close()
 
 
-def test_stage_e_contract_identity_includes_cli_and_threshold_contract(project_root: Path):
+def test_stage_e_contract_identity_includes_cli_and_threshold_contract(
+    project_root: Path, monkeypatch
+):
+    import sp7_powerlab.longterm as longterm_module
     from sp7_powerlab.config import load_config
 
     package_root = project_root / "src" / "sp7_powerlab"
     package_root.mkdir(parents=True)
+    monkeypatch.setattr(longterm_module, "IMPORTED_PACKAGE_ROOT", package_root)
     cli = package_root / "cli.py"
     cli.write_text("STAGE_E_VERSION = 1\n", encoding="utf-8")
     config = load_config(project_root)
@@ -961,6 +975,33 @@ def test_paired_meter_comparison_requires_comparable_a_b_b_a_blocks():
     assert incomparable["comparison_quality"] == "DATA_QUALITY_FAILURE"
     assert "candidate_first_brightness_not_comparable" in incomparable["comparison_quality_reasons"]
     assert incomparable["candidate_minus_reference_w"] is None
+
+
+def test_paired_meter_comparison_requires_formal_sample_floor():
+    sparse = [
+        {
+            **meter_row(ts, 5.0, 40.0 - 5.0 * ts / 3600.0),
+            "brightness_pct": 50.0,
+            "user_active": True,
+            "media_playing": False,
+            "remote_present": False,
+            "network_rx_mbps": 0.5,
+            "network_tx_mbps": 0.5,
+            "package_temp_c": 42.0,
+            "hwp_matches_fixed_envelope": True,
+        }
+        for ts in (0, 60)
+    ]
+    result = compare_paired_meter_runs(
+        sparse,
+        sparse,
+        sparse,
+        sparse,
+        minimum_block_seconds=60.0,
+        minimum_samples_per_block=6,
+    )
+    assert result["comparison_quality"] == "DATA_QUALITY_FAILURE"
+    assert "reference_before_too_few_samples" in result["comparison_quality_reasons"]
 
 
 def test_paired_meter_temperature_is_outcome_not_comparability_gate():

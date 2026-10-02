@@ -385,6 +385,11 @@ capture 直接拒绝。部署代码/config 后，正式 Stage E 前先：
 systemctl --user restart sp7-powerlab.service
 ```
 
+Formal Stage E cadence 固定来自 `[net_benefit]`：默认 `sample_seconds=60`、`max_sample_gap_seconds=90`、
+`minimum_samples_per_block=6`，并全部进入 Stage-E contract identity。正式 `sp7-powerlab-meter` 不提供
+`--interval/--sys-root/--proc-root`，`net-benefit compare` 也不提供 `--max-gap-seconds`；测试需要 fake
+sysfs/procfs 时直接实例化 Python 组件，不经过 production evidence CLI。
+
 每个 A1-B1-B2-A2 comparison 内必须先冻结该次要验证的 policy/config；四个 block 期间 Automation
 Level、VERIFIED envelope set 和 manual override 不得变化。FIXED_GOOD 不使用 manual override；A1/A2 都用
 `sp7-powerlab fixed apply <VERIFIED envelope>` 显式恢复同一个物理 baseline。
@@ -501,6 +506,11 @@ sp7-powerlab envelope activate-dynamic
 `sp7-powerlab-fixed.service`。该 oneshot 在 login/reboot 重应用 fixed envelope 后退出；不会把 10 秒 collector/
 controller 重新常驻。`activate-dynamic` 做相反切换。之后 StableReadiness 同时校验 selected policy
 fingerprint、actual runtime mode/daemon identity 或 fixed persistent audit。
+
+切换使用小型 preflight/rollback：Fixed 在 disable main 前先验证 current evidence、live hard/battery
+context、helper/hardware 与 VERIFIED envelope；后续 apply/oneshot 失败会恢复 main mode。Dynamic 切换先保留
+fixed selection，启动 main 后等待 fresh Level-1 heartbeat + loaded identity match，成功后才清 fixed
+selection；失败则恢复 fixed oneshot。
 
 ## 18. 进入和运行 STABLE
 

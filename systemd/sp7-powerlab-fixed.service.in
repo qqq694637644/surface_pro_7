@@ -1,6 +1,8 @@
 [Unit]
 Description=Surface Pro 7 PowerLab persistent fixed-good envelope
 After=default.target
+StartLimitIntervalSec=60
+StartLimitBurst=1
 
 [Service]
 Type=oneshot

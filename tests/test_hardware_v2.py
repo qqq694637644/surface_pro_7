@@ -3,6 +3,12 @@ from pathlib import Path
 import sp7_powerlab.hardware as hardware
 
 
+def test_systemd_user_unit_state_preserves_failed_stdout(monkeypatch):
+    monkeypatch.setattr(hardware, "systemd_available", lambda: True)
+    monkeypatch.setattr(hardware, "_command", lambda _args: (3, "failed"))
+    assert hardware.systemd_user_unit_state("sp7-powerlab-fixed.service") == "failed"
+
+
 def build_fake_hardware(tmp_path: Path):
     sys = tmp_path / "sys"
     proc = tmp_path / "proc"

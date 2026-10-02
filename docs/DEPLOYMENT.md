@@ -29,7 +29,7 @@ bash scripts/install-root-helper.sh
 3. systemd root service 只执行该副本。
 4. Unix socket 只允许安装时的目标 UID。
 5. helper 只暴露 inspect/snapshot/apply/restore HWP 操作。
-6. `inspect` 暴露 protocol version 和当前 `helper.py + actuators/hwp.py` implementation identity。
+6. `inspect` 暴露 protocol version 和当前 `helper.py + actuators/base.py + actuators/hwp.py` implementation identity。
 7. helper 不保留 CAP_SYS_ADMIN，CapabilityBoundingSet 和 AmbientCapabilities 均为空。
 
 日常 Git checkout 的修改不会自动变成 root 代码。
@@ -44,6 +44,12 @@ bash scripts/install-root-helper.sh
 直接保持 READ_ONLY / `root-helper-mismatch`；不兼容旧 root wheel，也不会把旧 helper 当成当前 actuator。
 `install-root-helper.sh` 完成更新后，如果 persistent fixed-good oneshot 已启用，会自动 restart 该 user unit，
 确保新的 matching helper 真正重新应用 selected fixed envelope。
+
+持久 fixed-good 在每次 login/reboot 写 HWP **之前**重新读取 live kernel/BIOS/thermal/thermald/calibration
+组成的 hard identity，并读取真实 BAT identity + energy_full。它们必须继续属于 stored evidence/battery epoch；
+不匹配时 oneshot 直接失败并要求回到 main PowerLab 做重新验证，不会自动创建新 epoch 后继续套旧 envelope。
+helper/thermald 仅在启动顺序尚未就绪时做最多 3 次、每次 10 秒的有限等待；hard/battery stale、helper
+implementation mismatch、envelope 不再 VERIFIED 都不会重试。
 
 主 service 每次 hardware-contract refresh 都会重新 discovery/bind actuator。若 user service 启动时
 root helper 尚未就绪，PowerLab 会先保持 READ_ONLY；helper 稍后恢复后不需要重启 user service，

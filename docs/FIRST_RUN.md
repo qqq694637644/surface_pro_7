@@ -357,6 +357,10 @@ MinimalMeter 默认每 60 秒采样；`--count 60` 约为一小时。短暂 Cont
 history 事后检查，不依赖更高频 polling。实际 formal minimum 仍以当前 Measurement Trust recommendation
 和实验配置下限为准。
 
+Formal cadence 由 `[net_benefit] sample_seconds/max_sample_gap_seconds/minimum_samples_per_block` 固定并进入
+Stage-E contract identity。production meter/compare 不暴露 interval、gap 或 fake sys/proc root 的放宽参数；
+四个 block cadence 必须一致且每块至少满足 sample floor。
+
 记录四个 `meter-...` run id：
 
 ```bash
@@ -442,7 +446,9 @@ sp7-powerlab lifecycle freeze --reason "Stage A-E and current policy net benefit
 
 STABLE 对 Dynamic 校验 selected runtime fingerprint；对 Fixed-good 每次 readiness / agent-context / freeze
 都执行 one-shot live audit：main service inactive、thermald active、无 ownership conflict、live hard identity
-仍匹配 evidence epoch、baseline 仍 VERIFIED/hash 一致、actual HWP 仍匹配 fixed envelope。
+仍匹配 evidence epoch、baseline 仍 VERIFIED/hash 一致、actual HWP 仍匹配 fixed envelope。若 fixed-good 是
+最终 selected runtime，还要求 main service disabled、fixed oneshot enabled 且当前为 active/exited，证明本
+session 已成功应用；enabled 本身不算成功证据。
 
 进入 STABLE 后：
 

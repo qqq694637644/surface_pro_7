@@ -192,12 +192,12 @@ def systemd_user_unit_state(unit: str) -> str:
     if not systemd_available():
         return "unavailable"
     code, state = _command(["systemctl", "--user", "is-active", unit])
+    if state:
+        return state
     if code == 4:
         return "unavailable"
     if code == 3:
         return "inactive"
-    if state:
-        return state
     return "unknown"
 
 

@@ -76,6 +76,9 @@ STAGE_E_CONTRACT_CONFIG = {
     ),
     "experiments": ("min_block_seconds",),
     "net_benefit": (
+        "sample_seconds",
+        "max_sample_gap_seconds",
+        "minimum_samples_per_block",
         "max_brightness_delta_pct",
         "max_active_fraction_delta",
         "max_media_fraction_delta",
@@ -90,12 +93,12 @@ STAGE_E_CONTRACT_CONFIG = {
 }
 
 
+IMPORTED_PACKAGE_ROOT = Path(__file__).resolve().parent
+
+
 def _code_identity(config: Config, files_to_hash: tuple[str, ...]) -> dict[str, Any]:
-    package_roots = (
-        config.root / "src" / "sp7_powerlab",
-        Path(__file__).resolve().parent,
-    )
-    package_root = next((path for path in package_roots if path.is_dir()), package_roots[-1])
+    del config
+    package_root = IMPORTED_PACKAGE_ROOT
     files: dict[str, str] = {}
     for relative in files_to_hash:
         path = package_root / relative
@@ -1071,6 +1074,7 @@ def compare_paired_meter_runs(
     max_consistency_ratio: float = 0.35,
     max_consistency_abs_wh: float = 0.05,
     minimum_block_seconds: float = 300.0,
+    minimum_samples_per_block: int = 6,
     max_brightness_delta_pct: float = 10.0,
     max_active_fraction_delta: float = 0.15,
     max_media_fraction_delta: float = 0.10,
@@ -1116,6 +1120,8 @@ def compare_paired_meter_runs(
             quality_reasons.append(f"{label}_data_quality_failed")
         if float(block.get("energy_valid_seconds") or 0.0) < float(minimum_block_seconds):
             quality_reasons.append(f"{label}_too_short")
+        if int(block.get("sample_count") or 0) < int(minimum_samples_per_block):
+            quality_reasons.append(f"{label}_too_few_samples")
     if before.get("fixed_hwp_all_match") is not True:
         quality_reasons.append("reference_before_hwp_not_fixed")
     if after.get("fixed_hwp_all_match") is not True:

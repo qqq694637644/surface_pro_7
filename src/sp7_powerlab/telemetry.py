@@ -120,6 +120,11 @@ def _battery_snapshot(sys_root: Path = SYSFS) -> dict[str, Any]:
     }
 
 
+def battery_snapshot(sys_root: Path = SYSFS) -> dict[str, Any]:
+    """Read the live BAT identity/energy state without mutating runtime epochs."""
+    return _battery_snapshot(sys_root)
+
+
 def _psi(resource: str, proc_root: Path = PROC) -> float | None:
     text = _read(proc_root / "pressure" / resource)
     if not text:
