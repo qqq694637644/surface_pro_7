@@ -1,0 +1,301 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from .actuators.hwp import HWPActuator
+from .config import Config, load_machine, load_thermal_config
+from .envelopes import snapshot_matches_envelope
+from .hardware import (
+    compatibility_state,
+    hard_control_identity,
+    inspect_hardware,
+    systemd_user_unit_enabled,
+    systemd_user_unit_state,
+)
+from .storage import Database
+from .telemetry import battery_snapshot
+
+
+class FixedContextStaleError(RuntimeError):
+    pass
+
+
+class FixedContextTransientError(RuntimeError):
+    pass
+
+
+def _live_battery_epoch_check(
+    db: Database,
+    *,
+    evidence_epoch: dict[str, Any] | None,
+    sys_root: Path,
+) -> dict[str, Any]:
+    battery_epoch = db.active_battery_epoch_record()
+    live_battery = battery_snapshot(sys_root)
+    reasons: list[str] = []
+
+    if not battery_epoch:
+        reasons.append("missing_active_battery_epoch")
+    else:
+        live_identity = str(live_battery.get("identity_hash") or "missing")
+        stored_identity = str(battery_epoch.get("identity_hash") or "")
+        if live_identity == "missing":
+            reasons.append("live_battery_identity_missing")
+        elif live_identity != stored_identity:
+            reasons.append("live_battery_identity_mismatch")
+
+        live_full = live_battery.get("energy_full_wh")
+        stored_full = battery_epoch.get("energy_full_wh")
+        if (
+            isinstance(live_full, (int, float))
+            and isinstance(stored_full, (int, float))
+            and stored_full > 0
+            and abs(float(live_full) - float(stored_full)) / max(float(stored_full), 0.1) > 0.20
+        ):
+            reasons.append("live_battery_energy_full_drift")
+
+        if evidence_epoch is not None and int(evidence_epoch.get("battery_epoch") or 0) != int(
+            battery_epoch.get("epoch") or 0
+        ):
+            reasons.append("evidence_battery_epoch_mismatch")
+
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "live_battery": live_battery,
+        "battery_epoch": battery_epoch,
+    }
+
+
+def validate_live_fixed_context_before_write(
+    config: Config,
+    db: Database,
+    *,
+    sys_root: Path = Path("/sys"),
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any]:
+    """Validate live hard/battery facts against stored evidence without creating epochs."""
+    epoch = db.active_evidence_epoch()
+    if not epoch:
+        raise FixedContextStaleError(
+            "fixed-good evidence is stale: active evidence/battery epoch missing"
+        )
+
+    machine = load_machine(config.root)
+    identity = machine.get("identity") or {}
+    calibration = machine.get("calibration") or {}
+    report = inspect_hardware(
+        sys_root=sys_root,
+        proc_root=proc_root,
+        expected_product=str(identity.get("expected_product", "Surface Pro 7")),
+        expected_cpu_substring=str(identity.get("expected_cpu_substring", "i5-1035G4")),
+        configured_thermal_sensor=str((machine.get("thermal") or {}).get("sensor_path") or "")
+        or None,
+        include_versions=True,
+    )
+    if not report.supported_machine:
+        raise FixedContextStaleError("fixed-good evidence is stale: live hardware contract changed")
+    if report.thermald.get("active") is not True:
+        raise FixedContextTransientError("thermald is not active yet")
+    if report.ownership_conflicts:
+        raise FixedContextTransientError("conflicting power writer is active")
+
+    live_hard_hash, live_hard_payload = hard_control_identity(
+        report,
+        thermal_config=load_thermal_config(config.root),
+        calibration_version=int(calibration.get("version") or 0),
+    )
+    if str(epoch.get("hard_identity_hash") or "") != live_hard_hash:
+        raise FixedContextStaleError(
+            "fixed-good evidence is stale: live hard identity no longer matches the evidence epoch"
+        )
+    if int(epoch.get("calibration_version") or 0) != int(calibration.get("version") or 0):
+        raise FixedContextStaleError("fixed-good evidence is stale: calibration version changed")
+    if int(epoch.get("evidence_semantics_version") or 0) != int(
+        config.get("evidence.semantics_version", 0)
+    ):
+        raise FixedContextStaleError("fixed-good evidence is stale: evidence semantics changed")
+
+    battery_check = _live_battery_epoch_check(db, evidence_epoch=epoch, sys_root=sys_root)
+    if battery_check["reasons"]:
+        reason = str(battery_check["reasons"][0])
+        message = {
+            "missing_active_battery_epoch": "active evidence/battery epoch missing",
+            "live_battery_identity_missing": "battery identity changed",
+            "live_battery_identity_mismatch": "battery identity changed",
+            "live_battery_energy_full_drift": "battery energy_full changed >20%",
+            "evidence_battery_epoch_mismatch": "evidence/battery epoch mismatch",
+        }.get(reason, reason)
+        raise FixedContextStaleError(f"fixed-good evidence is stale: {message}")
+
+    return {
+        "evidence_epoch_id": epoch.get("epoch_id"),
+        "battery_epoch": (battery_check.get("battery_epoch") or {}).get("epoch"),
+        "live_hard_identity_hash": live_hard_hash,
+        "live_hard_identity": live_hard_payload,
+        "live_battery": battery_check["live_battery"],
+    }
+
+
+def fixed_runtime_identity(
+    *,
+    evidence_epoch_id: str,
+    envelope: str,
+    envelope_content_hash: str,
+) -> str:
+    from .hardware import fingerprint_hash
+
+    return fingerprint_hash(
+        {
+            "evidence_epoch_id": evidence_epoch_id,
+            "envelope": envelope,
+            "envelope_content_hash": envelope_content_hash,
+        }
+    )
+
+
+def live_media_compatibility(
+    config: Config,
+    *,
+    sys_root: Path = Path("/sys"),
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any]:
+    machine = load_machine(config.root)
+    identity = machine.get("identity") or {}
+    report = inspect_hardware(
+        sys_root=sys_root,
+        proc_root=proc_root,
+        expected_product=str(identity.get("expected_product", "Surface Pro 7")),
+        expected_cpu_substring=str(identity.get("expected_cpu_substring", "i5-1035G4")),
+        configured_thermal_sensor=str((machine.get("thermal") or {}).get("sensor_path") or "")
+        or None,
+        include_versions=True,
+    )
+    state = compatibility_state(report)
+    return {
+        "media_compatibility_generation": state["media_compatibility_generation"],
+        "media_versions": state["media_versions"],
+    }
+
+
+def audit_fixed_runtime(
+    config: Config,
+    db: Database,
+    *,
+    evidence_epoch: dict[str, Any] | None,
+    fixed_baseline_envelope: str | None,
+    fixed_baseline_content_hash: str | None,
+    sys_root: Path = Path("/sys"),
+    proc_root: Path = Path("/proc"),
+    require_persistent_selection: bool = False,
+) -> dict[str, Any]:
+    machine = load_machine(config.root)
+    identity = machine.get("identity") or {}
+    calibration = machine.get("calibration") or {}
+    thermal_config = load_thermal_config(config.root)
+    report = inspect_hardware(
+        sys_root=sys_root,
+        proc_root=proc_root,
+        expected_product=str(identity.get("expected_product", "Surface Pro 7")),
+        expected_cpu_substring=str(identity.get("expected_cpu_substring", "i5-1035G4")),
+        configured_thermal_sensor=str((machine.get("thermal") or {}).get("sensor_path") or "")
+        or None,
+        include_versions=True,
+    )
+    live_hard_hash, live_hard_payload = hard_control_identity(
+        report,
+        thermal_config=thermal_config,
+        calibration_version=int(calibration.get("version") or 0),
+    )
+
+    service_state = systemd_user_unit_state("sp7-powerlab.service")
+    service_enabled = systemd_user_unit_enabled("sp7-powerlab.service")
+    fixed_unit_enabled = systemd_user_unit_enabled("sp7-powerlab-fixed.service")
+    fixed_unit_state = systemd_user_unit_state("sp7-powerlab-fixed.service")
+    hourly_timer_state = systemd_user_unit_state("sp7-powerlab-hourly.timer")
+    hourly_service_state = systemd_user_unit_state("sp7-powerlab-hourly.service")
+
+    reasons: list[str] = []
+    battery_check = _live_battery_epoch_check(
+        db,
+        evidence_epoch=evidence_epoch,
+        sys_root=sys_root,
+    )
+    reasons.extend(battery_check["reasons"])
+    if service_state != "inactive":
+        reasons.append("main_service_not_inactive")
+    selection = db.get_meta("fixed_good_selection", {})
+    if require_persistent_selection:
+        if service_enabled not in {"disabled", "masked"}:
+            reasons.append("main_service_not_disabled")
+        if fixed_unit_enabled != "enabled":
+            reasons.append("fixed_oneshot_not_enabled")
+        if fixed_unit_state != "active":
+            reasons.append("fixed_oneshot_not_active")
+        if not isinstance(selection, dict) or (
+            str(selection.get("envelope") or "") != str(fixed_baseline_envelope or "")
+            or str(selection.get("content_hash") or "") != str(fixed_baseline_content_hash or "")
+        ):
+            reasons.append("fixed_persistent_selection_mismatch")
+    if hourly_timer_state not in {"inactive", "unavailable"}:
+        reasons.append("hourly_timer_active")
+    if hourly_service_state not in {"inactive", "unavailable"}:
+        reasons.append("hourly_service_active")
+    if report.thermald.get("active") is not True:
+        reasons.append("thermald_not_active")
+    if report.ownership_conflicts:
+        reasons.append("conflicting_power_writer_active")
+    if not report.supported_machine:
+        reasons.append("hardware_contract_mismatch")
+    if evidence_epoch is None:
+        reasons.append("missing_evidence_epoch")
+    elif str(evidence_epoch.get("hard_identity_hash") or "") != live_hard_hash:
+        reasons.append("live_hard_identity_mismatch")
+
+    envelope = db.envelope(str(fixed_baseline_envelope)) if fixed_baseline_envelope else None
+    if not envelope or envelope.get("status") != "VERIFIED":
+        reasons.append("fixed_baseline_not_verified")
+    elif str(envelope.get("content_hash") or "") != str(fixed_baseline_content_hash or ""):
+        reasons.append("fixed_baseline_content_hash_mismatch")
+
+    hwp_snapshot: dict[str, Any] | None = None
+    hwp_matches = False
+    if envelope:
+        try:
+            hwp_snapshot = HWPActuator(sys_root).snapshot()
+            hwp_matches = snapshot_matches_envelope(hwp_snapshot, envelope)
+        except Exception:
+            reasons.append("fixed_hwp_snapshot_unavailable")
+        else:
+            if not hwp_matches:
+                reasons.append("fixed_hwp_state_mismatch")
+    else:
+        reasons.append("fixed_hwp_baseline_unavailable")
+    compatibility = compatibility_state(report)
+
+    return {
+        "ready": not reasons,
+        "reasons": sorted(set(reasons)),
+        "service_state": service_state,
+        "service_enabled": service_enabled,
+        "fixed_oneshot_enabled": fixed_unit_enabled,
+        "fixed_oneshot_state": fixed_unit_state,
+        "fixed_good_selection": selection,
+        "hourly_timer_state": hourly_timer_state,
+        "hourly_service_state": hourly_service_state,
+        "thermald_active": report.thermald.get("active"),
+        "ownership_conflicts": list(report.ownership_conflicts),
+        "expected_hard_identity_hash": ((evidence_epoch or {}).get("hard_identity_hash")),
+        "live_hard_identity_hash": live_hard_hash,
+        "live_hard_identity": live_hard_payload,
+        "live_battery": battery_check["live_battery"],
+        "active_battery_epoch": battery_check["battery_epoch"],
+        "fixed_baseline_envelope": fixed_baseline_envelope,
+        "fixed_baseline_content_hash": fixed_baseline_content_hash,
+        "fixed_baseline_verified": bool(envelope and envelope.get("status") == "VERIFIED"),
+        "hwp_matches_fixed_baseline": hwp_matches,
+        "hwp_snapshot": hwp_snapshot,
+        "live_media_compatibility_generation": compatibility["media_compatibility_generation"],
+        "live_media_versions": compatibility["media_versions"],
+    }

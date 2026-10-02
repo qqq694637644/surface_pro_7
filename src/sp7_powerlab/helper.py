@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -9,6 +10,24 @@ from pathlib import Path
 from typing import Any
 
 from .actuators.hwp import HWPActuator
+
+ROOT_HELPER_PROTOCOL_VERSION = 2
+
+
+def helper_implementation_identity() -> str:
+    package_root = Path(__file__).resolve().parent
+    paths = (
+        package_root / "helper.py",
+        package_root / "actuators" / "base.py",
+        package_root / "actuators" / "hwp.py",
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.relative_to(package_root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 class HelperProtocolError(RuntimeError):
@@ -91,7 +110,11 @@ class RootHelperServer:
         action = request.get("action")
         payload = request.get("payload") or {}
         if action == "inspect":
-            return self.actuator.inspect()
+            return {
+                **self.actuator.inspect(),
+                "protocol_version": ROOT_HELPER_PROTOCOL_VERSION,
+                "implementation_identity": helper_implementation_identity(),
+            }
         if action == "snapshot":
             return self.actuator.snapshot()
         if action == "apply":

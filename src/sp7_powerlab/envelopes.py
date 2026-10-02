@@ -196,7 +196,7 @@ class EnvelopeRegistry:
         base_name: str,
         changes: dict[str, Any],
     ) -> dict[str, Any]:
-        base = self.get(base_name)
+        base = self.db.envelope(base_name)
         if not base:
             raise KeyError(base_name)
         allowed = {"epp", "max_perf_pct", "turbo"}

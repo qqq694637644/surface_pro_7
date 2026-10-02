@@ -81,3 +81,9 @@ def test_helper_apply_uses_typed_hwp_values(tmp_path):
     assert result["after"]["epp"] == "power"
     assert result["after"]["max_perf_pct"] == 40
     assert result["after"]["turbo"] is False
+
+
+def test_helper_inspect_exposes_protocol_and_implementation_identity(tmp_path):
+    result = server(tmp_path).dispatch({"action": "inspect", "payload": {}})
+    assert result["protocol_version"] == 2
+    assert len(result["implementation_identity"]) == 64

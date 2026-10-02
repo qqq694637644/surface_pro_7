@@ -3,20 +3,43 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .agent_context import build_agent_context, build_agent_context_without_runtime
 from .analytics import battery_usage_summary
+from .attribution import AttributionEngine
 from .calibration import CalibrationManager
 from .config import load_config, load_machine, load_thermal_config
 from .demand import DemandObserver
-from .envelopes import EnvelopeRegistry
-from .hardware import inspect_hardware
+from .envelopes import EnvelopeRegistry, snapshot_matches_envelope
+from .hardware import inspect_hardware, systemd_user_unit_state
 from .helper import RootHelperServer
-from .llm import build_knowledge_pack
+from .knowledge import build_review_pack
+from .lifecycle import LifecycleManager
+from .longterm import (
+    StableReadiness,
+    UsageCoverage,
+    assess_current_net_benefit,
+    compare_paired_meter_runs,
+    dynamic_runtime_code_identity,
+    dynamic_runtime_config_identity,
+    runtime_mode_status,
+    stage_e_contract_identity,
+)
+from .measurement import assess_measurement_trust, characterize_battery_gauge
+from .runtime_audit import (
+    FixedContextStaleError,
+    FixedContextTransientError,
+    live_media_compatibility,
+    validate_live_fixed_context_before_write,
+)
+from .scheduler import CandidateScheduler
 from .service import PowerLabService, build_actuator, prepare_stack, service_status
 from .storage import Database, LegacyDatabaseError
 from .telemetry import TelemetryCollector
@@ -41,6 +64,18 @@ ROOT = _default_root()
 
 def emit(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+
+
+def _systemctl_user(*args: str) -> None:
+    completed = subprocess.run(
+        ["systemctl", "--user", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "systemctl failed"
+        raise SystemExit(detail)
 
 
 def config_from_args(args: argparse.Namespace):
@@ -70,7 +105,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             database = db.health()
         finally:
             db.close()
-    except LegacyDatabaseError as exc:
+    except (LegacyDatabaseError, sqlite3.DatabaseError) as exc:
         database = {"error": str(exc), "legacy_database": True}
     actuator, available, mode = build_actuator(config)
     _ = actuator
@@ -84,6 +119,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "automation_level": int(config.get("automation.level", 0)),
         }
     )
+    return 0
+
+
+def cmd_agent_context(args: argparse.Namespace) -> int:
+    config = config_from_args(args)
+    try:
+        db = Database(config.path("storage.database"))
+    except (LegacyDatabaseError, sqlite3.DatabaseError) as exc:
+        emit(build_agent_context_without_runtime(config, error=str(exc)))
+        return 0
+    registry = EnvelopeRegistry(ROOT, db)
+    try:
+        emit(build_agent_context(config, db, registry))
+    finally:
+        db.close()
     return 0
 
 
@@ -149,6 +199,17 @@ def cmd_calibrate_new_battery(args: argparse.Namespace) -> int:
         manager = CalibrationManager(ROOT, db, config)
         manager.set_active_battery_epoch(epoch)
         manager.invalidate("manual new battery epoch")
+        previous_trust = db.get_meta("measurement_trust", {})
+        db.set_meta(
+            "measurement_trust",
+            {
+                **(previous_trust if isinstance(previous_trust, dict) else {}),
+                "status": "BLOCKED",
+                "reasons": ["battery_epoch_changed"],
+                "invalidated_ts": time.time(),
+                "invalidated_by_battery_epoch": epoch,
+            },
+        )
         emit({"battery_epoch": epoch, "calibration_valid": False})
     finally:
         db.close()
@@ -243,6 +304,812 @@ def cmd_incidents(args: argparse.Namespace) -> int:
                 )
             }
         )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_status(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        epoch = db.active_evidence_epoch()
+        coverage_days = int(config.get("stable.coverage_days", 30))
+        coverage = UsageCoverage(db).summarize(
+            since_ts=time.time() - coverage_days * 86400.0,
+            evidence_epoch_id=(epoch or {}).get("epoch_id"),
+        )
+        target = float(config.get("stable.target_trusted_fraction", 0.90))
+        emit(
+            {
+                **manager.status(),
+                "usage_coverage": coverage,
+                "stable_target_trusted_fraction": target,
+                "stable_coverage_ready": (
+                    isinstance(coverage.get("trusted_fraction"), (int, float))
+                    and float(coverage["trusted_fraction"]) >= target
+                ),
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_freeze(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        readiness = StableReadiness(config, db).assess()
+        if not readiness["ready"] and not args.force:
+            emit({"frozen": False, "readiness": readiness})
+            return 2
+        manager.freeze(args.reason)
+        net_benefit = readiness.get("net_benefit") or {}
+        epoch = readiness.get("evidence_epoch") or {}
+        db.set_meta(
+            "stable_entry_readiness",
+            {
+                "ts": time.time(),
+                "qualified": bool(readiness.get("ready")),
+                "forced": bool(args.force),
+                "evidence_epoch_id": epoch.get("epoch_id"),
+                "selected_policy_mode": net_benefit.get("selected_policy_mode"),
+                "selected_policy_fingerprint": net_benefit.get("selected_policy_fingerprint"),
+                "usage_coverage": readiness.get("usage_coverage"),
+            },
+        )
+        emit({"frozen": True, "forced": bool(args.force), **manager.status()})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_reopen(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        manager.reopen(args.reason)
+        db.set_meta("stable_entry_readiness", {})
+        emit(manager.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_coverage(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        epoch = db.active_evidence_epoch()
+        days = int(args.days or config.get("stable.coverage_days", 30))
+        result = UsageCoverage(db).summarize(
+            since_ts=time.time() - days * 86400.0,
+            evidence_epoch_id=(epoch or {}).get("epoch_id"),
+        )
+        target = float(config.get("stable.target_trusted_fraction", 0.90))
+        emit(
+            {
+                "days": days,
+                "target_trusted_fraction": target,
+                "ready_for_stable_by_coverage": (
+                    isinstance(result.get("trusted_fraction"), (int, float))
+                    and float(result["trusted_fraction"]) >= target
+                ),
+                **result,
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_readiness(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        emit(StableReadiness(config, db).assess())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_optimize(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        manager.begin_optimization(args.reason)
+        emit(manager.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_lifecycle_validate(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        manager.begin_validation(args.reason)
+        emit(manager.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_safety_status(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        manager = LifecycleManager(db)
+        emit(
+            {
+                "control_safety_state": manager.control_state(),
+                "history": [
+                    dict(row)
+                    for row in db.conn.execute(
+                        "SELECT * FROM control_safety_history ORDER BY ts DESC LIMIT 20"
+                    )
+                ],
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_safety_recover_rollback(args: argparse.Namespace) -> int:
+    stack = prepare_stack(
+        ROOT,
+        Path(args.config).expanduser() if args.config else None,
+    )
+    try:
+        matched = stack["controller"].recover_rollback_integrity_fault(args.reason)
+        stack["lifecycle"].set_control(
+            "READ_ONLY",
+            "rollback integrity fault cleared after verified HWP reconcile; "
+            "awaiting normal runtime safety synchronization",
+            {"verified_envelope": matched, "reason": args.reason},
+        )
+        emit(
+            {
+                "recovered": True,
+                "verified_envelope": matched,
+                "rollback_integrity_fault": stack["db"].get_meta(
+                    "rollback_integrity_fault",
+                    {},
+                ),
+                "control_safety_state": stack["lifecycle"].control_state(),
+            }
+        )
+    finally:
+        stack["db"].close()
+    return 0
+
+
+def cmd_investigation_list(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        emit({"investigations": db.recent_investigations(args.limit)})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_investigation_inspect(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        item = db.investigation(args.investigation_id)
+        if not item:
+            raise SystemExit(f"investigation not found: {args.investigation_id}")
+        event = db.unexpected_power_event(str(item["event_id"])) if item.get("event_id") else None
+        emit({**item, "event": event})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_investigation_attribute(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        emit(AttributionEngine(db).attribute(args.investigation_id))
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_investigation_close(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        attribution = AttributionEngine(db)
+        classification = attribution.validate_classification(args.classification)
+        payload = {
+            "reason": args.reason,
+            "local_evidence": args.evidence or [],
+            "verification_plan": args.verification or [],
+        }
+        manager = LifecycleManager(db)
+        manager.finish_investigation(
+            args.investigation_id,
+            classification=classification,
+            payload=payload,
+        )
+        emit(
+            {
+                "investigation": db.investigation(args.investigation_id),
+                "lifecycle": manager.status(),
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_unexpected_power_list(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        emit({"events": db.recent_unexpected_power_events(args.limit)})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_unexpected_power_inspect(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        event = db.unexpected_power_event(args.event_id)
+        if not event:
+            raise SystemExit(f"unexpected-power event not found: {args.event_id}")
+        emit(event)
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_evidence_status(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        epoch = db.active_evidence_epoch()
+        epoch_id = (epoch or {}).get("epoch_id")
+        emit(
+            {
+                "active_evidence_epoch": epoch,
+                "compatibility_tags": db.active_compatibility_tags(),
+                "recent_decisions": db.evidence_decisions(
+                    evidence_epoch_id=epoch_id,
+                    limit=args.limit,
+                ),
+                "arm_measurements_total": db.conn.execute(
+                    "SELECT COUNT(*) FROM arm_measurements"
+                ).fetchone()[0],
+                "crossover_episodes": (
+                    db.conn.execute(
+                        "SELECT COUNT(*) FROM crossover_episodes WHERE evidence_epoch_id=?",
+                        (epoch_id,),
+                    ).fetchone()[0]
+                    if epoch_id
+                    else 0
+                ),
+                "frozen_references": (
+                    db.conn.execute(
+                        """SELECT COUNT(*) FROM reference_baselines
+                        WHERE frozen=1 AND evidence_epoch_id=?""",
+                        (epoch_id,),
+                    ).fetchone()[0]
+                    if epoch_id
+                    else 0
+                ),
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_evidence_noise(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        epoch = db.active_evidence_epoch()
+        epoch_id = (epoch or {}).get("epoch_id")
+        rows = (
+            [
+                dict(row)
+                for row in db.conn.execute(
+                    """SELECT updated_ts,evidence_epoch_id,strata_key,window_seconds,
+                    median_power_w,mad_power_w,noise_floor_w,sample_count
+                    FROM recent_noise_distributions
+                    WHERE evidence_epoch_id=?
+                    ORDER BY updated_ts DESC LIMIT ?""",
+                    (epoch_id, args.limit),
+                )
+            ]
+            if epoch_id
+            else []
+        )
+        emit({"active_evidence_epoch": epoch, "noise": rows})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_evidence_gauge(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        epoch = db.active_evidence_epoch()
+        since = time.time() - float(args.hours) * 3600.0
+        if epoch:
+            since = max(since, float(epoch.get("start_ts") or since))
+        rows = db.recent_samples(since)
+        discharge_power = [
+            float(row["battery_power_w"])
+            for row in rows
+            if row.get("battery_status") == "Discharging"
+            and isinstance(row.get("battery_power_w"), (int, float))
+            and not row.get("resume_grace")
+        ]
+        expected_power = sum(discharge_power) / len(discharge_power) if discharge_power else None
+        emit(
+            {
+                "hours": float(args.hours),
+                "expected_power_w": expected_power,
+                **characterize_battery_gauge(
+                    rows,
+                    expected_power_w=expected_power,
+                    energy_quantum_multiplier=float(
+                        config.get("evidence.gauge_quantum_multiplier", 8.0)
+                    ),
+                    max_gap_seconds=float(config.get("collector.max_gap_seconds", 45.0)),
+                ),
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_evidence_trust(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        epoch = db.active_evidence_epoch()
+        since = time.time() - float(args.hours) * 3600.0
+        if epoch:
+            since = max(since, float(epoch.get("start_ts") or since))
+        rows = db.recent_samples(since)
+        result = assess_measurement_trust(
+            rows,
+            min_samples=int(config.get("evidence.measurement_min_samples", 30)),
+            min_observation_seconds=float(
+                config.get("evidence.measurement_min_observation_seconds", 900.0)
+            ),
+            configured_min_arm_seconds=float(config.get("experiments.min_block_seconds", 300.0)),
+            energy_quantum_multiplier=float(config.get("evidence.gauge_quantum_multiplier", 8.0)),
+            max_gap_seconds=float(config.get("collector.max_gap_seconds", 45.0)),
+            max_consistency_ratio=float(config.get("evidence.max_energy_consistency_ratio", 0.35)),
+            max_consistency_abs_wh=float(
+                config.get("evidence.max_energy_consistency_abs_wh", 0.05)
+            ),
+            min_consistency_windows=int(
+                config.get("evidence.measurement_min_consistency_windows", 2)
+            ),
+        )
+        machine = load_machine(ROOT)
+        calibration = machine.get("calibration") or {}
+        battery = machine.get("battery") or {}
+        if not epoch:
+            result = {
+                **result,
+                "status": "BLOCKED",
+                "reasons": [
+                    *(result.get("reasons") or []),
+                    "missing_active_evidence_epoch",
+                ],
+            }
+        elif int(epoch.get("calibration_version") or 0) != int(
+            calibration.get("version") or 0
+        ) or int(epoch.get("battery_epoch") or 0) != int(battery.get("active_epoch") or 0):
+            result = {
+                **result,
+                "status": "BLOCKED",
+                "reasons": [
+                    *(result.get("reasons") or []),
+                    "active_evidence_epoch_context_stale",
+                ],
+            }
+        record = {
+            **result,
+            "assessed_ts": time.time(),
+            "history_hours": float(args.hours),
+            "evidence_epoch_id": (epoch or {}).get("epoch_id"),
+            "battery_epoch": (epoch or {}).get("battery_epoch"),
+            "calibration_version": (epoch or {}).get("calibration_version"),
+            "evidence_semantics_version": (epoch or {}).get("evidence_semantics_version"),
+        }
+        db.set_meta("measurement_trust", record)
+        emit(record)
+    finally:
+        db.close()
+    return 0
+
+
+NET_BENEFIT_CAPTURE_MODES = {
+    "MONITORING": "MONITORING_OVERHEAD",
+    "DYNAMIC_CONTROLLER": "DYNAMIC_CONTROLLER",
+}
+
+
+def _meter_campaign(
+    db: Database,
+    reference_before_id: str,
+    candidate_first_id: str,
+    candidate_second_id: str,
+    reference_after_id: str,
+    *,
+    max_interblock_gap_seconds: float = 900.0,
+    max_campaign_span_seconds: float = 86400.0,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], str]:
+    reference_before = db.minimal_meter_run(reference_before_id)
+    candidate_first = db.minimal_meter_run(candidate_first_id)
+    candidate_second = db.minimal_meter_run(candidate_second_id)
+    reference_after = db.minimal_meter_run(reference_after_id)
+    if not reference_before:
+        raise SystemExit(f"unknown MinimalMeter reference-before run: {reference_before_id}")
+    if not candidate_first:
+        raise SystemExit(f"unknown MinimalMeter first candidate run: {candidate_first_id}")
+    if not candidate_second:
+        raise SystemExit(f"unknown MinimalMeter second candidate run: {candidate_second_id}")
+    if not reference_after:
+        raise SystemExit(f"unknown MinimalMeter reference-after run: {reference_after_id}")
+    if len({reference_before_id, candidate_first_id, candidate_second_id, reference_after_id}) != 4:
+        raise SystemExit("Net Benefit A-B-B-A comparison requires four distinct MinimalMeter runs")
+    runs = (reference_before, candidate_first, candidate_second, reference_after)
+    if any(run.get("status") != "COMPLETE" for run in runs):
+        raise SystemExit("Net Benefit A-B-B-A comparison requires four COMPLETE MinimalMeter runs")
+    if (
+        reference_before.get("capture_mode") != "FIXED_GOOD"
+        or reference_after.get("capture_mode") != "FIXED_GOOD"
+    ):
+        raise SystemExit("Net Benefit A-B-B-A references must use capture mode FIXED_GOOD")
+    candidate_mode = str(candidate_first.get("capture_mode") or "")
+    if str(candidate_second.get("capture_mode") or "") != candidate_mode:
+        raise SystemExit("both Net Benefit candidate blocks must use the same capture mode")
+    result_mode = NET_BENEFIT_CAPTURE_MODES.get(candidate_mode)
+    if result_mode is None:
+        raise SystemExit("candidate MinimalMeter run must use MONITORING or DYNAMIC_CONTROLLER")
+
+    provenance_fields = (
+        "campaign_id",
+        "evidence_epoch_id",
+        "battery_epoch",
+        "battery_identity_hash",
+        "hard_identity_hash",
+        "calibration_version",
+        "evidence_semantics_version",
+    )
+    mismatched = [
+        field for field in provenance_fields if len({str(run.get(field)) for run in runs}) != 1
+    ]
+    if mismatched:
+        raise SystemExit("MinimalMeter provenance mismatch: " + ", ".join(sorted(mismatched)))
+    policy_fingerprints = {str(run.get("runtime_policy_fingerprint") or "") for run in runs}
+    if len(policy_fingerprints) != 1 or "" in policy_fingerprints:
+        raise SystemExit("MinimalMeter runtime policy fingerprint changed within A-B-B-A")
+    if reference_before.get("envelope") != reference_after.get("envelope") or reference_before.get(
+        "envelope_content_hash"
+    ) != reference_after.get("envelope_content_hash"):
+        raise SystemExit("A-B-B-A fixed reference definition changed between reference blocks")
+    if candidate_mode == "MONITORING" and (
+        any(
+            reference_before.get("envelope") != run.get("envelope")
+            for run in (candidate_first, candidate_second)
+        )
+        or any(
+            reference_before.get("envelope_content_hash") != run.get("envelope_content_hash")
+            for run in (candidate_first, candidate_second)
+        )
+    ):
+        raise SystemExit("MONITORING comparison requires the same fixed VERIFIED envelope")
+
+    for run in runs:
+        payload = run.get("payload") or {}
+        if int(payload.get("capture_contract_version") or 0) != 4:
+            raise SystemExit("Net Benefit comparison requires capture contract v4 provenance")
+    for field in ("stage_e_contract_identity", "media_compatibility_generation"):
+        values = {str((run.get("payload") or {}).get(field) or "") for run in runs}
+        if len(values) != 1 or "" in values:
+            raise SystemExit(f"MinimalMeter {field} changed within A-B-B-A")
+    cadence_values = {
+        float((run.get("payload") or {}).get("interval_seconds") or 0.0) for run in runs
+    }
+    if len(cadence_values) != 1 or 0.0 in cadence_values:
+        raise SystemExit("MinimalMeter formal cadence changed within A-B-B-A")
+    before_end = float(reference_before.get("end_ts") or 0.0)
+    first_start = float(candidate_first.get("start_ts") or 0.0)
+    first_end = float(candidate_first.get("end_ts") or 0.0)
+    second_start = float(candidate_second.get("start_ts") or 0.0)
+    second_end = float(candidate_second.get("end_ts") or 0.0)
+    after_start = float(reference_after.get("start_ts") or 0.0)
+    if not (before_end <= first_start and first_end <= second_start and second_end <= after_start):
+        raise SystemExit(
+            "Net Benefit A-B-B-A runs are not in reference-candidate-candidate-reference order"
+        )
+    interblock_gaps = (
+        first_start - before_end,
+        second_start - first_end,
+        after_start - second_end,
+    )
+    if any(gap > float(max_interblock_gap_seconds) for gap in interblock_gaps):
+        raise SystemExit("Net Benefit A-B-B-A inter-block gap exceeds the paired-campaign limit")
+
+    campaign_id = str(candidate_first.get("campaign_id") or "")
+    campaign = db.net_benefit_campaign(campaign_id)
+    if not campaign:
+        raise SystemExit(f"Net Benefit campaign entity does not exist: {campaign_id}")
+    if campaign.get("status") != "OPEN":
+        raise SystemExit(f"Net Benefit campaign is not OPEN: {campaign.get('status')}")
+    if time.time() - float(campaign.get("created_ts") or 0.0) > float(max_campaign_span_seconds):
+        db.invalidate_net_benefit_campaign(campaign_id, "campaign_span_exceeded")
+        raise SystemExit("Net Benefit campaign exceeded max_campaign_span_seconds")
+    campaign_context = {
+        "evidence_epoch_id": candidate_first.get("evidence_epoch_id"),
+        "battery_epoch": candidate_first.get("battery_epoch"),
+        "hard_identity_hash": candidate_first.get("hard_identity_hash"),
+        "calibration_version": candidate_first.get("calibration_version"),
+        "evidence_semantics_version": candidate_first.get("evidence_semantics_version"),
+    }
+    campaign_mismatch = [
+        field for field, value in campaign_context.items() if str(campaign.get(field)) != str(value)
+    ]
+    if campaign_mismatch:
+        db.invalidate_net_benefit_campaign(
+            campaign_id,
+            "campaign_context_changed:" + ",".join(sorted(campaign_mismatch)),
+        )
+        raise SystemExit(
+            "Net Benefit campaign context mismatch: " + ", ".join(sorted(campaign_mismatch))
+        )
+    if str(campaign.get("fixed_baseline_envelope") or "") != str(
+        reference_before.get("envelope") or ""
+    ) or str(campaign.get("fixed_baseline_content_hash") or "") != str(
+        reference_before.get("envelope_content_hash") or ""
+    ):
+        db.invalidate_net_benefit_campaign(campaign_id, "fixed_baseline_changed")
+        raise SystemExit("Net Benefit campaign fixed baseline no longer matches its contract")
+    campaign_payload = campaign.get("payload") or {}
+    for field in ("stage_e_contract_identity", "media_compatibility_generation"):
+        run_value = str((candidate_first.get("payload") or {}).get(field) or "")
+        if str(campaign_payload.get(field) or "") != run_value:
+            db.invalidate_net_benefit_campaign(campaign_id, f"{field}_changed")
+            raise SystemExit(f"Net Benefit campaign {field} changed")
+    comparisons = dict(campaign_payload.get("comparisons") or {})
+    if result_mode == "DYNAMIC_CONTROLLER" and result_mode in comparisons:
+        raise SystemExit(f"Net Benefit campaign already contains {result_mode}")
+
+    active_epoch = db.active_evidence_epoch()
+    if not active_epoch or str(active_epoch.get("epoch_id") or "") != str(
+        candidate_first.get("evidence_epoch_id") or ""
+    ):
+        raise SystemExit("MinimalMeter runs are not from the current evidence epoch")
+    return reference_before, candidate_first, candidate_second, reference_after, result_mode
+
+
+def cmd_net_benefit_compare(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        reference_before, candidate_first, candidate_second, reference_after, result_mode = (
+            _meter_campaign(
+                db,
+                args.reference_before_run,
+                args.candidate_first_run,
+                args.candidate_second_run,
+                args.reference_after_run,
+                max_interblock_gap_seconds=float(
+                    config.get("net_benefit.max_interblock_gap_seconds", 900.0)
+                ),
+                max_campaign_span_seconds=float(
+                    config.get("net_benefit.max_campaign_span_seconds", 86400.0)
+                ),
+            )
+        )
+        current_contract = stage_e_contract_identity(config)
+        current_media = live_media_compatibility(config)
+        formal_sample_seconds = float(config.get("net_benefit.sample_seconds", 60.0))
+        if any(
+            float((run.get("payload") or {}).get("interval_seconds") or 0.0)
+            != formal_sample_seconds
+            for run in (reference_before, candidate_first, candidate_second, reference_after)
+        ):
+            db.invalidate_net_benefit_campaign(
+                str(candidate_first["campaign_id"]),
+                "formal_cadence_mismatch",
+            )
+            raise SystemExit(
+                "Net Benefit capture cadence does not match the current formal contract"
+            )
+        captured_contract = str(
+            (candidate_first.get("payload") or {}).get("stage_e_contract_identity") or ""
+        )
+        captured_media = str(
+            (candidate_first.get("payload") or {}).get("media_compatibility_generation") or ""
+        )
+        if captured_contract != str(current_contract.get("identity") or ""):
+            db.invalidate_net_benefit_campaign(
+                str(candidate_first["campaign_id"]),
+                "stage_e_contract_identity_stale",
+            )
+            raise SystemExit("Net Benefit capture contract is stale under the current code/config")
+        if captured_media != str(current_media.get("media_compatibility_generation") or ""):
+            db.invalidate_net_benefit_campaign(
+                str(candidate_first["campaign_id"]),
+                "media_compatibility_generation_stale",
+            )
+            raise SystemExit("Net Benefit media compatibility generation is stale")
+        trust = db.get_meta("measurement_trust", {})
+        minimum_block_seconds = max(
+            float(config.get("experiments.min_block_seconds", 300.0)),
+            float((trust or {}).get("recommended_min_arm_seconds") or 0.0),
+        )
+        result = compare_paired_meter_runs(
+            reference_before.get("samples") or [],
+            candidate_first.get("samples") or [],
+            candidate_second.get("samples") or [],
+            reference_after.get("samples") or [],
+            usable_battery_wh=args.usable_battery_wh,
+            max_gap_seconds=float(config.get("net_benefit.max_sample_gap_seconds", 90.0)),
+            max_consistency_ratio=float(config.get("evidence.max_energy_consistency_ratio", 0.35)),
+            max_consistency_abs_wh=float(
+                config.get("evidence.max_energy_consistency_abs_wh", 0.05)
+            ),
+            minimum_block_seconds=minimum_block_seconds,
+            minimum_samples_per_block=int(config.get("net_benefit.minimum_samples_per_block", 6)),
+            max_brightness_delta_pct=float(
+                config.get("net_benefit.max_brightness_delta_pct", 10.0)
+            ),
+            max_active_fraction_delta=float(
+                config.get("net_benefit.max_active_fraction_delta", 0.15)
+            ),
+            max_media_fraction_delta=float(
+                config.get("net_benefit.max_media_fraction_delta", 0.10)
+            ),
+            max_remote_fraction_delta=float(
+                config.get("net_benefit.max_remote_fraction_delta", 0.10)
+            ),
+            max_network_mbps_delta=float(config.get("net_benefit.max_network_mbps_delta", 5.0)),
+            max_reference_drift_w=float(config.get("net_benefit.max_reference_drift_w", 0.30)),
+            max_candidate_delta_spread_w=float(
+                config.get("net_benefit.max_candidate_delta_spread_w", 0.30)
+            ),
+            require_candidate_fixed_hwp=(candidate_first.get("capture_mode") == "MONITORING"),
+        )
+        result = {
+            **result,
+            "reference_before_run_id": reference_before["run_id"],
+            "candidate_first_run_id": candidate_first["run_id"],
+            "candidate_second_run_id": candidate_second["run_id"],
+            "reference_after_run_id": reference_after["run_id"],
+            "campaign_id": candidate_first["campaign_id"],
+            "evidence_epoch_id": candidate_first["evidence_epoch_id"],
+            "battery_epoch": candidate_first["battery_epoch"],
+            "battery_identity_hash": candidate_first["battery_identity_hash"],
+            "hard_identity_hash": candidate_first["hard_identity_hash"],
+            "calibration_version": candidate_first["calibration_version"],
+            "evidence_semantics_version": candidate_first["evidence_semantics_version"],
+            "fixed_baseline_envelope": reference_before["envelope"],
+            "fixed_baseline_content_hash": reference_before["envelope_content_hash"],
+            "runtime_policy_fingerprint": candidate_first["runtime_policy_fingerprint"],
+            "stage_e_contract_identity": (candidate_first.get("payload") or {}).get(
+                "stage_e_contract_identity"
+            ),
+            "media_compatibility_generation": (candidate_first.get("payload") or {}).get(
+                "media_compatibility_generation"
+            ),
+            "candidate_thermal_intervention_count": sum(
+                len(
+                    ((run.get("payload") or {}).get("control_safety_activity") or {}).get("thermal")
+                    or []
+                )
+                for run in (candidate_first, candidate_second)
+            ),
+        }
+        run_id = db.start_net_benefit_result(
+            mode=result_mode,
+            payload={
+                "comparison_design": "A_B_B_A",
+                "reference_before_run_id": reference_before["run_id"],
+                "candidate_first_run_id": candidate_first["run_id"],
+                "candidate_second_run_id": candidate_second["run_id"],
+                "reference_after_run_id": reference_after["run_id"],
+                "usable_battery_wh": args.usable_battery_wh,
+                "mode": result_mode,
+                "campaign_id": candidate_first["campaign_id"],
+            },
+        )
+        db.finish_net_benefit_result(run_id, result)
+        campaign = None
+        if result.get("comparison_quality") == "OK" and result_mode == "DYNAMIC_CONTROLLER":
+            campaign = db.record_net_benefit_campaign_comparison(
+                str(candidate_first["campaign_id"]),
+                mode=result_mode,
+                overhead_run_id=run_id,
+                runtime_policy_fingerprint=str(candidate_first["runtime_policy_fingerprint"]),
+            )
+        emit({"run_id": run_id, "campaign": campaign, **result})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_net_benefit_history(args: argparse.Namespace) -> int:
+    _config, db = db_from_args(args)
+    try:
+        emit({"results": db.net_benefit_results(args.limit)})
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_net_benefit_summary(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        emit(assess_current_net_benefit(config, db, limit=args.limit))
+    finally:
+        db.close()
+    return 0
+
+
+def _scheduler_stack(args: argparse.Namespace):
+    config, db, registry = _registry(args)
+    registry.load()
+    return config, db, registry, CandidateScheduler(config, db, registry)
+
+
+def cmd_scheduler_status(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        emit(scheduler.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_scheduler_candidates(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        emit(
+            scheduler.candidates(
+                baseline_name=args.baseline,
+                ux_regression=bool(args.ux_regression),
+            )
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_scheduler_propose(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        emit(
+            scheduler.propose_next(
+                baseline_name=args.baseline,
+                ux_regression=bool(args.ux_regression),
+            )
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_scheduler_pause(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        scheduler.pause(args.reason)
+        emit(scheduler.status())
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_scheduler_resume(args: argparse.Namespace) -> int:
+    _config, db, _registry_value, scheduler = _scheduler_stack(args)
+    try:
+        scheduler.resume()
+        emit(scheduler.status())
     finally:
         db.close()
     return 0
@@ -349,6 +1216,265 @@ def cmd_envelope_clear_override(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fixed_good_selection(db: Database) -> dict[str, Any]:
+    value = db.get_meta("fixed_good_selection", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _dynamic_activation_ready(
+    status: dict[str, Any],
+    *,
+    activation_start_ts: float,
+    expected_code: str,
+    expected_config: str,
+) -> bool:
+    return (
+        status.get("mode") == "DYNAMIC_CONTROLLER"
+        and float(status.get("service_heartbeat_ts") or 0.0) >= activation_start_ts
+        and str(status.get("runtime_code_identity") or "") == expected_code
+        and str(status.get("runtime_config_identity") or "") == expected_config
+    )
+
+
+def _preflight_verified_fixed_envelope(
+    config: Any,
+    db: Database,
+    registry: EnvelopeRegistry,
+    name: str,
+) -> tuple[dict[str, Any], Any, str]:
+    if db.active_trial():
+        raise FixedContextStaleError("fixed apply is forbidden during an active trial")
+    if db.active_calibration():
+        raise FixedContextStaleError("fixed apply is forbidden during calibration")
+    validate_live_fixed_context_before_write(config, db)
+    envelope = registry.get(name)
+    if not envelope or envelope.get("status") != "VERIFIED":
+        raise FixedContextStaleError(
+            "fixed-good evidence is stale: target envelope is not VERIFIED"
+        )
+    actuator, available, actuator_mode = build_actuator(config)
+    if actuator_mode == "root-helper-mismatch":
+        raise FixedContextStaleError(
+            "root helper implementation does not match current runtime; "
+            "rerun scripts/install-root-helper.sh"
+        )
+    if not available or actuator_mode != "root-helper":
+        raise FixedContextTransientError("restricted root helper is not available yet")
+    return envelope, actuator, actuator_mode
+
+
+def _apply_verified_fixed_envelope(
+    config: Any,
+    db: Database,
+    registry: EnvelopeRegistry,
+    name: str,
+) -> dict[str, Any]:
+    if systemd_user_unit_state("sp7-powerlab.service") != "inactive":
+        raise SystemExit("fixed apply requires sp7-powerlab.service to be stopped")
+    if db.active_trial():
+        raise SystemExit("fixed apply is forbidden during an active trial")
+    if db.active_calibration():
+        raise SystemExit("fixed apply is forbidden during calibration")
+    envelope, actuator, actuator_mode = _preflight_verified_fixed_envelope(
+        config, db, registry, name
+    )
+    result = actuator.apply_envelope(envelope)
+    snapshot = actuator.snapshot()
+    if not snapshot_matches_envelope(snapshot, envelope):
+        raise SystemExit("fixed apply HWP read-back does not match the VERIFIED envelope")
+    db.set_meta("current_envelope", name)
+    return {
+        "applied": True,
+        "mode": "FIXED_GOOD",
+        "envelope": name,
+        "content_hash": envelope.get("content_hash"),
+        "actuator_mode": actuator_mode,
+        "result": result,
+        "snapshot": snapshot,
+    }
+
+
+def cmd_fixed_apply(args: argparse.Namespace) -> int:
+    config, db, registry = _registry(args)
+    try:
+        try:
+            emit(_apply_verified_fixed_envelope(config, db, registry, args.name))
+        except (FixedContextStaleError, FixedContextTransientError) as exc:
+            raise SystemExit(str(exc)) from exc
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_envelope_apply_fixed(args: argparse.Namespace) -> int:
+    config, db, registry = _registry(args)
+    try:
+        selection = _fixed_good_selection(db)
+        name = str(selection.get("envelope") or "")
+        content_hash = str(selection.get("content_hash") or "")
+        epoch = db.active_evidence_epoch()
+        if not name or not content_hash:
+            raise SystemExit("no persistent fixed-good selection is configured")
+        if not epoch or str(selection.get("evidence_epoch_id") or "") != str(
+            epoch.get("epoch_id") or ""
+        ):
+            raise SystemExit(
+                "persistent fixed-good selection is stale for the current evidence epoch"
+            )
+        envelope = registry.get(name)
+        if not envelope or str(envelope.get("content_hash") or "") != content_hash:
+            raise SystemExit("persistent fixed-good envelope content hash changed")
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                emit(_apply_verified_fixed_envelope(config, db, registry, name))
+                last_error = None
+                break
+            except FixedContextTransientError as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(10.0)
+        if last_error is not None:
+            raise SystemExit(
+                f"persistent fixed-good apply transient preflight failed: {last_error}"
+            )
+    except FixedContextStaleError as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_envelope_activate_fixed(args: argparse.Namespace) -> int:
+    config, db, registry = _registry(args)
+    try:
+        net_benefit = assess_current_net_benefit(config, db, limit=100)
+        if (
+            not net_benefit.get("complete")
+            or net_benefit.get("selected_policy_mode") != "FIXED_GOOD"
+        ):
+            raise SystemExit("current Net Benefit evidence does not select FIXED_GOOD")
+        name = str(net_benefit.get("fixed_baseline_envelope") or "")
+        content_hash = str(net_benefit.get("fixed_baseline_content_hash") or "")
+        epoch = db.active_evidence_epoch()
+        envelope = registry.get(name) if name else None
+        if not epoch or not envelope or envelope.get("status") != "VERIFIED":
+            raise SystemExit("selected fixed-good baseline is not currently VERIFIED")
+        if str(envelope.get("content_hash") or "") != content_hash:
+            raise SystemExit("selected fixed-good baseline content hash is stale")
+        try:
+            _preflight_verified_fixed_envelope(config, db, registry, name)
+        except (FixedContextStaleError, FixedContextTransientError) as exc:
+            raise SystemExit(str(exc)) from exc
+
+        _systemctl_user("disable", "--now", "sp7-powerlab.service")
+        try:
+            applied = _apply_verified_fixed_envelope(config, db, registry, name)
+        except (FixedContextStaleError, FixedContextTransientError) as exc:
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            raise SystemExit(str(exc)) from exc
+        except BaseException:
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            raise
+        selection = {
+            "ts": time.time(),
+            "evidence_epoch_id": epoch.get("epoch_id"),
+            "envelope": name,
+            "content_hash": content_hash,
+            "selected_policy_fingerprint": net_benefit.get("selected_policy_fingerprint"),
+        }
+        db.set_meta("fixed_good_selection", selection)
+        db.set_meta("current_envelope", name)
+        db.set_meta("manual_override", None)
+        try:
+            _systemctl_user("enable", "--now", "sp7-powerlab-fixed.service")
+            if systemd_user_unit_state("sp7-powerlab-fixed.service") != "active":
+                raise RuntimeError("fixed oneshot did not reach active (exited) state")
+        except RuntimeError as exc:
+            db.set_meta("fixed_good_selection", None)
+            _systemctl_user("disable", "--now", "sp7-powerlab-fixed.service")
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            raise SystemExit(str(exc)) from exc
+        except BaseException:
+            db.set_meta("fixed_good_selection", None)
+            _systemctl_user("disable", "--now", "sp7-powerlab-fixed.service")
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            raise
+        emit(
+            {
+                "activated": True,
+                "mode": "FIXED_GOOD",
+                "selection": selection,
+                "actuator_mode": applied["actuator_mode"],
+                "result": applied["result"],
+                "snapshot": applied["snapshot"],
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_envelope_activate_dynamic(args: argparse.Namespace) -> int:
+    config, db = db_from_args(args)
+    try:
+        net_benefit = assess_current_net_benefit(config, db, limit=100)
+        if (
+            not net_benefit.get("complete")
+            or net_benefit.get("selected_policy_mode") != "DYNAMIC_CONTROLLER"
+        ):
+            raise SystemExit("current Net Benefit evidence does not select DYNAMIC_CONTROLLER")
+        if int(config.get("automation.level", 0)) != 1:
+            raise SystemExit("DYNAMIC_CONTROLLER activation requires automation.level=1")
+        previous_selection = db.get_meta("fixed_good_selection")
+        _systemctl_user("disable", "--now", "sp7-powerlab-fixed.service")
+        try:
+            activation_start_ts = time.time()
+            _systemctl_user("enable", "--now", "sp7-powerlab.service")
+            expected_code = str(dynamic_runtime_code_identity(config).get("aggregate_sha256") or "")
+            expected_config = str(dynamic_runtime_config_identity(config).get("identity") or "")
+            deadline = time.time() + max(
+                float(config.get("collector.sample_seconds", 10.0)) * 4.0, 30.0
+            )
+            ready = False
+            while time.time() < deadline:
+                status = runtime_mode_status(config, db)
+                if _dynamic_activation_ready(
+                    status,
+                    activation_start_ts=activation_start_ts,
+                    expected_code=expected_code,
+                    expected_config=expected_config,
+                ):
+                    ready = True
+                    break
+                time.sleep(1.0)
+            if not ready:
+                raise RuntimeError("dynamic service did not reach fresh Level-1 runtime identity")
+        except RuntimeError as exc:
+            _systemctl_user("disable", "--now", "sp7-powerlab.service")
+            if isinstance(previous_selection, dict) and previous_selection:
+                db.set_meta("fixed_good_selection", previous_selection)
+                _systemctl_user("enable", "--now", "sp7-powerlab-fixed.service")
+            raise SystemExit(str(exc)) from exc
+        except BaseException:
+            _systemctl_user("disable", "--now", "sp7-powerlab.service")
+            if isinstance(previous_selection, dict) and previous_selection:
+                db.set_meta("fixed_good_selection", previous_selection)
+                _systemctl_user("enable", "--now", "sp7-powerlab-fixed.service")
+            raise
+        db.set_meta("fixed_good_selection", None)
+        emit(
+            {
+                "activated": True,
+                "mode": "DYNAMIC_CONTROLLER",
+                "selected_policy_fingerprint": net_benefit.get("selected_policy_fingerprint"),
+            }
+        )
+    finally:
+        db.close()
+    return 0
+
+
 def _trial_stack(args: argparse.Namespace):
     stack = prepare_stack(
         ROOT,
@@ -379,18 +1505,6 @@ def cmd_trial_start(args: argparse.Namespace) -> int:
         if not latest:
             raise SystemExit("no telemetry sample available")
         emit(stack["trials"].start(proposal, latest))
-    finally:
-        stack["db"].close()
-    return 0
-
-
-def cmd_trial_evaluate(args: argparse.Namespace) -> int:
-    stack = _trial_stack(args)
-    try:
-        latest = stack["db"].latest_sample()
-        if not latest:
-            raise SystemExit("no telemetry sample available")
-        emit({"trial": stack["trials"].tick(latest)})
     finally:
         stack["db"].close()
     return 0
@@ -437,10 +1551,10 @@ def cmd_feedback(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_hourly(args: argparse.Namespace) -> int:
+def cmd_review_pack(args: argparse.Namespace) -> int:
     config, db, registry = _registry(args)
     try:
-        pack = build_knowledge_pack(config, db, registry)
+        pack = build_review_pack(config, db, registry)
         if args.output:
             path = Path(args.output)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -454,28 +1568,18 @@ def cmd_hourly(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_knowledge_export(args: argparse.Namespace) -> int:
-    config, db, registry = _registry(args)
-    try:
-        pack = build_knowledge_pack(config, db, registry)
-        directory = ROOT / "history" / "continuous"
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "knowledge-v2.json"
-        path.write_text(
-            json.dumps(pack, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
-            encoding="utf-8",
-        )
-        emit({"path": str(path), "run_id": pack["run_id"]})
-    finally:
-        db.close()
-    return 0
-
-
 def cmd_service_run(args: argparse.Namespace) -> int:
-    service = PowerLabService(
-        ROOT,
-        Path(args.config).expanduser() if args.config else None,
-    )
+    try:
+        service = PowerLabService(
+            ROOT,
+            Path(args.config).expanduser() if args.config else None,
+        )
+    except LegacyDatabaseError as exc:
+        print(f"PowerLab runtime schema is incompatible: {exc}", file=sys.stderr)
+        print(
+            "Run 'sp7-powerlab reset-runtime --yes' explicitly before restarting.", file=sys.stderr
+        )
+        return 78
     try:
         service.run(iterations=args.iterations)
     finally:
@@ -505,7 +1609,7 @@ def cmd_root_helper(args: argparse.Namespace) -> int:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sp7-powerlab",
-        description="Surface Pro 7 battery-life optimization lab v2",
+        description="Surface Pro 7 battery-life optimization lab",
     )
     p.add_argument("--version", action="version", version=__version__)
     p.add_argument("--config")
@@ -513,6 +1617,9 @@ def parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor")
     doctor.set_defaults(func=cmd_doctor)
+
+    agent_context = sub.add_parser("agent-context")
+    agent_context.set_defaults(func=cmd_agent_context)
 
     reset = sub.add_parser("reset-runtime")
     reset.add_argument("--yes", action="store_true")
@@ -551,6 +1658,135 @@ def parser() -> argparse.ArgumentParser:
     incidents.add_argument("--limit", type=int, default=50)
     incidents.set_defaults(func=cmd_incidents)
 
+    lifecycle = sub.add_parser("lifecycle")
+    lifecycle_sub = lifecycle.add_subparsers(dest="lifecycle_command", required=True)
+    lifecycle_status = lifecycle_sub.add_parser("status")
+    lifecycle_status.set_defaults(func=cmd_lifecycle_status)
+    lifecycle_freeze = lifecycle_sub.add_parser("freeze")
+    lifecycle_freeze.add_argument("--reason", default="manual freeze")
+    lifecycle_freeze.add_argument("--force", action="store_true")
+    lifecycle_freeze.set_defaults(func=cmd_lifecycle_freeze)
+    lifecycle_reopen = lifecycle_sub.add_parser("reopen")
+    lifecycle_reopen.add_argument("--reason", default="manual reopen")
+    lifecycle_reopen.set_defaults(func=cmd_lifecycle_reopen)
+    lifecycle_coverage = lifecycle_sub.add_parser("coverage")
+    lifecycle_coverage.add_argument("--days", type=int)
+    lifecycle_coverage.set_defaults(func=cmd_lifecycle_coverage)
+    lifecycle_readiness = lifecycle_sub.add_parser("readiness")
+    lifecycle_readiness.set_defaults(func=cmd_lifecycle_readiness)
+    lifecycle_optimize = lifecycle_sub.add_parser("optimize")
+    lifecycle_optimize.add_argument("--reason", default="manual optimization start")
+    lifecycle_optimize.set_defaults(func=cmd_lifecycle_optimize)
+    lifecycle_validate = lifecycle_sub.add_parser("validate")
+    lifecycle_validate.add_argument("--reason", default="manual validation start")
+    lifecycle_validate.set_defaults(func=cmd_lifecycle_validate)
+
+    safety = sub.add_parser("safety")
+    safety_sub = safety.add_subparsers(dest="safety_command", required=True)
+    safety_status = safety_sub.add_parser("status")
+    safety_status.set_defaults(func=cmd_safety_status)
+    safety_recover = safety_sub.add_parser("recover-rollback")
+    safety_recover.add_argument("--reason", required=True)
+    safety_recover.set_defaults(func=cmd_safety_recover_rollback)
+
+    investigation = sub.add_parser("investigation")
+    investigation_sub = investigation.add_subparsers(
+        dest="investigation_command",
+        required=True,
+    )
+    investigation_list = investigation_sub.add_parser("list")
+    investigation_list.add_argument("--limit", type=int, default=50)
+    investigation_list.set_defaults(func=cmd_investigation_list)
+    investigation_inspect = investigation_sub.add_parser("inspect")
+    investigation_inspect.add_argument("investigation_id")
+    investigation_inspect.set_defaults(func=cmd_investigation_inspect)
+    investigation_attribute = investigation_sub.add_parser("attribute")
+    investigation_attribute.add_argument("investigation_id")
+    investigation_attribute.set_defaults(func=cmd_investigation_attribute)
+    investigation_close = investigation_sub.add_parser("close")
+    investigation_close.add_argument("investigation_id")
+    investigation_close.add_argument(
+        "classification",
+        choices=(
+            "EXPECTED_WORKLOAD_CHANGE",
+            "INSUFFICIENT_EVIDENCE",
+            "SUSPECTED_REGRESSION",
+            "ACTIONABLE_WASTE",
+            "CONFIRMED_CONFIG_REGRESSION",
+        ),
+    )
+    investigation_close.add_argument("--reason", default="")
+    investigation_close.add_argument("--evidence", action="append")
+    investigation_close.add_argument("--verification", action="append")
+    investigation_close.set_defaults(func=cmd_investigation_close)
+
+    unexpected_power = sub.add_parser("unexpected-power")
+    unexpected_power_sub = unexpected_power.add_subparsers(
+        dest="unexpected_power_command",
+        required=True,
+    )
+    unexpected_power_list = unexpected_power_sub.add_parser("list")
+    unexpected_power_list.add_argument("--limit", type=int, default=50)
+    unexpected_power_list.set_defaults(func=cmd_unexpected_power_list)
+    unexpected_power_inspect = unexpected_power_sub.add_parser("inspect")
+    unexpected_power_inspect.add_argument("event_id")
+    unexpected_power_inspect.set_defaults(func=cmd_unexpected_power_inspect)
+
+    evidence = sub.add_parser("evidence")
+    evidence_sub = evidence.add_subparsers(dest="evidence_command", required=True)
+    evidence_status = evidence_sub.add_parser("status")
+    evidence_status.add_argument("--limit", type=int, default=20)
+    evidence_status.set_defaults(func=cmd_evidence_status)
+    evidence_noise = evidence_sub.add_parser("noise")
+    evidence_noise.add_argument("--limit", type=int, default=50)
+    evidence_noise.set_defaults(func=cmd_evidence_noise)
+    evidence_gauge = evidence_sub.add_parser("gauge")
+    evidence_gauge.add_argument("--hours", type=float, default=6.0)
+    evidence_gauge.set_defaults(func=cmd_evidence_gauge)
+    evidence_trust = evidence_sub.add_parser("trust")
+    evidence_trust.add_argument("--hours", type=float, default=6.0)
+    evidence_trust.set_defaults(func=cmd_evidence_trust)
+
+    net_benefit = sub.add_parser("net-benefit")
+    net_benefit_sub = net_benefit.add_subparsers(dest="net_benefit_command", required=True)
+    net_benefit_compare = net_benefit_sub.add_parser("compare")
+    net_benefit_compare.add_argument("reference_before_run")
+    net_benefit_compare.add_argument("candidate_first_run")
+    net_benefit_compare.add_argument("candidate_second_run")
+    net_benefit_compare.add_argument("reference_after_run")
+    net_benefit_compare.add_argument("--usable-battery-wh", type=float)
+    net_benefit_compare.set_defaults(func=cmd_net_benefit_compare)
+    net_benefit_history = net_benefit_sub.add_parser("history")
+    net_benefit_history.add_argument("--limit", type=int, default=20)
+    net_benefit_history.set_defaults(func=cmd_net_benefit_history)
+    net_benefit_summary = net_benefit_sub.add_parser("summary")
+    net_benefit_summary.add_argument("--limit", type=int, default=50)
+    net_benefit_summary.set_defaults(func=cmd_net_benefit_summary)
+
+    fixed = sub.add_parser("fixed")
+    fixed_sub = fixed.add_subparsers(dest="fixed_command", required=True)
+    fixed_apply = fixed_sub.add_parser("apply")
+    fixed_apply.add_argument("name")
+    fixed_apply.set_defaults(func=cmd_fixed_apply)
+
+    scheduler = sub.add_parser("scheduler")
+    scheduler_sub = scheduler.add_subparsers(dest="scheduler_command", required=True)
+    scheduler_status = scheduler_sub.add_parser("status")
+    scheduler_status.set_defaults(func=cmd_scheduler_status)
+    scheduler_candidates = scheduler_sub.add_parser("candidates")
+    scheduler_candidates.add_argument("baseline")
+    scheduler_candidates.add_argument("--ux-regression", action="store_true")
+    scheduler_candidates.set_defaults(func=cmd_scheduler_candidates)
+    scheduler_propose = scheduler_sub.add_parser("propose")
+    scheduler_propose.add_argument("baseline")
+    scheduler_propose.add_argument("--ux-regression", action="store_true")
+    scheduler_propose.set_defaults(func=cmd_scheduler_propose)
+    scheduler_pause = scheduler_sub.add_parser("pause")
+    scheduler_pause.add_argument("--reason", default="manual pause")
+    scheduler_pause.set_defaults(func=cmd_scheduler_pause)
+    scheduler_resume = scheduler_sub.add_parser("resume")
+    scheduler_resume.set_defaults(func=cmd_scheduler_resume)
+
     envelope = sub.add_parser("envelope")
     env_sub = envelope.add_subparsers(dest="envelope_command", required=True)
     env_list = env_sub.add_parser("list")
@@ -570,6 +1806,12 @@ def parser() -> argparse.ArgumentParser:
     env_override.set_defaults(func=cmd_envelope_override)
     env_clear = env_sub.add_parser("clear-override")
     env_clear.set_defaults(func=cmd_envelope_clear_override)
+    env_apply_fixed = env_sub.add_parser("apply-fixed", help=argparse.SUPPRESS)
+    env_apply_fixed.set_defaults(func=cmd_envelope_apply_fixed)
+    env_activate_fixed = env_sub.add_parser("activate-fixed-good")
+    env_activate_fixed.set_defaults(func=cmd_envelope_activate_fixed)
+    env_activate_dynamic = env_sub.add_parser("activate-dynamic")
+    env_activate_dynamic.set_defaults(func=cmd_envelope_activate_dynamic)
 
     trial = sub.add_parser("trial")
     trial_sub = trial.add_subparsers(dest="trial_command", required=True)
@@ -579,8 +1821,6 @@ def parser() -> argparse.ArgumentParser:
     trial_start = trial_sub.add_parser("start")
     trial_start.add_argument("proposal")
     trial_start.set_defaults(func=cmd_trial_start)
-    trial_eval = trial_sub.add_parser("evaluate")
-    trial_eval.set_defaults(func=cmd_trial_evaluate)
     trial_rollback = trial_sub.add_parser("rollback")
     trial_rollback.add_argument("--trial-id")
     trial_rollback.add_argument("--reason", default="manual rollback")
@@ -596,12 +1836,9 @@ def parser() -> argparse.ArgumentParser:
     feedback.add_argument("--notes")
     feedback.set_defaults(func=cmd_feedback)
 
-    hourly = sub.add_parser("hourly")
-    hourly.add_argument("--output")
-    hourly.set_defaults(func=cmd_hourly)
-
-    knowledge = sub.add_parser("knowledge-export")
-    knowledge.set_defaults(func=cmd_knowledge_export)
+    review_pack = sub.add_parser("review-pack")
+    review_pack.add_argument("--output")
+    review_pack.set_defaults(func=cmd_review_pack)
 
     service = sub.add_parser("service")
     service_sub = service.add_subparsers(dest="service_command", required=True)

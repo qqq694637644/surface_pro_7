@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import platform
 import shutil
@@ -156,12 +158,12 @@ def systemd_available() -> bool:
     return shutil.which("systemctl") is not None
 
 
-def thermald_status() -> dict[str, Any]:
+def thermald_status(*, include_version: bool = True) -> dict[str, Any]:
     if not systemd_available():
         return {"available": False, "active": False, "version": None}
     code, active = _command(["systemctl", "is-active", "thermald"])
     version = None
-    if shutil.which("thermald"):
+    if include_version and shutil.which("thermald"):
         _, version = _command(["thermald", "--version"])
     return {
         "available": shutil.which("thermald") is not None,
@@ -184,6 +186,30 @@ def ownership_conflicts() -> list[str]:
         if code == 0 and active == "active":
             conflicts.append(service)
     return conflicts
+
+
+def systemd_user_unit_state(unit: str) -> str:
+    if not systemd_available():
+        return "unavailable"
+    code, state = _command(["systemctl", "--user", "is-active", unit])
+    if state:
+        return state
+    if code == 4:
+        return "unavailable"
+    if code == 3:
+        return "inactive"
+    return "unknown"
+
+
+def systemd_user_unit_enabled(unit: str) -> str:
+    if not systemd_available():
+        return "unavailable"
+    code, state = _command(["systemctl", "--user", "is-enabled", unit])
+    if state:
+        return state
+    if code == 4:
+        return "unavailable"
+    return "unknown"
 
 
 @dataclass(frozen=True)
@@ -233,6 +259,7 @@ def inspect_hardware(
     expected_product: str = "Surface Pro 7",
     expected_cpu_substring: str = "i5-1035G4",
     configured_thermal_sensor: str | None = None,
+    include_versions: bool = True,
 ) -> HardwareReport:
     product = dmi_value("product_name", sys_root) or "unknown"
     cpu = cpu_model(proc_root)
@@ -271,7 +298,7 @@ def inspect_hardware(
         if not caps[key]:
             errors.append(f"required capability missing: {key}")
 
-    td = thermald_status()
+    td = thermald_status(include_version=include_versions)
     if not td["active"]:
         errors.append("thermald is not active")
 
@@ -297,12 +324,58 @@ def inspect_hardware(
     )
 
 
+def fingerprint_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def hard_control_identity(
+    report: HardwareReport,
+    *,
+    thermal_config: dict[str, Any],
+    calibration_version: int,
+) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "product": report.product,
+        "cpu": report.cpu,
+        "bios": report.bios,
+        "kernel": report.kernel,
+        "intel_pstate": report.capabilities.get("intel_pstate"),
+        "hwp_epp": report.capabilities.get("hwp_epp"),
+        "thermal_sensor": report.thermal_sensor,
+        "thermald_version": report.thermald.get("version"),
+        "thermal_config_hash": fingerprint_hash(thermal_config),
+        "calibration_version": int(calibration_version),
+    }
+    return fingerprint_hash(payload), payload
+
+
 def system_fingerprint(report: HardwareReport) -> dict[str, Any]:
     versions: dict[str, str | None] = {}
     for binary in ("firefox", "chromium", "google-chrome", "playerctl"):
         if shutil.which(binary):
             _, output = _command([binary, "--version"])
             versions[binary] = output or None
+    if shutil.which("glxinfo"):
+        code, output = _command(["glxinfo", "-B"])
+        if code == 0:
+            mesa_line = next(
+                (
+                    line.strip()
+                    for line in output.splitlines()
+                    if "Mesa" in line
+                    and (
+                        "OpenGL version string" in line
+                        or "OpenGL core profile version string" in line
+                    )
+                ),
+                None,
+            )
+            versions["mesa"] = mesa_line
+    versions["desktop"] = (
+        os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("DESKTOP_SESSION") or None
+    )
     versions["thermald"] = report.thermald.get("version")
     return {
         "product": report.product,
@@ -313,4 +386,21 @@ def system_fingerprint(report: HardwareReport) -> dict[str, Any]:
         "hwp_epp": report.capabilities.get("hwp_epp"),
         "thermal_sensor": report.thermal_sensor,
         "versions": versions,
+    }
+
+
+def compatibility_state(report: HardwareReport) -> dict[str, Any]:
+    fingerprint = system_fingerprint(report)
+    versions = fingerprint.get("versions") or {}
+    software_versions = {
+        "kernel": fingerprint.get("kernel"),
+        **{key: value for key, value in versions.items() if key != "thermald"},
+    }
+    media_keys = {"firefox", "chromium", "google-chrome", "playerctl", "mesa"}
+    media_versions = {key: software_versions.get(key) for key in sorted(media_keys)}
+    return {
+        "system_fingerprint": fingerprint,
+        "software_versions": software_versions,
+        "media_versions": media_versions,
+        "media_compatibility_generation": f"media-{fingerprint_hash(media_versions)}",
     }

@@ -1,1537 +1,869 @@
-# Surface Pro 7 PowerLab — PLAN2：收敛式长期学习与可信证据架构
+# Surface Pro 7 PowerLab — PLAN2
 
-> 状态：下一阶段设计合同，基于已合并到 `main` 的 PowerLab v2
->
-> 目标硬件：Microsoft Surface Pro 7 / Intel Core i5-1035G4
->
-> 核心目标：在用户体验良好、系统稳定、热状态可持续的前提下，提高真实电池续航；成熟后停止主动探索，只保留低开销监控、漂移检测与重新优化能力。
->
-> 实施原则：下一阶段允许破坏式演进，不为旧运行时 SQLite 设计兜底兼容；任何新的自动学习能力都必须建立在可信测量和可审计证据之上。
+PLAN2 是 PowerLab 的正式设计合同。
 
----
+它只定义系统必须保持的语义和验收边界，不保存实时机器状态，也不记录当前实现进度。
 
-## 1. PLAN2 为什么存在
-
-PowerLab v2 已经解决了最危险的一批底层问题：
-
-- 不让 LLM 进入实时控制回路；
-- Intel HWP 负责毫秒级性能控制；
-- PowerLab 只提供较慢的 operating envelope；
-- BAT 整机功耗是主 reward；
-- Demand / Thermal Observer 不再依赖模糊的语义场景分类；
-- HWP 写入具备事务与 read-back；
-- 真实 HWP 状态会与 SQLite 状态 reconcile；
-- battery epoch、system fingerprint、calibration version 会约束证据有效性；
-- Trial 已经能做 A1/B1/A2 + A3/B2 的独立 revalidation；
-- candidate 造成的 PSI、thermal、media regression 不会被从结果里过滤；
-- LLM 只接触窄 `sp7-powerlab-agent` capability；
-- root helper 不提供任意 root shell。
-
-这些基础继续保留。
-
-PLAN2 不再讨论“如何让 AI 更聪明地自动调参数”。
-
-PLAN2 要解决的是更基础的问题：
-
-1. 我们是否真的能稳定测出 0.1W、0.2W 的差异？
-2. 某个候选到底是真赢，还是恰好遇到一个幸运窗口？
-3. 如果收益小于自然噪声，为什么还要继续实验？
-4. 历史上曾经有效的配置，在 kernel、Firefox、Mesa、电池变化以后还可信吗？
-5. PowerLab 自己的 telemetry、SQLite、process scan 和定时任务消耗多少电？
-6. 找到足够好的配置以后，系统为什么还要继续折腾用户？
-7. 如果一个固定良好配置已经达到完整 PowerLab 98% 的效果，是否应该承认复杂系统没有继续存在的必要？
-
-PLAN2 的答案是：
-
-> **PowerLab 不追求永远持续优化。它追求可信测量、有限探索、可靠收敛，以及在环境变化后重新优化的能力。**
+- 当前机器事实：运行 `sp7-powerlab agent-context`
+- 当前实现成熟度：`docs/PROJECT_STATUS.md`
+- 源码/CLI 导航：`docs/PROJECT_MAP.md`
+- Agent 行为纪律：`docs/LLM_BEHAVIOR.md`
 
 ---
 
-## 2. 顶层设计原则
+## 1. 目标与范围
 
-PLAN2 以以下七条原则作为设计合同。
+目标硬件：
 
-### 2.1 先证明测量可信
+- Microsoft Surface Pro 7
+- Intel Core i5-1035G4
+- Linux
+- intel_pstate / Intel HWP
 
-任何优化器、搜索器、LLM proposal 都不能弥补不可信的数据。
+唯一优化目标：
 
-如果系统不知道自己的自然波动是多少，就没有资格声称：
+> 在用户体验良好、系统稳定、热状态可持续的前提下，降低真实整机 BAT 放电，提高实际续航。
 
-> “这个 candidate 节省了 0.08W。”
+这不是最低 CPU 功耗目标。整机续航同时受 display、GPU、Wi-Fi、browser/media、后台进程、设备、电源管理、thermal 和 PowerLab 自身开销影响。
 
-### 2.2 先找异常功耗，再考虑降低性能
+### 使用假设
 
-优先级始终是：
+Surface Pro 7 持续高本地功耗会快速积热并可能降频。
 
-1. 异常后台活动；
-2. 硬件加速失效；
-3. runtime PM / device idle 问题；
-4. 软件或 kernel regression；
-5. 不必要的 wakeup / interrupt；
-6. 最后才是降低 CPU 性能意图。
+本项目不把持续本地重计算作为主要 workload。长编译、训练、批处理和长时间计算通常放远程服务器。
 
-一个真实的 +1W regression，通常比把 max_perf_pct 从 60 微调到 55 更有价值。
+本机重点优化：
 
-### 2.3 HWP 负责快控制，PowerLab 只给慢意图
+- 日常交互
+- 浏览/阅读
+- 轻量开发
+- 媒体
+- 远程工作
+- idle/background
+- 软件/设备异常功耗
 
-PowerLab 不实现自定义 DVFS。
+### 成功允许“更简单”
 
-不做：
+正确结果可以是：
 
-- 10ms 级频率调节；
-- 用户态替代 Intel HWP；
-- 实时 ML controller；
-- 实时 contextual bandit；
-- reinforcement learning 控制 CPU。
+- fixed-good verified envelope 已足够好；
+- dynamic controller 有价值，但高开销 monitoring 没价值；
+- dynamic controller 有明确净收益；
+- 多个 envelope 可以合并；
+- Scheduler 已没有值得继续搜索的 headroom。
 
-实时路径继续保持 deterministic。
-
-### 2.4 Evidence Engine 判断事实，LLM 无权判输赢
-
-LLM 不能：
-
-- 计算 reward；
-- 改实验通过门槛；
-- 修改 noise floor；
-- 修改 data-quality gate；
-- 宣布 WIN；
-- 宣布 promotion；
-- 把 hypothesis 写成 confirmed root cause。
-
-### 2.5 Candidate Scheduler 尽量简单
-
-第一版只做有限、离散、邻域搜索。
-
-不为了“机器学习”而引入 Bayesian Optimization。
-
-### 2.6 进入 STABLE 后停止主动实验
-
-大多数成熟运行时间应该是：
-
-`NO_CHANGE`
-
-只有发生漂移、异常或明显新机会，才重新开启优化。
-
-### 2.7 最终只认 Net Battery Benefit
-
-不是：
-
-> PowerLab 算法多聪明。
-
-而是：
-
-> PowerLab 开启以后，真实续航净收益是否足以覆盖它自己的监控开销、误判风险和维护复杂度。
+系统必须知道何时停止。
 
 ---
 
-## 3. 项目目标重新定义
+## 2. 核心架构与不变量
 
-原来的“持续优化”改为：
+主运行链：
 
-> **持续保持重新优化的能力。**
+~~~
+Telemetry
+  -> Demand / Thermal
+  -> Deterministic Controller
+  -> VERIFIED Envelope
+  -> transactional HWP
+  -> real BAT / UX / thermal outcome
+~~~
 
-PowerLab 生命周期不是无限 trial loop。
+学习链：
 
-正确模式是：
+~~~
+Telemetry / MinimalMeter
+  -> Measurement Trust
+  -> current hard evidence epoch
+  -> Frozen Reference + Recent Noise
+  -> finite Candidate Scheduler
+  -> controlled Trial
+  -> EvidenceDecision
+~~~
 
-```text
-前期认真学习
-    ↓
-找到足够好的配置
-    ↓
-冻结
-    ↓
-长期低开销监控
-    ↓
-只有 drift / incident / new opportunity
-    ↓
-重新打开优化
-```
+异常链：
 
-成熟以后 99% 时间都可能没有主动实验。
+~~~
+UnexpectedPower / Drift
+  -> Investigation
+  -> Attribution
+  -> verification
+  -> expected/no change
+     or confirmed regression/reopen
+~~~
 
-这不是失败。
+收敛链：
 
-这是系统收敛成功。
+~~~
+independent validation + real-usage coverage
+  + current Reference / Noise
+  + end-to-end Net Benefit campaign
+  -> StableReadiness
+  -> STABLE
+  -> monitor / drift / NO_CHANGE
+~~~
 
----
+### 不变量
 
-## 4. PLAN2 总体架构
+1. **BAT 整机放电是主能量证据。**
+   RAPL、CPU、PSI、GPU、process、network 是 attribution/constraint，不替代整机续航 reward。
 
-```text
-                    Linux / Intel HWP
-                   毫秒级硬件性能控制
-                           ▲
-                           │
-                 Deterministic Controller
-                           │
-                   VERIFIED ENVELOPE
-                           │
-          ┌────────────────┴────────────────┐
-          │                                 │
-  Demand / Thermal                  Unexpected Power
-     Observers                         Detector
-          │                                 │
-          └────────────────┬────────────────┘
-                           ▼
-                  Trusted Measurements
-                           │
-              ┌────────────┴────────────┐
-              ▼                         ▼
-       Evidence Engine              Attribution
-              │                         │
-     WIN / LOSE / EQUIV                LLM
-       / INCONCLUSIVE              Researcher
-              │                    hypothesis
-              ▼
-      Candidate Scheduler
-      simple discrete search
-              │
-              ▼
-          Trial Engine
+2. **快控制与慢控制分离。**
+   Linux scheduler / HWP 负责瞬时 DVFS；PowerLab 只表达 EPP、max_perf_pct、Turbo、named envelope 等慢意图。
 
-                 Lifecycle Manager
- READ_ONLY / CALIBRATING / OBSERVING / OPTIMIZING
-              / VALIDATING / STABLE
-```
+3. **Safety 独立于学习。**
+   validated thermal safety、transaction/read-back/rollback、battery/suspend/ownership gate 不能因为 AI/Scheduler 想继续实验而关闭。
 
-关键变化：
+4. **Active trial 不能移动裁判线。**
+   不得为了当前 candidate 临时放宽 data-quality、noise、MUE、evidence budget 或 UX/thermal/media veto。
 
-- `Evidence Engine` 和 `Candidate Scheduler` 分离；
-- `Waste Detector` 改成 `Unexpected Power Detector`；
-- 新增 `Lifecycle Manager`；
-- 新增 empirical noise model；
-- 新增 data-quality gate；
-- 新增 monitoring overhead / net benefit；
-- LLM 从“optimizer”彻底降级为 researcher。
+5. **Candidate 造成的坏结果必须保留。**
+   thermal pressure、PSI、media discontinuity、stability、用户卡顿都是真实 outcome，不能作为“不再 comparable”被过滤。
+
+6. **AI 不进入实时控制主链。**
+   AI 可以调查、解释、设计实验、修改代码/配置和维护 Git，但不做每 10 秒 DVFS 微调。
+
+7. **同名对象不是证据身份。**
+   battery/evidence epoch、compatibility generation、envelope content hash、trial evidence scope、
+   runtime policy fingerprint 和 Net Benefit campaign 都是不同的兼容边界；不能因为名称相同就继承历史证据。
 
 ---
 
-## 5. 现有 v2 中继续保留的部分
+## 3. Measurement Trust、Calibration 与 Noise
 
-PLAN2 不推倒以下模块。
+### 3.1 Measurement Trust
 
-### 5.1 Telemetry
+在优化之前先证明测量可信。
 
-继续采集：
+至少覆盖：
 
-- BAT status；
-- BAT power；
-- energy_now；
-- energy_full；
-- battery epoch；
-- CPU utilization；
-- PSI；
-- load；
-- EPP；
-- max_perf_pct；
-- Turbo；
-- package temperature；
-- thermal slope；
-- RAPL；
-- brightness；
-- network；
-- GPU hints；
-- media state；
-- active/idle；
-- process attribution；
-- system/software fingerprint。
+- BAT power integration
+- battery energy delta
+- power_now / energy_now cadence
+- gauge quantization
+- suspend/gap handling
+- charging/discharging handling
+- integration-vs-energy consistency
+- minimum useful arm duration
 
-### 5.2 Deterministic Controller
+仅有效 Discharging 区间进入 reward。
 
-Controller 继续保持“无聊”。
+无效区间包括：
 
-示意：
+- Charging / AC
+- suspend gap
+- resume grace
+- 缺失或异常样本
+- 超过 max gap
 
-```text
-idle
-→ ECO_IDLE
+`energy_now` endpoint delta 用于一致性检查。短窗口因 gauge 量化不变化时，不制造虚假精度。
 
-remote + low local compute
-→ REMOTE_EFFICIENT
+长时间 Stage A 观察可以包含 Charging、suspend/resume 或采样 gap，但这些边界必须把数据切成
+独立的 contiguous valid-discharge window。每个达到 gauge/config 最小时长的 window 单独比较：
 
-media
-→ MEDIA_EFFICIENT
+~~~
+integral(power_now)  vs  energy_now(first) - energy_now(last)
+~~~
 
-normal interactive
-→ INTERACTIVE_EFFICIENT
+不能因为全局 observation 被打断、全局 endpoint delta 不可用，就只累计多个短 Discharging
+片段的 valid seconds 后宣布 Measurement Trust READY。READY 至少要求配置数量的可检查 window，
+且已检查 window 不得出现 consistency mismatch。
 
-thermal pressure
-→ THERMAL_SAFE
-```
+Measurement Trust 输出：
 
-它不学习。
+- READY
+- BLOCKED
 
-它只应用已经 VERIFIED 的 envelope。
+Scheduler 在 BLOCKED 时不探索。
 
-### 5.3 Thermal safety
+### 3.2 新 battery epoch 顺序
 
-`thermald` 继续是独立安全层。
+新电池或新 battery epoch：
 
-PowerLab ThermalObserver 继续用于：
+~~~
+battery epoch
+  -> preliminary Measurement Trust
+  -> calibration
+  -> new/current hard evidence epoch
+  -> Measurement Trust again
+  -> verified baseline
+  -> natural reference/noise
+~~~
 
-- 观测；
-- 实验约束；
-- heat-soak 检测；
-- trial preemption；
-- cooldown / washout 判断。
+旧坏电池数据不能直接与新电池 evidence 合并。
 
-### 5.4 HWP transaction
+### 3.3 Calibration
 
-继续只允许受审查的有限 HWP 参数。
+阶段：
 
-不开放任意 sysfs path。
+- cold_idle
+- normal_interactive
+- media
+- bounded_burst
 
-### 5.5 Battery Epoch / Fingerprint
+Calibration 只使用有效 Discharging 数据。
 
-继续禁止把：
+bounded_burst 用于短时 thermal inertia / RAPL / throttling 观察，不是 sustained benchmark。
 
-- 旧电池；
-- 新电池；
-- 大 kernel 变化；
-- BIOS 变化；
-- thermal sensor 变化；
-- calibration 变化
+### 3.4 Frozen Reference 与 Recent Noise
 
-混成一个长期“永久真理”。
+必须同时维护两类基线：
 
-### 5.6 Narrow LLM capability
+**FrozenReferenceBaseline**
 
-继续禁止把：
+回答：
 
-- 任意 Bash；
-- 任意 Python/code execution；
-- 主 `sp7-powerlab` CLI；
-- root helper socket
+> 和当前 hard epoch 刚稳定时相比，是否发生长期退化？
 
-暴露给 LLM。
+建立后默认冻结，不能随 recent power 变高自动漂移。
 
----
+**RecentNoiseDistribution**
 
-## 6. Trusted Measurements
+回答：
 
-PLAN2 的第一优先级不是 Scheduler，而是可信测量。
+> 最近自然波动有多大？
 
-任何实验结论之前必须先经过：
+用于 MUE、drift 和 experiment budget，可维护例如 24h / 7d / 30d。
 
-`Measurement Quality Gate`
+自然 Frozen Reference / Recent Noise 的输入必须比普通 usage telemetry 更干净：整个 rollup 内
+power source 保持 Discharging、没有 resume grace、没有超限 sample gap、battery/evidence epoch
+单一，并达到 minimum valid-discharge fraction。被 Charging/resume/gap 切碎的 transitional
+rollup 可以保留作普通 telemetry，但不能作为一个完整 reference/noise observation。
 
----
+sample 产生时必须同时冻结 `current_envelope` 和 `current_envelope_content_hash`。同一分钟内 envelope
+name 或 content hash 任一发生变化，rollup 都不能进入 reference/noise。Reference/Noise identity 必须
+包含 envelope content hash；同名 envelope promotion 后的新 revision 不得继承旧 revision 的 Frozen
+Reference 或 RecentNoiseDistribution。Evidence 层还必须独立确认 DB 中该 envelope 仍为 VERIFIED，
+且当前 DB content hash 与 rollup 中冻结的 hash 完全一致，否则 fail-closed。
 
-## 7. BAT reward 不再只是平均 power_now
+### 3.5 避免 bucket explosion
 
-实验层同时维护两个能量估计。
+个人单机数据只使用少量主分层，例如：
 
-### 7.1 BAT power integration
+- hard evidence epoch
+- effective envelope
+- active/idle
+- media/non-media
+- remote/local
 
-对有效放电窗口：
+自然 Frozen Reference / Recent Noise 必须按稳定的 brightness bucket 隔离，因为屏幕功耗可能大于 CPU candidate effect。
+trial 自身仍把 brightness 当 comparison constraint，而不是把所有连续变量都加入 hard trial strata。
+thermal start、network/workload、data quality、compatibility 等继续优先作为 comparison constraints/covariates，避免笛卡尔积 bucket。
 
-```text
-E_integrated
-=
-∫ P_battery(t) dt
-```
+### 3.6 Minimum Useful Effect
 
-必须：
+概念上：
 
-- gap-aware；
-- 只统计 Discharging；
-- 不跨 suspend；
-- 不跨 AC / Charging；
-- 保留时间权重；
-- 不把缺失样本插值成真实数据。
+~~~
+MUE = max(practical threshold, empirical noise requirement)
+~~~
 
-### 7.2 Battery energy delta
-
-同时记录：
-
-```text
-E_delta
-=
-energy_now(start)
--
-energy_now(end)
-```
-
-### 7.3 两者的定位
-
-它们不是两台独立仪器。
-
-很可能都来自同一 battery gauge / EC。
-
-因此它们用于：
-
-> consistency check
-
-不是：
-
-> 两个独立投票。
-
-### 7.4 Data-quality gate
-
-例如：
-
-```text
-integrated = 0.82 Wh
-energy delta = 0.79 Wh
-```
-
-可接受。
-
-如果：
-
-```text
-integrated = 0.82 Wh
-energy delta = 0.41 Wh
-```
-
-该 episode：
-
-```text
-DATA_QUALITY_FAILURE
-```
-
-不能进入 WIN / LOSE 判定。
-
-具体容忍度不能先拍脑袋写死，应在 Stage A 真机 burn-in 后确定。
-
----
-
-## 8. Empirical Noise Floor
-
-固定：
-
-```text
-min_power_saving_w = 0.10
-```
-
-不再作为最终科学依据。
-
-### 8.1 Noise baseline 来源
-
-在 VERIFIED envelope 自然运行时收集重复窗口。
-
-匹配至少包括：
-
-- battery epoch；
-- system fingerprint；
-- envelope revision；
-- brightness bucket；
-- demand region；
-- active / idle；
-- media state；
-- remote / local；
-- thermal start state；
-- power source；
-- data-quality status。
-
-### 8.2 Noise 不是单一全局数字
-
-不同 envelope / demand 应有不同 noise model。
-
-例如：
-
-```text
-INTERACTIVE_EFFICIENT / active / local
-noise = N1
-
-REMOTE_EFFICIENT / active / remote
-noise = N2
-
-MEDIA_EFFICIENT / media
-noise = N3
-```
-
-### 8.3 第一版统计量
-
-第一版不追求复杂概率模型。
-
-至少保存：
-
-- median；
-- MAD；
-- P25 / P75；
-- P10 / P90；
-- episode-to-episode delta；
-- valid duration；
-- sample count；
-- data-quality rejection rate。
-
-优先使用 robust statistics。
-
-### 8.4 Minimum Useful Effect
-
-```text
-minimum_useful_effect
-=
-max(
-    empirical_noise_floor,
-    practical_value_threshold
-)
-```
-
-其中：
-
-- empirical noise：机器真实自然波动；
-- practical threshold：即使真实存在，也必须“大到值得折腾”。
-
-不能只靠统计显著。
-
-还要考虑工程价值。
-
----
-
-## 9. Practical Value Threshold
-
-一个 candidate 即使真实省：
-
-`0.04W`
-
-也未必值得继续证明。
-
-需要把收益换算到真实使用。
-
-例如：
-
-```text
-0.06W × 8h = 0.48Wh/day
-```
-
-如果为了证明这 0.06W：
-
-- 要几周实验；
-- 会不断切配置；
-- 有 UX 风险；
-- 增加监控成本；
-
-那么正确结论应是：
+收益长期小于 MUE 时：
 
 `PRACTICALLY_EQUIVALENT`
 
-而不是无限：
+是正式、正常的结论。
 
-`NEED_MORE_DATA`
+minimum arm duration 同时受到：
 
----
+- configured minimum
+- gauge resolution
+- empirical noise
+- experiment budget
 
-## 10. Evidence Engine
-
-Evidence Engine 是 PLAN2 的核心裁判。
-
-它不负责选择下一个参数。
-
-只负责回答：
-
-> 当前证据是否足以说明 candidate 值得替换 baseline？
-
-### 10.1 输入
-
-- Trial episodes；
-- BAT integrated energy；
-- energy_now delta；
-- noise model；
-- PSI；
-- thermal；
-- media continuity；
-- brightness；
-- workload matching；
-- 用户反馈；
-- data-quality；
-- battery epoch；
-- system/software fingerprint；
-- trial interruption / carryover 信息。
-
-### 10.2 输出
-
-正式状态：
-
-```text
-WIN
-LOSE
-INCONCLUSIVE
-PRACTICALLY_EQUIVALENT
-```
-
-另有前置失败状态：
-
-```text
-DATA_QUALITY_FAILURE
-INVALID_COMPARISON
-```
-
-### 10.3 用户负面反馈
-
-```text
-sluggish
-bad
-unstable
-```
-
-继续保持 hard veto。
-
-不与 0.5W 节省做数学加权。
-
-用户明确觉得体验差：
-
-> candidate 失败。
-
-### 10.4 Evidence Engine 不可被 LLM 修改
-
-以下参数只能来自：
-
-- 本地代码；
-- 受版本控制的配置；
-- 真机 calibration；
-- noise model。
-
-LLM proposal 无权覆盖。
+约束。
 
 ---
 
-## 11. Evidence Episode
+## 4. Evidence 与 Trial Contract
 
-Evidence Engine 不把单个 10 秒 sample 当独立证据。
+### 4.1 三层数据语义
 
-基本单位是：
+**ArmMeasurement**
 
-`episode`
+一个连续 baseline/candidate arm 的真实测量，至少保留：
 
-每个 episode 包含：
+- start/end
+- valid duration
+- integrated BAT Wh
+- energy delta / consistency
+- PSI
+- thermal
+- media
+- workload/comparison constraints
+- data quality
+- interruption reason
 
-- baseline arm；
-- candidate arm；
-- washout / settling；
-- matching context；
-- aggregate BAT energy；
-- outcome constraints；
-- data-quality；
-- interruption reason。
+**CrossoverEpisode**
 
----
+一组能产生 paired effect 的 arm。
 
-## 12. Initial crossover 与独立 revalidation
+Initial：
 
-现有正确结构继续保留，并正式写入合同。
+~~~
+A1 + B1 + A2
+~~~
 
-### Initial
+Revalidation：
 
-```text
+~~~
+A3 + B2
+~~~
+
+统一符号：
+
+~~~
+paired_effect_w < 0
+=> candidate saves power
+~~~
+
+**EvidenceDecision**
+
+对 compatible crossover evidence 做最终判定。
+
+输出只有：
+
+- WIN
+- LOSE
+- PRACTICALLY_EQUIVALENT
+- INCONCLUSIVE
+
+单独 arm 不叫 episode。
+
+### 4.2 Initial 与独立 Revalidation
+
+Initial：
+
+~~~
 A1 baseline
-   ↓
 B1 candidate
-   ↓
 A2 baseline
-   ↓
-initial evaluation
-```
+~~~
 
-### Revalidation
+B1 需要形成 provisional improvement。
 
-只有 initial WIN 后：
+随后重新采：
 
-```text
-等待新的 comparable window
-   ↓
+~~~
 A3 fresh baseline
-   ↓
 B2 candidate
-   ↓
-revalidation evaluation
-```
+~~~
 
-要求：
+B2 必须独立再次达到当前 MUE。
 
-- B1 不进入 B2 判分；
-- A2 不作为 B2 的旧 baseline；
-- revalidation 必须使用新的 A3；
-- B2 只与同一轮 A3 比。
+禁止：
 
----
+~~~
+B1 大胜 + B2 无收益
+=> 平均后 promotion
+~~~
 
-## 13. Evidence 数量不能“结果越漂亮越立即宣布胜利”
+### 4.3 Evidence Decision
 
-禁止实现：
+WIN 至少需要：
 
-```text
-第一次 -0.9W
-→ 看起来很强
-→ 立即 promotion
-```
+- paired effect 达到负向 MUE
+- 足够独立 crossover
+- 方向一致
+- data quality 合格
+- 无 UX/thermal/media hard veto
 
-这会产生提前停止偏差。
+LOSE 包括：
 
-### 13.1 第一版简单规则
+- candidate 明显更耗电
+- UX hard veto
+- thermal hard veto
+- media/stability hard veto
 
-不使用复杂 sequential statistics。
+PRACTICALLY_EQUIVALENT：
 
-大效果：
+- evidence budget 已足够
+- effect 大部分落在 MUE 内
 
-- 至少 2 个独立 crossover / revalidation episode；
-- 全部 data-quality 通过；
-- 无 UX veto；
-- effect 大于 noise floor 与 practical threshold。
+INCONCLUSIVE：
 
-中等效果：
+- data quality 不足
+- evidence 数量不足
+- effect 方向不稳定
+- comparison 无法成立
 
-- 需要更多独立 episode；
-- 初步目标 3–4 个；
-- 真机 burn-in 后再确定。
+Data-quality failure 不自动算 LOSE。
 
-很小效果：
+### 4.4 Evidence Budget
 
-```text
-PRACTICALLY_EQUIVALENT
-```
+效果越接近 MUE，需要越多独立 evidence。
 
-停止。
+大且稳定的收益可以更快结束；中等效果需要更多 crossover。
 
-### 13.2 证据预算
+必须有最大预算，不能无限追求统计确定性。
 
-每个 candidate 必须有最大实验预算。
+### 4.5 Comparability
 
-达到预算仍不能判：
+外生条件改变可暂停/中止当前 crossover，例如：
 
-```text
-INCONCLUSIVE
-```
+- 用户主动换 workload
+- brightness 明显改变
+- suspend/resume
+- power source 变化
+- 数据缺口
 
-然后停止主动测试。
+离开可比窗口时：
 
-不能无限消耗用户体验。
+- 停止 candidate
+- 恢复 baseline
+- 返回等待或 abort
 
----
+不能让 candidate 长期留在机器上等未来“凑够数据”。
 
-## 14. Carryover 与状态型 Washout
+### 4.6 Washout / Carryover
 
-SP7 是被动散热设备。
+Surface Pro 7 thermal carryover 明显。
 
-相邻 A/B arm 不独立。
+Washout 使用：
 
-主要 carryover：
+> minimum time + experiment-local state convergence + maximum timeout
 
-- package temperature；
-- chassis heat soak；
-- RAPL rolling average；
-- CPU backlog；
-- cache / browser work；
-- network transfer backlog。
+至少考虑：
 
-因此不能只写：
+- HWP read-back
+- thermal slope
+- short-window RAPL
+- CPU/IO PSI
+- backlog
 
-```text
-sleep 60s
-→ MEASURING
-```
+arm 切换后重置 experiment-local rolling buffers。
 
----
+300s 等长窗口可用于 heat-soak/trend，但不能直接决定短 arm washout。
 
-## 15. Washout 采用“最短时间 + 状态收敛 + 最大超时”
+### 4.7 用户体验
 
-正确逻辑：
+用户负面反馈是有效反证。
 
-```text
-SETTLING
-   ↓
-minimum settle time satisfied
-AND
-HWP read-back correct
-AND
-thermal state acceptable
-AND
-thermal slope stable
-AND
-RAPL rolling state stable
-AND
-CPU/IO PSI/backlog acceptable
-   ↓
-MEASURING
-```
-
-同时必须有：
-
-`maximum washout timeout`
-
-如果长期无法稳定：
-
-- 恢复 baseline；
-- 返回 WAITING；
-- 或 episode abort。
-
-不能把 candidate 长期留在机器上等待“以后总会稳定”。
+`sluggish / bad / unstable` 可以否决 candidate，即使 BAT 更低。
 
 ---
 
-## 16. Candidate 造成的结果必须保留
+## 5. Evidence Epoch 与 Compatibility
 
-重要区分：
+不存在跨所有硬件/软件版本永久有效的“最佳配置”。
 
-### 外生 workload change
+### 5.1 Hard Evidence Epoch
+
+以下变化应创建新 hard epoch：
+
+- battery replacement / battery epoch
+- kernel / linux-surface / CPU power-driver relevant change
+- CPU power driver / HWP control semantics
+- 重要 BIOS/firmware power behavior
+- validated thermal safety provider 语义
+- thermal sensor identity
+- calibration semantics 不兼容变化
+- Controller/Evidence 核心语义不兼容变化
+
+旧 hard epoch evidence 不直接用于当前 promotion。
+
+Active trial 必须固定其启动时的 hard evidence epoch。hard epoch 一旦在 trial
+期间变化，整次 trial 必须 rollback/终止；旧 arm 不得暂停后在新 epoch 中继续，
+也不得在 evaluation 时重新标记成新 epoch evidence。
+
+已经完成但尚未 promotion 的 winner 同样受此约束：只有 trial 的固定 hard
+evidence epoch 仍是 current epoch，且当前 Measurement Trust 仍与该 epoch 匹配，
+才允许 promotion；否则必须重新验证。
+
+### 5.2 Compatibility Tags
+
+不是所有软件变化都需要 hard epoch。当前保守规则：
+
+- kernel/linux-surface/CPU power-driver relevant change：hard epoch
+- browser major / Mesa / media backend：media compatibility generation
+- desktop 等低影响版本：记录为 advisory，除非真实数据证明需要隔离
+- workload family：进入 evidence scope / comparison constraints
+
+每类 evidence 可声明：
+
+- required-compatible
+- advisory
+- irrelevant
+
+Firefox major upgrade 不应让 ECO_IDLE 历史整体失效，但旧 media reference/noise/trial evidence
+不能继续与新 media generation 混投。
+
+### 5.3 Evidence Scope
+
+candidate 的 HWP content hash 只回答“参数内容是否相同”，不能单独作为因果 evidence identity。
+
+所有 crossover accumulation、EvidenceDecision、CandidateFrontier 和 retry budget 必须按：
+
+~~~
+evidence_scope_key = hash(
+    hard evidence epoch,
+    relevant compatibility generation,
+    baseline content hash,
+    reference/workload strata key,
+    candidate content hash
+)
+~~~
+
+聚合。
+
+因此相同 `max_perf_pct=50` 如果来自不同 baseline、不同 workload/reference stratum 或不同
+compatibility generation，必须是不同实验问题。允许保留相同 candidate content hash 作为“参数内容相同”
+的知识，但它们的 WIN/LOSE、attempts、frontier 状态不能互相覆盖或累加。
+
+### 5.4 Historical Evidence
+
+旧证据可以用于：
+
+- prior
+- regression investigation
+- search direction
+- historical comparison
+
+不能简单当当前 epoch 票数累加。
+
+---
+
+## 6. Control Safety、Lifecycle 与 STABLE
+
+三个状态正交。
+
+### 6.1 Control Safety
+
+状态：
+
+- CONTROL_ALLOWED
+- READ_ONLY
+- DEGRADED
+- EMERGENCY
+
+回答：
+
+> 当前允许什么控制动作？
+
+validated thermal safety provider 失效时，可以只让 Control 进入 READ_ONLY，而不重置 Learning。
+
+### 6.2 Learning Lifecycle
+
+状态：
+
+- CALIBRATING
+- BASELINE_OBSERVATION
+- COARSE_OPTIMIZATION
+- VALIDATING
+- STABLE
+- REOPENED
+
+回答：
+
+> 当前应该积累什么 evidence，Scheduler 是否应该工作？
+
+### 6.3 Investigation
+
+状态：
+
+- IDLE
+- INVESTIGATING
 
 例如：
 
-- 用户开始视频；
-- 亮度明显改变；
-- suspend；
-- AC 接入；
-- remote session 新开始；
-- battery epoch 变化。
+~~~
+Control = CONTROL_ALLOWED
+Learning = STABLE
+Investigation = INVESTIGATING
+~~~
 
-这些应暂停 / abort episode。
+此时可以继续使用 verified envelope，但 Scheduler 不应因为一次异常直接搜索。
 
-### Candidate-caused outcome
+### 6.4 STABLE
 
-例如：
+STABLE 是正常目标状态。
 
-- PSI 上升；
-- thermal pressure 增加；
-- CPU busy 时间拉长；
-- media continuity 下降；
-- latency proxy 恶化；
-- demand 数值因性能限制而改变。
+STABLE 下：
 
-这些不能过滤。
+- selected=Dynamic 时 Controller / main service / core telemetry / drift / UnexpectedPower 继续
+- selected=Fixed-good 时 main service 可以保持停止，实际 HWP 固定在 verified envelope
+- fixed-good 的状态检查、diagnostic / attribution 按需运行
+- 不部署 scheduled review timer；review pack 按需生成
+- Scheduler 默认睡眠
+- 不主动 trial
+- AI 最常见结论应是 NO_CHANGE
 
-它们就是 candidate 的结果。
+进入 STABLE 不要求每个理论 demand 都有独立最优 envelope。
 
----
+核心标准是：
 
-## 17. Workload 并不真正完全相同
+> 最近代表性真实使用时间的大多数已经有可信 verified policy coverage。
 
-真实交互设备中：
+这里的 trusted coverage 必须来自 `reference_eligible=true` 的 clean rollup。Charging/resume/gap 等
+transitional rollup 的 valid seconds 仍属于真实 usage 分母，但只能计为 uncovered/untrusted，不能因为
+同一 stratum 已经存在 Frozen Reference 就被重新称为 trusted。
 
-```text
-max_perf 60
-网页完成 300ms
+`target_trusted_fraction` 不能脱离 denominator floor 单独使用。STABLE 还必须至少满足配置中的：
 
-max_perf 45
-网页完成 450ms
-```
+- minimum total valid usage seconds
+- minimum total trusted usage seconds
+- minimum distinct usage days
+- minimum observation span days
 
-用户后续行为自然不同。
+`coverage_days` 只定义 lookback window，不表示系统已经实际观察了这么久。目标是要求足量真实使用，
+并且这些使用分散在足够长的时间范围内，而不是机械等待完整自然月。
 
-因此 PowerLab 不能假装这是实验室 benchmark。
+如果 Stage E 最终选择 FIXED_GOOD，并且系统是通过完整 readiness 正常进入 STABLE，则 freeze 时保存
+entry coverage snapshot。只要 evidence epoch、selected policy fingerprint 和 actual FIXED_GOOD mode 都未变，
+后续 rolling coverage 自然过期不单独使 STABLE 失效；否则 fixed-good 会因为“必须持续采样才能证明不采样”
+而被迫重新引入常驻 observer。任何 identity/mode 变化仍按正常 readiness/reopen 规则处理。
 
-Evidence Engine 只能做：
+还需要：
 
-> 尽可能可比的 N-of-1 工程证据。
+- Measurement Trust READY
+- reference/noise 可用
+- 无 active trial
+- 无 unresolved investigation/UnexpectedPower
+- 无针对当前 selected policy 的未解决严重负面反馈
+- Net Benefit 已评估
 
-不能声称：
+稀有 workload 可以 fallback 到安全 verified envelope。
 
-> 完全相同 workload 的严格因果实验。
+### 6.5 Reopen
 
-这也是保留人工 UX feedback 的原因。
+允许 reopen 的条件：
 
----
+- 新 hard evidence epoch
+- relevant compatibility change
+- confirmed configuration regression
+- verified envelope 被 BLOCKED
+- 明确的新高价值控制假设
+- 用户体验投诉且 evidence 指向当前 envelope
 
-## 18. Evidence Epoch 与历史衰减
-
-不存在“全生命周期永久最优配置”。
-
-只有：
-
-> 当前 evidence epoch 下的最佳 verified 配置。
-
-### 18.1 Evidence Epoch 至少受这些因素影响
-
-- battery epoch；
-- kernel；
-- BIOS；
-- linux-surface；
-- thermald；
-- thermal config；
-- Firefox / Chromium major version；
-- Mesa；
-- firmware；
-- calibration version；
-- thermal sensor path。
-
-### 18.2 三层证据
-
-```text
-current_epoch_evidence
-recent_compatible_evidence
-historical_evidence
-```
-
-### 18.3 Promotion
-
-主要依赖：
-
-`current_epoch_evidence`
-
-recent evidence 可以辅助。
-
-historical evidence 只作为：
-
-> 以前它曾经好用。
-
-不能当：
-
-> 过去赢了 20 次，所以今天有 20 票。
+UnexpectedPower 本身不是 reopen 条件。
 
 ---
 
-## 19. Drift Detection
+## 7. Candidate Scheduler
 
-系统必须同时支持：
+Scheduler 是有限搜索器，不是永久优化器。
 
-### 19.1 突发异常
+### 7.1 默认搜索空间
 
-例如：
+第一版只允许可解释的离散邻域：
 
-`+1.5W overnight`
+- max_perf_pct 小步
+- named EPP
+- Turbo on/off
+- named envelope
 
-### 19.2 慢性退化
+没有真实 headroom 证据前，不开放：
 
-例如：
+- EPP 0–255 连续搜索
+- arbitrary sysfs tuning
+- Bayesian Optimization
+- RL / neural policy
 
-```text
-4.80
-4.90
-5.00
-5.05
-5.10
-5.20
-```
+### 7.2 搜索方向
 
-没有一天构成巨大 incident。
+UX 正常：
 
-但 30–60 天已经有明显变化。
+优先 lower-energy neighbors。
 
-因此 drift detector 至少维护：
+只有以下情况优先提高性能：
 
-- 24h；
-- 7d；
-- 30d；
-- current epoch baseline；
-- rolling median；
-- robust slope。
+- 用户报告 sluggish
+- PSI/latency 显示 envelope 过紧
+- evidence 支持 race-to-idle 可降低整机能耗
 
----
+另外允许在 local compute pressure 明确为 MODERATE 时做有限、低风险的 race-to-idle probe，
+用于产生这类 evidence；LOW/idle 场景不默认向更高性能方向探索。
 
-## 20. Waste Detector 改成 Unexpected Power Detector
+### 7.3 Eligibility
 
-“功耗高于历史”不等于 waste。
+至少检查：
 
-所以 PLAN2 不再使用：
+- Automation Level
+- Learning lifecycle
+- ControlSafetyState
+- active trial/calibration
+- active investigation
+- Measurement Trust
+- verified baseline
+- hard evidence epoch
+- noise baseline
+- CPU/headroom signal
+- low battery
+- thermal cooldown
+- negative-feedback cooldown
+- daily/weekly experiment budget
+- minimum arm duration 是否超预算
+- evidence scope 尚未被当前 baseline/workload/compatibility 组合尝试完
 
-`WasteDetector`
+### 7.4 Candidate priority
 
-作为事实名称。
+不使用伪精确复杂加权分数。
 
-改为：
+使用可审计顺序：
 
-`UnexpectedPowerDetector`
+~~~
+measurement confidence
+  -> practical saving potential
+  -> UX/thermal risk
+  -> lifecycle/safety
+  -> experiment cost
+~~~
 
-它只负责输出：
+### 7.5 Stop Rules
 
-> 这个窗口比历史相似窗口高，值得调查。
+停止探索，当：
 
----
-
-## 21. Unexpected Power Event 分类
-
-第一层事件：
-
-`UNEXPECTED_POWER`
-
-经过 Attribution 后才可能变成：
-
-```text
-EXPECTED_WORKLOAD_CHANGE
-INSUFFICIENT_EVIDENCE
-SUSPECTED_REGRESSION
-ACTIONABLE_WASTE
-```
-
-只有证据真正支持以后才能称：
-
-`ACTIONABLE_WASTE`
-
----
-
-## 22. Attribution
-
-Attribution 的职责是解释：
-
-> 多出来的 W 大概率来自哪里？
-
-输入可以包括：
-
-- BAT delta；
-- RAPL delta；
-- GPU activity；
-- media decode hint；
-- process CPU；
-- process IO；
-- network；
-- interrupts / wakeups；
-- runtime PM；
-- software fingerprint；
-- recent package upgrades。
-
-第一版优先做 deterministic attribution。
-
-例如：
-
-```text
-BAT +1.3W
-RAPL +1.1W
-Firefox content CPU high
-GPU decode low
-MPRIS playing
-```
-
-可以产生：
-
-`SUSPECTED_MEDIA_DECODE_REGRESSION`
-
-不能直接产生：
-
-`CONFIRMED_FIREFOX_BUG`
+- 没有 untried eligible neighbor
+- effect 小于 MUE
+- noise 使实验不经济
+- minimum arm 超预算
+- retry budget 用尽
+- 用户负面反馈 cooldown
+- thermal cooldown
+- battery 太低
+- STABLE
+- active investigation
+- end-to-end Net Benefit 已不值得继续增加复杂度
 
 ---
 
-## 23. LLM Researcher
+## 8. UnexpectedPower、Drift 与 Attribution
 
-LLM 的最终职责是：
+### 8.1 UnexpectedPower
 
-- 解释异常；
-- 汇总长期趋势；
-- 阅读外部资料；
-- 关联软件版本；
-- 提出验证假设；
-- 建议新增搜索维度；
-- 总结用户长期历史。
+只表示：
 
-LLM 不负责：
+> 实际整机 BAT 明显高于当前合理预期。
 
-- 实时控制；
-- Evidence Engine；
-- noise threshold；
-- trial pass/fail；
-- promotion；
-- root cause confirmation。
+它不自动等于 waste。
 
----
+检测到后：
 
-## 24. LLM 外部事实必须带来源
+- 建立 Investigation
+- 触发 Diagnostic Burst
+- 不直接降低 CPU
+- 不直接唤醒 Scheduler
 
-如果 Researcher 提出：
+### 8.2 Drift
 
-> “Firefox 某版本存在 VA-API regression。”
+慢性 drift 同时看：
 
-actionable proposal 必须带：
+- FrozenReferenceBaseline
+- recent windows
+- robust slope
 
-- release note；
-- bug tracker；
-- GitHub / GitLab issue；
-- upstream discussion；
-- 其他可核查来源。
+Frozen reference 不随 recent distribution 自动漂移。
 
-没有来源时只能保存为：
+### 8.3 Investigation 分类
 
-`UNVERIFIED_HYPOTHESIS`
+允许：
 
----
+- EXPECTED_WORKLOAD_CHANGE
+- INSUFFICIENT_EVIDENCE
+- SUSPECTED_REGRESSION
+- ACTIONABLE_WASTE
+- CONFIRMED_CONFIG_REGRESSION
 
-## 25. LLM cadence 改为双轨
+只有 confirmed configuration regression 或明确的新控制假设才允许 reopen optimization。
 
-### 25.1 每小时本地运行
+### 8.4 Attribution
 
-不需要 LLM。
+优先检查：
 
-运行：
+- top processes
+- RAPL
+- browser/media decode
+- GPU
+- network
+- device/runtime PM
+- wakeups
+- compatibility changes
+- thermal
 
-- summarizer；
-- noise estimator；
-- drift detector；
-- UnexpectedPowerDetector；
-- Evidence Engine；
-- lifecycle update。
+本机 causal hypothesis 可以由 local evidence 直接提出，但必须有 verification plan。
 
-### 25.2 Event-triggered LLM
-
-发生以下事件可以立即调用 Researcher：
-
-- significant power regression；
-- thermal anomaly；
-- trial result；
-- fingerprint change；
-- unexpected process；
-- media regression；
-- repeated data-quality failure；
-- Scheduler 找不到合理 candidate。
-
-### 25.3 Scheduled slow review
-
-每日：
-
-`24h summary`
-
-每周：
-
-`7d / 30d drift review`
-
-避免完全 event-only 导致慢性退化被忽略。
+外部 factual claim 应给 upstream 可核查来源，并在本机验证相关性。
 
 ---
 
-## 26. Lifecycle Manager
+## 9. Controller、Thermal 与 Telemetry
 
-PLAN2 新增顶层生命周期。
+### 9.1 Deterministic Controller
 
-```text
-READ_ONLY
-   ↓
-CALIBRATING
-   ↓
-BASELINE_OBSERVATION
-   ↓
-COARSE_OPTIMIZATION
-   ↓
-VALIDATION
-   ↓
-STABLE
-```
+正常控制只使用 verified envelope。
 
-异常时：
+必须具备：
 
-```text
-STABLE
-   ↓
-DRIFT / INCIDENT / NEW_BATTERY /
-SYSTEM_UPDATE / USER_COMPLAINT /
-NEW_HIGH_VALUE_HYPOTHESIS
-   ↓
-REOPEN_OPTIMIZATION
-```
+- startup/runtime actual-state reconcile
+- minimum dwell
+- manual override
+- thermal preemption
+- ControlSafetyState gate
 
----
+数据库不能被当作 HWP 真实状态；重启/手工 sysfs 修改/系统事件后必须重新读实际状态。
 
-## 27. READ_ONLY
+### 9.2 HWP transaction
 
-条件：
+apply 必须是事务：
 
-- calibration 无效；
-- hardware contract 不完整；
-- thermald 不健康；
-- HWP ownership 冲突；
-- battery telemetry 不可信；
-- thermal sensor 未确认；
-- controller rollback integrity failure。
+~~~
+snapshot
+ -> apply finite parameters
+ -> read-back
+ -> success
+    or exact rollback
+~~~
 
-行为：
+rollback integrity 不可信时，Control 应升级到只读/紧急状态，而不是继续写。
 
-- 只观测；
-- 不自动写 envelope；
-- 不运行 trial；
-- 不 Scheduler。
+### 9.3 Thermal
 
----
+validated thermal safety provider 当前实现可以是 thermald，但设计不永久绑定具体进程名。
 
-## 28. CALIBRATING
+PowerLab thermal observer 用于：
 
-目标：
+- pressure state
+- trial outcome
+- heat-soak/cooldown
+- preemption
 
-建立：
+不能通过放宽热安全来让 candidate 通过。
 
-- BAT baseline；
-- thermal baseline；
-- sensor identity；
-- initial battery epoch；
-- telemetry data quality；
-- initial monitoring overhead。
-
-不能在 calibration 未完成时开始长期搜索。
-
----
-
-## 29. BASELINE_OBSERVATION
-
-这是 PLAN2 最重要的新阶段之一。
-
-持续自然使用。
-
-主要回答：
-
-1. 我的整机 BAT W 分布是什么？
-2. 不同 demand / envelope 的自然波动是多少？
-3. PowerLab 自身开销是多少？
-4. CPU package 在整机功耗里占多大比例？
-5. 哪些维度真正有优化 headroom？
-6. 有没有明显 regression 比 CPU tuning 更重要？
-
-这个阶段不急于自动搜索。
-
----
-
-## 30. COARSE_OPTIMIZATION
-
-只有当满足：
-
-- measurement trust；
-- noise model 足够；
-- headroom 足够；
-- lifecycle 允许；
-- 用户体验风险可接受；
-
-才开始。
-
-只做 coarse discrete local search。
-
----
-
-## 31. VALIDATION
-
-Scheduler 找到 candidate 后：
-
-- 独立 episode；
-- fresh baseline；
-- noise-aware Evidence Engine；
-- practical threshold；
-- user feedback；
-- data-quality gate；
-- current epoch evidence。
-
-只有明确 WIN 才 promotion。
-
----
-
-## 32. STABLE
-
-这是成熟 PowerLab 的默认状态。
-
-STABLE 中：
-
-- Controller 正常运行；
-- Telemetry 低开销运行；
-- drift detector 运行；
-- UnexpectedPowerDetector 运行；
-- noise model 缓慢更新；
-- active Scheduler 睡眠；
-- 无主动 trial；
-- LLM 不按小时机械调用；
-- 用户没有被不断实验。
-
----
-
-## 33. STABLE 的进入条件
-
-至少满足：
-
-- 每个主要 demand class 有 verified envelope；
-- 最近 Scheduler 邻域没有高价值未测试 candidate；
-- 剩余可见差异进入 noise / practical equivalence；
-- 最近没有 unresolved regression；
-- monitoring overhead 已测；
-- current system epoch 数据足够；
-- 用户没有负面反馈；
-- dynamic controller 自身有净收益或至少没有显著负收益。
-
----
-
-## 34. 重新开启 Optimization 的条件
-
-包括：
-
-- new battery epoch；
-- kernel / BIOS / Mesa / browser significant change；
-- system fingerprint change；
-- current verified envelope regression；
-- sustained drift；
-- UnexpectedPower event；
-- user complaint；
-- 新的高价值 deterministic hypothesis；
-- 新 actuator / control dimension；
-- verified envelope 被 BLOCKED；
-- monitoring overhead 大幅改变。
-
----
-
-## 35. Candidate Scheduler
-
-Scheduler 只负责：
-
-> 如果值得继续探索，下一个试谁？
-
-不负责判 winner。
-
----
-
-## 36. Candidate Space
-
-第一阶段继续使用 named EPP：
-
-- performance；
-- balance_performance；
-- balance_power；
-- power。
-
-max_perf_pct 使用离散邻域。
-
-示例：
-
-```text
-baseline:
-balance_power / 60 / turbo on
-
-neighbors:
-balance_power / 55 / on
-balance_power / 65 / on
-power         / 60 / on
-balance_performance / 60 / on
-balance_power / 60 / off
-```
-
-如果 55 真赢：
-
-下一步才允许 50。
-
-这是：
-
-`discrete local search`
-
----
-
-## 37. 暂不开放 EPP 0–255 搜索
-
-即使硬件技术上支持 numeric EPP，也不代表现在值得探索。
-
-正确顺序：
-
-```text
-named EPP
-   ↓
-证明 EPP 是高价值维度
-   ↓
-证明 coarse search 已不够
-   ↓
-才考虑 numeric refinement
-```
-
----
-
-## 38. 暂不上 Bayesian Optimization
-
-原因：
-
-- candidate space 很小；
-- 数据昂贵；
-- reward 非平稳；
-- workload 不是实验室 benchmark；
-- model 容易给出虚假的平滑结构；
-- local search 更透明；
-- 个人项目更需要可审计性。
-
-只有将来控制维度明显增加，并且 Evidence Engine 已稳定以后才重新评估 BO。
-
----
-
-## 39. Scheduler Stop Rules
-
-Scheduler 最重要的能力之一：
-
-> 知道什么时候什么都不做。
-
-停止条件：
-
-- 所有邻居都 LOSE；
-- 所有邻居 PRACTICALLY_EQUIVALENT；
-- remaining headroom 小于 minimum useful effect；
-- experiment budget exhausted；
-- 用户进入高价值工作时段；
-- monitoring overhead 接近潜在收益；
-- data-quality 长期不足。
-
-然后 lifecycle：
-
-`STABLE`
-
----
-
-## 40. Search Budget
-
-每个 envelope / epoch 都有预算。
-
-例如控制：
-
-- 每周最多多少 active trial；
-- 每个 candidate 最多多少 episode；
-- 每天最多多少分钟候选配置；
-- 负面反馈后 cooldown 多久；
-- 最近有 thermal event 时停止多久；
-- 电量低于阈值时不探索。
-
-默认应极其保守。
-
----
-
-## 41. Power Attribution 与 Headroom
-
-优化前先回答：
-
-> 我的 5W 到底花在哪里？
-
-至少估计：
-
-- whole-device BAT；
-- CPU package RAPL；
-- display-related contribution proxy；
-- GPU；
-- network；
-- platform remainder。
-
-不是要求精确拆成物理账单。
-
-而是为了判断：
-
-> 某一维最多可能省多少。
-
----
-
-## 42. Headroom Score
-
-每个优化方向先估计：
-
-```text
-potential_saving_w
-measurement_confidence
-ux_risk
-experiment_cost
-```
-
-Scheduler 优先：
-
-> 高潜力、低风险、可测量。
-
-例如：
-
-### CPU
-
-```text
-BAT = 5.0W
-RAPL = 1.0W
-```
-
-CPU tuning 理论 headroom 有限。
-
-### Media regression
-
-```text
-historical = 5.0W
-current = 6.4W
-RAPL/GPU attribution abnormal
-```
-
-优先调查 regression。
-
----
-
-## 43. Observer Effect
+### 9.4 Telemetry / Observer Effect
 
 PowerLab 自己也耗电。
 
-可能来源：
+采样分层：
 
-- 10s telemetry；
-- process scan；
-- SQLite 写入；
-- ActivityWatch；
-- GPU inspection；
-- hourly summarizer；
-- LLM pack generation；
-- systemd timers。
+**Service core（main service 运行时）**
 
-PLAN2 必须测它。
+- BAT
+- temperature
+- HWP state
+- aggregate CPU
+- drift essentials
 
----
+如果 Stage E 最终选择 fixed-good，main service 可以停止；此时不为了“维持监控”强制常驻上述采样，
+状态检查、Agent review 和 diagnostic 按需执行。只有 selected=Dynamic 时这些信号属于长期 runtime 成本。
 
-## 44. Monitoring Overhead Experiment
+**Expensive attribution**
 
-真机 Stage A 必须包含：
+STABLE 下低频：
 
-### A
+- process
+- GPU
+- device/runtime PM
+- wakeups
+- detailed network
+- ActivityWatch enrichment
 
-```text
-PowerLab OFF
-固定良好 envelope
-```
+**Trial/Calibration**
 
-### B
+提高信息密度。
 
-```text
-PowerLab ON
-同一个固定 envelope
-Scheduler OFF
-Trial OFF
-```
+**Diagnostic Burst**
 
-比较：
-
-- BAT W；
-- Wh；
-- RAPL；
-- CPU wakeups；
-- residency；
-- service CPU；
-- disk writes。
-
----
-
-## 45. Net Battery Benefit
-
-最终指标：
-
-```text
-NetSaving
-=
-GrossSaving
--
-MonitoringOverhead
-```
-
-如果：
-
-```text
-PowerLab overhead = +0.12W
-optimization gain  = -0.15W
-```
-
-净收益只有：
-
-`0.03W`
-
-这不能称为成功。
-
----
-
-## 46. Telemetry 采样应随生命周期降频
-
-STABLE 状态不应一直按实验密度采所有数据。
-
-建议未来支持：
-
-### Trial / Calibration
-
-高信息密度。
-
-### STABLE
-
-降低：
-
-- process scan 频率；
-- GPU probe 频率；
-- attribution probe；
-- DB flush；
-- LLM pack cadence。
-
-保留核心：
-
-- BAT；
-- thermal；
-- HWP state；
-- drift essentials。
+异常时短时提高 attribution，随后恢复低频。
 
 目标：
 
@@ -1539,744 +871,408 @@ STABLE 状态不应一直按实验密度采所有数据。
 
 ---
 
-## 47. Controller 本身也必须接受 A/B
+## 10. Agent 与 Automation
 
-最终要比较：
+### 10.1 Agent 角色
 
-### Baseline A
+GPT-5.6 或其他高能力 Agent 可以拥有用户提供的 Bash/workspace/MCP。
 
-```text
-thermald
-+
-一个固定良好 envelope
-```
+适合：
 
-### PowerLab B
+- 读 agent-context
+- 调查 UnexpectedPower
+- 分析长期历史
+- 查 upstream regression
+- 提出/审查实验
+- 修改用户态代码/配置
+- 写测试
+- 维护 Git
+- 判断复杂度是否值得保留
 
-```text
-deterministic controller
-+
-dynamic verified envelopes
-```
+Agent 不做实时 DVFS controller。
 
-如果长期：
+具体工作纪律见 `docs/LLM_BEHAVIOR.md`。
 
-```text
-A = 5.05W
-B = 5.00W
-```
+### 10.2 真正保留的硬边界
 
-但 B：
+- root helper 不是 root shell
+- HWP path/参数有限
+- transaction/read-back/rollback
+- validated thermal safety
+- active trial deterministic Evidence contract
 
-- 更多 wakeups；
-- 更多错误切换；
-- UX 更不稳定；
-- 维护成本更高；
+Automation Level 不是同 UID Bash Agent 的 capability sandbox。
 
-正确工程结论可以是：
+### 10.3 Automation Levels
 
-> 删除 dynamic controller。
-
----
-
-## 48. 多 Envelope 也必须允许被合并
-
-如果长期发现：
-
-```text
-INTERACTIVE_EFFICIENT
-REMOTE_EFFICIENT
-MEDIA_EFFICIENT
-```
-
-最终参数几乎一样：
-
-```text
-balance_power
-60%
-turbo on
-```
-
-应该合并为：
-
-`NORMAL_EFFICIENT`
-
-不要为了架构漂亮保留无价值概念。
-
----
-
-## 49. Thermal 研究也要有停止规则
-
-如果一个月实际使用：
-
-```text
-THERMAL_PRESSURE = 0
-THROTTLING = 0
-```
-
-那么 ThermalObserver 继续作为安全检测器即可。
-
-不要继续把主要开发资源投到热模型微调。
-
-本项目主目标仍然是：
-
-> 续航。
-
----
-
-## 50. 数据模型新增概念
-
-下一阶段 SQLite 至少需要概念上支持：
-
-### `evidence_epochs`
-
-记录：
-
-- epoch id；
-- battery epoch；
-- system fingerprint；
-- software fingerprint；
-- calibration version；
-- start / end；
-- invalidation reason。
-
-### `noise_baselines`
-
-记录：
-
-- envelope；
-- demand region；
-- brightness bucket；
-- thermal start；
-- median / MAD / IQR；
-- episode count；
-- data quality。
-
-### `evidence_episodes`
-
-记录：
-
-- trial；
-- arm；
-- baseline/candidate；
-- BAT integrated Wh；
-- battery energy delta；
-- consistency error；
-- PSI；
-- thermal；
-- media continuity；
-- UX feedback；
-- validity。
-
-### `evidence_decisions`
-
-记录：
-
-- WIN；
-- LOSE；
-- INCONCLUSIVE；
-- PRACTICALLY_EQUIVALENT；
-- reason；
-- thresholds；
-- current noise model version。
-
-### `candidate_frontier`
-
-记录：
-
-- current baseline；
-- tested neighbors；
-- rejected candidates；
-- equivalent candidates；
-- candidate budget。
-
-### `unexpected_power_events`
-
-替代含义过强的 waste incident。
-
-### `attribution_hypotheses`
-
-记录：
-
-- deterministic evidence；
-- LLM hypothesis；
-- external sources；
-- verification state。
-
-### `lifecycle_history`
-
-记录：
-
-- state；
-- transition reason；
-- timestamp。
-
-### `monitoring_overhead_runs`
-
-记录 PowerLab ON/OFF 对照。
-
----
-
-## 51. Schema / Migration 策略
-
-PLAN2 实施按破坏式演进设计。
-
-原则：
-
-- 不为 v2 runtime SQLite 写复杂迁移；
-- 新 schema version fail-fast；
-- 必要时显式 reset runtime DB；
-- Git 中的 durable config 独立保留；
-- machine-specific VERIFIED 身份不能因为 Git 文件存在就自动继承；
-- 新 Evidence Engine 上线后，旧 trial result 不自动视为新 evidence vote。
-
-如果未来已经积累大量真机数据，再单独决定是否写一次性 import 工具。
-
----
-
-## 52. CLI 规划
-
-人类 CLI 可以新增：
-
-```text
-sp7-powerlab lifecycle status
-sp7-powerlab lifecycle freeze
-sp7-powerlab lifecycle reopen
-
-sp7-powerlab evidence status
-sp7-powerlab evidence inspect <candidate>
-sp7-powerlab evidence noise
-
-sp7-powerlab scheduler status
-sp7-powerlab scheduler candidates
-sp7-powerlab scheduler pause
-sp7-powerlab scheduler resume
-
-sp7-powerlab unexpected-power list
-sp7-powerlab unexpected-power inspect <id>
-
-sp7-powerlab overhead status
-sp7-powerlab overhead compare
-```
-
-名称是设计占位，不要求完全照抄实现。
-
----
-
-## 53. Agent capability 规划
-
-LLM agent 继续保持窄接口。
-
-未来最多新增只读/提案型动作：
-
-```text
-observe
-hourly-summary
-drift-summary
-unexpected-power-context
-submit-hypothesis
-submit-research
-```
-
-不能新增：
-
-- lifecycle force transition；
-- trial start；
-- trial promote；
-- threshold edit；
-- Scheduler direct execute；
-- helper call；
-- arbitrary file / shell。
-
----
-
-## 54. Researcher 外部来源结构
-
-LLM hypothesis 若引用外部事实，必须保存结构化 source：
-
-```text
-title
-url
-source_type
-retrieved_at
-claim
-relevance
-```
-
-actionable hypothesis 至少需要一个可核查来源。
-
-没有来源：
-
-`UNVERIFIED_HYPOTHESIS`
-
----
-
-## 55. PLAN2 自动化等级建议
-
-### Level 0
+**Level 0**
 
 只读。
 
-### Level 1
+**Level 1**
 
-自动 Controller 只切 VERIFIED envelope。
+允许 deterministic controller 使用 verified envelope。
 
-### Level 2
+**Level 2**
 
-Scheduler 可以提出 candidate。
+Scheduler 可以提出 candidate，默认不自动 trial。
 
-Trial 必须人工批准。
+**Level 3**
 
-Promotion 必须人工批准。
+全部 safety/evidence/budget gate 通过后，daemon 可自动开始低风险 trial。
 
-推荐个人长期使用级别。
+**Level 4**
 
-### Level 3
+只有 `auto_promote=true` 且 trial 已是 VERIFIED_WINNER 才允许自动 promotion。
 
-允许低风险 candidate 自动开始 trial。
-
-Evidence Engine 仍完全本地确定。
-
-### Level 4
-
-允许满足严格条件的自动 promotion。
-
-只有真机长期验证以后才考虑。
-
-STABLE 状态下即使 Level 4，也默认不主动探索。
+STABLE 下即使 Level 4，也默认不主动探索。
 
 ---
 
-## 56. 实施顺序
+## 11. Net Battery Benefit 与复杂度删除
 
-不能先写 Scheduler。
+最终不能只看：
 
-正确顺序如下。
+> candidate 比 baseline 少多少 W。
+
+必须比较整个系统。
+
+正式 Stage E 只强制评估：
+
+### A. fixed-good
+
+~~~
+MinimalMeter + fixed good verified configuration
+~~~
+
+### B. dynamic controller
+
+~~~
+MinimalMeter + dynamic controller
+~~~
+
+Automation Level 2+ 的 Scheduler / Agent / autonomous trial 能力是按需学习层，不定义为必须长期常开的
+第四种 Net Benefit treatment。若未来明确决定长期运行 autonomous learning，再为那个实际 runtime mode
+单独建立新的 treatment 和验证合同。
+
+MONITORING（Level 0 + fixed HWP）只保留为按需 observer-overhead 诊断，不进入 formal StableReadiness。
+
+Net Benefit 直接来自 end-to-end paired comparison，而不是两个任意历史小时均值相减。
+
+MinimalMeter capture 的 provenance 必须在**采集开始时**固定并持久化，至少包括 run/campaign、
+capture mode、battery identity/epoch、hard evidence epoch/fingerprint、calibration version、evidence
+semantics、起始 verified envelope、media compatibility generation、runtime policy fingerprint 和 Stage E
+measurement-contract identity。该 identity 同时 hash 正式比较代码和直接决定 Stage E 有效性的 config/
+threshold 子集。比较时只能读取 capture-time provenance；
+禁止读取“当前 epoch”后给旧采集文件事后贴标签。
+
+Dynamic runtime policy fingerprint 使用**显式 allowlist**，只覆盖 Level-1 长期 runtime 真正使用的
+controller/service/telemetry/demand/thermal/HWP 以及 Level-1 hot/slow path 实际执行的
+evidence/evaluation/longterm/calibration 等代码、相关 config、VERIFIED envelope names/content hashes 和
+manual override。Scheduler/Agent search code 不应因为与 Level-1 无关而迫使重做长期 Dynamic 验证；
+runtime 确实执行的 TrialManager path 可以保守纳入。Stage E 的测量合同使用独立 contract identity，
+明确包含 `cli.py`、`minimal_meter_cli.py`、`measurement.py`、`longterm.py` 等比较路径代码以及相关合同
+config。
+
+main daemon 启动时必须冻结自己**实际加载**的 runtime code/config identity，并放进 heartbeat。正式
+DYNAMIC_CONTROLLER/MONITORING capture 重新计算当前 expected identity；heartbeat 与当前源码/config
+不一致时 fail-closed，并要求先 restart `sp7-powerlab.service`。这与 runtime policy fingerprint 是两条
+独立检查：一个证明“当前进程真在跑哪份实现”，一个定义“被验证的长期 policy 是什么”。
+
+Net Benefit 使用 gap-aware integrated BAT energy / valid discharge duration 计算 time-weighted mean
+power，但**一个正式 block 必须恰好是一段连续 Discharging observation**。block 中出现 Charging/AC、
+suspend/resume、超限 sample gap、battery epoch change 或 evidence epoch change 时，整个 block
+`DATA_QUALITY_FAILURE`；不能过滤无效段后把多个 discharge segment 重新拼成一个有效 block。
+
+正式 comparison 使用：
+
+~~~
+A1 = FIXED_GOOD
+B1 = DYNAMIC_CONTROLLER
+B2 = DYNAMIC_CONTROLLER 的第二个独立 block
+A2 = FIXED_GOOD
+~~~
+
+即 A1-B1-B2-A2。四个 block 必须按时间顺序、相邻 block 间隔不超过配置上限、属于同一
+battery/hard/calibration/campaign context，
+并且 A1/A2 的 fixed baseline 名称和 content hash 完全相同。B1/B2 分别形成 paired delta，最终用
+两个 delta 的 median，并要求方向一致、spread 不超过配置上限。
+
+MinimalMeter 同时记录低成本 comparability covariates：brightness、active fraction、media fraction、
+remote fraction 和 basic network。它们只用于 veto 明显不可比的 block，不用于建立高维统计模型。
+package temperature 不作为 comparability covariate；它是 treatment outcome。Dynamic 更凉不得因为
+“温度不同”被过滤，明显更热或触发 thermal intervention 则阻止直接保留 Dynamic，转为 NEED_MORE_DATA。
+
+capture mode 不能只是用户标签。正式 capture 必须验证：
+
+- FIXED_GOOD：live systemd state 证明 PowerLab service inactive，且每个 sample 的实际 HWP 都匹配同一个 VERIFIED envelope
+- DYNAMIC_CONTROLLER：service 正在运行、Automation Level 1，capture 开始时 ControlSafety=CONTROL_ALLOWED；
+  capture 内 thermal safety intervention 作为 outcome，其他 READ_ONLY/DEGRADED/EMERGENCY transition 使 block INVALID
+
+当前版本不再部署 scheduled Agent review unit；installer 会移除旧 hourly unit。正式 capture 仍 fail-closed
+检查遗留 `sp7-powerlab-hourly.timer/service`，防止旧部署污染 treatment。
+
+formal capture 开始时不得有 active investigation、unresolved UnexpectedPower 或 Diagnostic Burst。capture 中
+发生 trial/calibration/investigation/UnexpectedPower、hard context 改变、media compatibility generation
+改变、Stage-E contract 改变、fixed-mode HWP 改变、service mode 失真、非 thermal Control Safety interruption、
+短 suspend/resume 或遗留 scheduled-review unit 运行时，整个 run 标记 INVALID。
+
+用于 STABLE readiness 的 Dynamic 结果必须来自一个显式 bounded validation campaign、同一个 hard
+evidence epoch、同一个 fixed baseline content hash，并通过完整 A1-B1-B2-A2 comparability gate。不能把
+不同周、不同 fixed reference 或不同系统条件下的历史 block 拼成“完整比较”。
+
+validation campaign 是有生命周期的 DB entity，不是可无限复用的字符串。campaign 从 OPEN 开始，
+固定 hard/battery/calibration/semantics context 与 fixed baseline identity；超过 `max_campaign_span_seconds`
+或 context/baseline/media generation/Stage-E-contract identity 变化时 INVALID。一个有效 Dynamic comparison
+完成后自动 COMPLETE/CLOSED，禁止继续往旧 campaign 塞新结果。
+
+campaign COMPLETE 不是永久证书。每次 Net Benefit summary / StableReadiness 都必须把 tested Stage-E
+contract identity 与**当前** contract identity 比较，并现场刷新 browser/Mesa media generation；任一变化，
+旧结果只保留作历史，不继续背书 STABLE。
+
+Formal Stage E 的采样规则属于 deterministic local contract，不属于 Agent/CLI 可调参数。至少固定
+`sample_seconds`、`max_sample_gap_seconds`、`minimum_samples_per_block`，并全部进入 Stage-E contract
+identity。产生正式 evidence 的 production meter 不暴露 interval/max-gap/sys-root/proc-root 放宽入口；
+A1/B1/B2/A2 必须使用同一 formal cadence，同时满足最小时长、样本数 floor 与 gap 上限。
+
+最终复杂度选择只问一个问题：
+
+~~~
+Dynamic Controller 的两个独立 paired block 是否都至少节省一个 practical threshold？
+~~~
+
+- 是：KEEP_DYNAMIC_CONTROLLER
+- 两个都否：FIXED_GOOD_ENVELOPE
+- 只有一个是，或 evidence 不完整：NEED_MORE_DATA
+
+若结果接近、Agent 值得继续调查“是不是 observer 自己太贵”，可以额外运行 MONITORING A1-B1-B2-A2。
+该结果只进入诊断 history，不阻塞或完成 formal Stage E campaign。
+
+STABLE 对 Dynamic 必须同时验证 selected policy fingerprint 与实际 Level-1 runtime mode。对 FIXED_GOOD
+不使用 stale heartbeat 推断物理状态，而是在每次 `agent-context` / `lifecycle readiness` / `freeze` 运行
+one-shot audit：main service inactive、thermald active、无 ownership conflict、live hard identity 与当前
+evidence epoch 一致、现场 media compatibility 仍匹配、fixed baseline 仍 VERIFIED/hash 匹配、actual HWP
+snapshot 匹配 envelope。若 FIXED_GOOD 是最终 selected runtime，还必须证明 main service 已 disabled、
+`sp7-powerlab-fixed.service` 已 enabled，并且持久 selection 绑定当前 epoch/baseline；login/reboot 时由该
+oneshot 重应用 fixed envelope 后退出。persistent audit 还必须看到 oneshot 本 session 为 active/exited；
+enabled 只代表“会尝试”，不能证明本次已经成功应用。
+
+任何 manual/persistent fixed write 在 HWP write 前必须现场重算 live hard identity，并直接读取 BAT identity
+与 energy_full，使用 battery epoch 相同的 identity/20% energy_full 语义与 stored evidence 比较。fixed
+oneshot **只验证，不创建 epoch**；发现新 kernel/BIOS/battery/hard context 后 fail-closed，回到 main
+PowerLab/Stage A-B revalidation。只对 helper/thermald 启动时暂不可用做短暂有限重试。
+
+runtime identity 的 production 语义是“当前 Python 实际 import 的 package files”，而不是 WorkingDirectory
+里恰好存在的 repo source。restricted root helper 的 implementation identity 覆盖 helper.py、
+actuators/base.py、actuators/hwp.py。
+
+允许结论：
+
+- KEEP_DYNAMIC_CONTROLLER
+- FIXED_GOOD_ENVELOPE
+- NEED_MORE_DATA
+
+比较尽量采用 block/day-level crossover，避免单纯历史前后比较。
+
+### Complexity Deletion
+
+如果长期没有实际收益，应删除或降级：
+
+- 多 envelope
+- dynamic controller
+- Candidate Scheduler
+- high-frequency attribution
+- Agent review cadence
+- thermal model 的非安全部分
+- always-on autonomous learning
+
+fixed-good 与复杂系统实际续航/UX 等价时，删掉复杂度是成功结果。
 
 ---
 
-## 57. Phase 0 — Measurement Trust
+## 12. 版本、真机验证与验收
 
-先实现：
+### 12.1 Schema / Versioning
 
-- power integration；
-- energy_now delta；
-- consistency gate；
-- data-quality status；
-- noise baseline；
-- monitoring overhead experiment；
-- robust baseline statistics。
+设计必须保留这些概念：
 
-验收问题：
+- battery epoch
+- hard evidence epoch
+- compatibility tags
+- reference baseline
+- recent noise
+- ArmMeasurement
+- CrossoverEpisode
+- EvidenceDecision
+- candidate frontier
+- trial / feedback
+- control/learning history
+- UnexpectedPower / investigation
+- Net Benefit / MinimalMeter results
+- MinimalMeter capture provenance
+- Net Benefit campaign lifecycle
+- runtime policy fingerprint
+- runtime mode validation
+- core control/evidence code identity
 
-> 我们到底能不能可信地测出 candidate 的量级？
+详细字段属于实现，不复制进 PLAN2。
 
-如果答案是否定的：
+允许破坏式 schema 升级。
 
-停止。
+语义不兼容时：
 
-不要实现 optimizer。
+- fail-fast
+- reset/rebuild
+- 不写隐藏兼容层
 
----
+### 12.2 Git
 
-## 58. Phase 1 — Evidence Engine
+Git 保存：
 
-实现：
+- code
+- config
+- docs
+- durable knowledge
 
-- episode aggregation；
-- current epoch evidence；
-- noise-aware thresholds；
-- WIN；
-- LOSE；
-- INCONCLUSIVE；
-- PRACTICALLY_EQUIVALENT；
-- user-feedback veto；
-- data-quality rejection。
+不保存高频 raw SQLite、临时 telemetry 和 runtime build 垃圾。
 
-替代当前 Trial 内部“固定阈值直接 winner”的职责。
+### 12.3 真机验证阶段
 
----
+**Stage A — Measurement Trust / Calibration**
 
-## 59. Phase 2 — Lifecycle Manager / STABLE
+- hardware contract
+- battery epoch
+- gauge cadence/quantization
+- BAT consistency
+- Measurement Trust READY
+- calibration
+- HWP read-back/rollback
 
-实现：
+**Stage B — Reference / Noise**
 
-- lifecycle state；
-- transition log；
-- STABLE；
-- freeze；
-- reopen conditions；
-- drift trigger；
-- scheduler sleeping。
+- first real verified baseline
+- FrozenReference
+- RecentNoise
+- practical threshold 初步验证
+- optional monitoring overhead 诊断（仅需要时）
 
-这是 PLAN2 最重要的功能之一。
+**Stage C — Coarse Search**
 
----
+- 只测试有限邻域
+- 验证 stop rules
+- 只找 practical gains
 
-## 60. Phase 3 — State-based Washout
+**Stage D — Validation / Burn-in**
 
-把固定 settle time 升级为：
-
-```text
-minimum time
-+
-state convergence
-+
-maximum timeout
-```
-
-重点真机验证 SP7 heat soak。
-
----
-
-## 61. Phase 4 — Unexpected Power Detector
-
-重命名并重构现有 WasteDetector。
-
-先检测：
-
-`UNEXPECTED_POWER`
-
-再 attribution。
-
-不能直接把异常叫 waste。
-
----
-
-## 62. Phase 5 — Candidate Scheduler
-
-在 Evidence Engine 稳定后才实现。
-
-第一版：
-
-- discrete local search；
-- neighbor expansion；
-- blacklist；
-- experiment budget；
-- headroom priority；
-- stop rules。
-
-不实现 BO。
-
----
-
-## 63. Phase 6 — Researcher Cadence
-
-把当前“每小时 LLM”改成：
-
-- 每小时 local；
-- event-driven researcher；
-- daily review；
-- weekly drift review。
-
-并要求外部事实带来源。
-
----
-
-## 64. Phase 7 — Net Benefit Validation
-
-正式比较：
-
-1. fixed good envelope；
-2. PowerLab monitoring only；
-3. PowerLab dynamic controller；
-4. full PowerLab。
-
-最终决定：
-
-- 哪些模块保留；
-- 哪些模块合并；
-- 哪些模块删除。
-
----
-
-## 65. Stage A 真机验证重新定义
-
-Stage A 不先调 EPP。
-
-先回答：
-
-### Measurement
-
-- BAT power 是否稳定可读？
-- energy_now delta 是否可信？
-- 两者 consistency 如何？
-- noise floor 多大？
-- suspend/resume 是否破坏数据？
-
-### Attribution
-
-- 正常 5W 花在哪里？
-- CPU RAPL 占多少？
-- GPU / display / network 大概是什么量级？
-- 有没有明显常驻浪费？
-
-### Overhead
-
-- PowerLab OFF vs ON 增加多少 W？
-- process scan 的成本是多少？
-- ActivityWatch 的成本是多少？
-- SQLite / timer 的成本是多少？
-
-### Thermal
-
-- 实际是否经常进入 HEAT_SOAKED？
-- 是否发生 THERMAL_PRESSURE？
-- remote/light workload 下 thermal 是否基本无关？
-
-Stage A 结束后才能决定：
-
-> CPU envelope optimization 的 ROI 到底有多大。
-
----
-
-## 66. Stage B — Baseline 与 Noise
-
-目标：
-
-- 每个主要 demand class 得到自然分布；
-- noise model 达到最低 episode 数；
-- practical threshold 定义完成；
-- current evidence epoch 建立。
-
-不做大量 candidate exploration。
-
----
-
-## 67. Stage C — Coarse Search
-
-只探索：
-
-- named EPP；
-- max_perf_pct 粗粒度邻居；
-- Turbo on/off。
-
-最多改变一个 primary dimension。
-
-每个 candidate 必须受：
-
-- experiment budget；
-- noise floor；
-- UX veto；
-- washout；
 - independent revalidation
+- representative real usage coverage
+- minimum valid/trusted usage seconds
+- minimum distinct usage days / observation span
+- no unresolved regression
 
-约束。
+**Stage E — Net Benefit / Complexity Selection**
 
----
+- fixed-good
+- dynamic
+- complete one bounded validation campaign
+- B1/B2 都达到 practical saving 才 KEEP_DYNAMIC_CONTROLLER
+- selected/recommended policy fingerprint still matches runtime
+- fixed-good one-shot live audit / dynamic live mode check
 
-## 68. Stage D — STABLE Burn-in
+完成 Stage E 后，只有 deterministic StableReadiness 的全部 gate 都通过，才进入 STABLE。
+STABLE 是 A–E 完成后的收敛状态，不是 Stage E 之前的 burn-in 状态。
 
-进入 STABLE 后至少观察数周。
+### 12.4 核心验收
 
-重点不是继续优化。
+**Measurement**
 
-而是验证：
+- Discharging-only reward
+- gap-aware integration
+- suspend 不进入 reward
+- gauge resolution 已实测
+- minimum arm 同时受 config/gauge/noise/budget 约束
+- data-quality failure 不制造 winner
 
-- drift false positive；
-- UnexpectedPower false positive；
-- monitoring overhead；
-- envelope switching stability；
-- 用户是否真正无感。
+**Evidence**
 
----
+- Arm/Crossover/Decision 分离
+- initial/revalidation 独立
+- B2 独立达到 MUE
+- candidate-caused bad outcomes 保留
+- old hard epoch 不直接 promotion
+- equivalent/inconclusive 是正式结果
+- negative feedback 可 veto
 
-## 69. Stage E — 是否值得保留复杂度
+**Control/Safety**
 
-最后必须回答：
+- verified-envelope-only
+- actual-state reconcile
+- transaction/read-back/rollback
+- thermal safety 可抢占
+- ControlSafetyState 真正阻止正常写入
 
-### Dynamic controller 是否值得？
+**Scheduler**
 
-### 多 envelope 是否值得？
+- Measurement/Control/Lifecycle/Investigation/noise/headroom/budget gates
+- finite candidate space
+- finite retry
+- STABLE 不探索
+- 无 practical headroom 时停止
 
-### Candidate Scheduler 是否值得？
+**UnexpectedPower**
 
-### LLM researcher 是否值得？
+- detection 与 root cause 分离
+- 高于历史不直接叫 waste
+- investigation 可判 expected workload
+- 不直接 reopen
+- hypothesis 有本机 evidence/verification；外部事实有来源
 
-### PowerLab 整体净收益是否值得？
+**STABLE / Net Benefit**
 
-允许答案是：
+- 真实 usage coverage 达标
+- denominator floor / distinct usage days / observation span 达标
+- 稀有 workload 有安全 fallback
+- 无 active trial/investigation
+- reference/noise 可用
+- Dynamic 来自一个 bounded COMPLETE campaign
+- selected/recommended policy fingerprint 与 actual runtime mode 都代表当前系统
+- dynamic controller 无 practical net gain 时退回 fixed-good
 
-> 不值得。
+### 12.5 当前明确不做
 
----
+没有真实 SP7 数据证明需要之前，不做：
 
-## 70. Acceptance Criteria — Measurement
+- LLM per-sample controller
+- semantic scene taxonomy 作为实时核心
+- deep neural network 核心控制
+- full reinforcement learning
+- neural contextual bandit
+- Bayesian Optimization
+- continuous arbitrary EPP search
+- 持续本地满载作为优化主目标
+- 旧 schema 兼容迁移层
 
-必须满足：
-
-- BAT energy integration gap-aware；
-- energy delta 可用；
-- consistency gate 有真机阈值；
-- Charging / AC 不进入放电 reward；
-- suspend gap 不进入 reward；
-- noise floor 有真实数据；
-- monitoring overhead 已量化。
-
----
-
-## 71. Acceptance Criteria — Evidence Engine
-
-必须满足：
-
-- B1 不污染 B2；
-- B2 使用 fresh A3；
-- candidate-caused regression 保留；
-- external workload change abort/pause；
-- UX negative feedback veto；
-- small effect 可输出 PRACTICALLY_EQUIVALENT；
-- data-quality failure 不判 winner；
-- old epoch evidence 不直接累计票数。
-
----
-
-## 72. Acceptance Criteria — Scheduler
-
-必须满足：
-
-- 只选有限邻居；
-- 不修改 Evidence threshold；
-- 不越过 automation level；
-- 有 experiment budget；
-- 有 stop rules；
-- STABLE 默认不探索；
-- headroom 太低时不探索。
-
----
-
-## 73. Acceptance Criteria — Unexpected Power
-
-必须满足：
-
-- detection 与 root-cause 分离；
-- 不能把“高于历史”直接叫 waste；
-- attribution 可返回 EXPECTED；
-- LLM 只能提供 hypothesis；
-- external factual claim 有来源。
+未来只有在粗粒度方案已到瓶颈、仍有明显 practical headroom，且新增复杂度可验证有净收益时才重新评估。
 
 ---
 
-## 74. Acceptance Criteria — STABLE
+## 13. 最终成功定义
 
-进入 STABLE 后：
+PowerLab 成功意味着：
 
-- 7 天内无主动 trial，除非明确 trigger；
-- Scheduler 不机械寻找更细参数；
-- controller 稳定；
-- telemetry 降到合适低开销；
-- drift detection 正常；
-- 用户无显著负面反馈。
+1. 测量可信；
+2. 控制安全且可恢复；
+3. 用户体验良好；
+4. thermal 可持续；
+5. 异常功耗可调查；
+6. candidate 收益有独立证据；
+7. noise 内差异会被停止；
+8. 大多数真实使用时间有可信策略覆盖；
+9. 系统知道何时进入 STABLE；
+10. 环境变化时按 evidence reopen；
+11. PowerLab 自身开销明显小于实际收益；
+12. 如果复杂系统不值得，能删除复杂度并退回 fixed-good。
 
----
+最终原则：
 
-## 75. Acceptance Criteria — Net Benefit
-
-最终必须完成：
-
-```text
-fixed good profile
-vs
-PowerLab monitoring only
-vs
-dynamic controller
-vs
-full PowerLab
-```
-
-如果完整 PowerLab 的净收益小于 practical threshold：
-
-应删除、冻结或简化相关模块。
-
----
-
-## 76. 明确不做
-
-PLAN2 默认不做：
-
-- deep learning；
-- neural network；
-- reinforcement learning；
-- online ML real-time controller；
-- realtime contextual bandit；
-- arbitrary EPP 0–255 search；
-- 自动调屏幕亮度以“刷低功耗”；
-- undervolting；
-- 任意 MSR 写入；
-- 任意 sysfs 写入；
-- 自定义 thermald hard trip；
-- LLM root access；
-- LLM shell access；
-- LLM 修改 Evidence Engine。
-
----
-
-## 77. 复杂度删除原则
-
-任何模块都必须允许被证据淘汰。
-
-如果：
-
-### 多 envelope 没收益
-
-合并。
-
-### dynamic controller 没收益
-
-删除。
-
-### Scheduler 没收益
-
-永久 STABLE。
-
-### thermal model 没实际使用价值
-
-只保留安全检测。
-
-### LLM researcher 没带来 actionable finding
-
-降低 cadence 或关闭。
-
-### PowerLab 总体净收益不足
-
-退回固定良好配置。
-
-项目没有义务证明自己复杂才有价值。
-
----
-
-## 78. 成功标准
-
-PowerLab 成功不等于：
-
-- trial 数量多；
-- LLM proposal 多；
-- 参数越来越精细；
-- 数据库越来越大；
-- 算法越来越复杂。
-
-成功意味着：
-
-1. 正常使用体验好；
-2. 实际电池续航更长；
-3. 热状态可持续；
-4. 遇到 regression 能发现；
-5. 系统变化后能重新学习；
-6. 成熟以后基本不打扰用户；
-7. 自身监控开销远小于真实收益；
-8. 如果没有进一步收益，它知道停止。
-
----
-
-## 79. PLAN2 最终系统定义
-
-PowerLab 不再定义为“持续自动优化器”。
-
-最终定义：
-
-> **一个专门针对 Surface Pro 7 i5-1035G4 的个人续航证据系统。它以低开销方式长期记录整机电池、性能压力、热状态和系统版本；先建立真实噪声与功耗基线，再用保守的 Evidence Engine 判断候选配置是否具有可重复且有实际价值的收益。Candidate Scheduler 只在存在足够优化 headroom 时进行有限、离散、可回滚的探索；一旦找到足够好的配置，系统进入 STABLE 并停止主动实验。只有发生漂移、异常、系统/电池变化、用户投诉或新的高价值假设时才重新打开优化。LLM 只负责研究、解释与外部资料关联，不参与实时控制，也无权修改实验裁判标准。最终评价只看真实净续航收益，而不是 PowerLab 自身的算法复杂度。**
-
----
-
-## 80. 一句话原则
-
-> **先测准，再判断；先找浪费，再降性能；收益小于噪声就停止；找到足够好的答案就冻结；环境变了再重新学习。**
+> 先测准，再判断；异常先调查，不急着调参；先确认可行动的异常功耗，再考虑降性能；收益小于噪声就停止；真实使用覆盖够了就冻结；环境变了再按证据重新学习。

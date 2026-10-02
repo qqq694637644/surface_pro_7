@@ -1,6 +1,6 @@
-# PowerLab v2 configuration
+# PowerLab configuration
 
-The v2 configuration is deliberately small and Surface Pro 7 specific.
+The configuration is deliberately Surface Pro 7 specific.
 
 - `powerlab.toml`: sampling, retention, automation and service cadence.
 - `machine.toml`: calibration output for this physical Surface Pro 7.
@@ -10,4 +10,6 @@ The v2 configuration is deliberately small and Surface Pro 7 specific.
 The repository ships with `calibration.valid = false`. This is intentional:
 PowerLab starts read-only on a real machine until calibration is completed.
 
-Changing `thermal.toml` is a high-risk manual operation. LLM decisions never edit it.
+Changing `thermal.toml` is a high-risk engineering operation. Structured trial proposals do
+not edit it; a Bash Agent may only change it as an explicit code/config change with review,
+tests, and subsequent real-machine revalidation.

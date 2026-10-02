@@ -52,6 +52,68 @@ class BatteryLifeController:
     def current_envelope(self) -> str | None:
         return self.db.get_meta("current_envelope")
 
+    def rollback_integrity_fault(self) -> dict[str, Any] | None:
+        value = self.db.get_meta("rollback_integrity_fault", {})
+        if isinstance(value, dict) and value.get("active"):
+            return value
+        return None
+
+    def rollback_integrity_ok(self) -> bool:
+        return self.rollback_integrity_fault() is None
+
+    def _latch_rollback_integrity_fault(
+        self,
+        *,
+        reason: str,
+        payload: dict[str, Any],
+    ) -> None:
+        fault = {
+            "active": True,
+            "ts": self.clock(),
+            "source": "controller",
+            "reason": reason,
+            **payload,
+        }
+        self.db.set_meta("rollback_integrity_fault", fault)
+        self.db.set_meta("current_envelope", None)
+        self.db.add_runtime_state(
+            "control",
+            "EMERGENCY",
+            "HWP rollback integrity is latched until explicit verified recovery",
+            fault,
+        )
+
+    def recover_rollback_integrity_fault(self, reason: str) -> str:
+        fault = self.rollback_integrity_fault()
+        if fault is None:
+            raise RuntimeError("no rollback integrity fault is latched")
+        snapshot = self.actuator.snapshot()
+        matched = self.registry.match_verified_snapshot(
+            snapshot,
+            preferred=self.current_envelope(),
+        )
+        if not matched:
+            raise RuntimeError("actual HWP state does not match exactly one VERIFIED envelope")
+        self.db.set_meta("current_envelope", matched)
+        self.db.set_meta(
+            "rollback_integrity_fault",
+            {
+                **fault,
+                "active": False,
+                "cleared_ts": self.clock(),
+                "clear_reason": reason,
+                "verified_envelope": matched,
+            },
+        )
+        self.db.add_control_action(
+            action="RECOVER_ROLLBACK_INTEGRITY",
+            envelope=matched,
+            success=True,
+            reason=reason,
+            after=snapshot,
+        )
+        return matched
+
     @staticmethod
     def _same_hwp_state(left: dict[str, Any], right: dict[str, Any]) -> bool:
         return (
@@ -133,6 +195,15 @@ class BatteryLifeController:
         sample: dict[str, Any],
         desired: str,
     ) -> str | None:
+        control_state = self.db.latest_runtime_state("control")
+        if control_state:
+            state = str(control_state.get("state") or "")
+            emergency_thermal_safe = state == "EMERGENCY" and desired == "THERMAL_SAFE"
+            if state != "CONTROL_ALLOWED" and not emergency_thermal_safe:
+                return (
+                    f"control safety state {state}: "
+                    f"{control_state.get('reason') or 'control disabled'}"
+                )
         required = {
             "battery_power_w": sample.get("battery_power_w"),
             "package_temp_c": sample.get("package_temp_c"),
@@ -235,13 +306,9 @@ class BatteryLifeController:
             if recovery_error:
                 failure_reason += f"; rollback integrity failure: {recovery_error}"
                 self.hardware_writable = False
-                self.db.set_meta("current_envelope", None)
-                self.db.add_incident(
-                    "waste",
-                    {
-                        "start_ts": now,
-                        "severity": "high",
-                        "reason": "HWP apply failed and exact rollback could not be verified",
+                self._latch_rollback_integrity_fault(
+                    reason="HWP apply failed and exact rollback could not be verified",
+                    payload={
                         "error": str(exc),
                         "rollback_error": recovery_error,
                     },

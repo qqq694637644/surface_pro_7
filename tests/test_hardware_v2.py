@@ -3,6 +3,12 @@ from pathlib import Path
 import sp7_powerlab.hardware as hardware
 
 
+def test_systemd_user_unit_state_preserves_failed_stdout(monkeypatch):
+    monkeypatch.setattr(hardware, "systemd_available", lambda: True)
+    monkeypatch.setattr(hardware, "_command", lambda _args: (3, "failed"))
+    assert hardware.systemd_user_unit_state("sp7-powerlab-fixed.service") == "failed"
+
+
 def build_fake_hardware(tmp_path: Path):
     sys = tmp_path / "sys"
     proc = tmp_path / "proc"
@@ -50,7 +56,7 @@ def test_surface_contract_accepts_expected_machine(tmp_path, monkeypatch):
     monkeypatch.setattr(
         hardware,
         "thermald_status",
-        lambda: {"available": True, "active": True, "version": "2"},
+        lambda **_kwargs: {"available": True, "active": True, "version": "2"},
     )
     monkeypatch.setattr(hardware, "ownership_conflicts", lambda: [])
     report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)
@@ -66,7 +72,7 @@ def test_wrong_cpu_blocks_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(
         hardware,
         "thermald_status",
-        lambda: {"available": True, "active": True, "version": "2"},
+        lambda **_kwargs: {"available": True, "active": True, "version": "2"},
     )
     monkeypatch.setattr(hardware, "ownership_conflicts", lambda: [])
     report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)
@@ -80,7 +86,7 @@ def test_conflicting_writer_blocks_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(
         hardware,
         "thermald_status",
-        lambda: {"available": True, "active": True, "version": "2"},
+        lambda **_kwargs: {"available": True, "active": True, "version": "2"},
     )
     monkeypatch.setattr(hardware, "ownership_conflicts", lambda: ["auto-cpufreq.service"])
     report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)
@@ -96,7 +102,7 @@ def test_arbitrary_acpi_thermal_zone_is_not_cpu_control_sensor(tmp_path, monkeyp
     monkeypatch.setattr(
         hardware,
         "thermald_status",
-        lambda: {"available": True, "active": True, "version": "2"},
+        lambda **_kwargs: {"available": True, "active": True, "version": "2"},
     )
     monkeypatch.setattr(hardware, "ownership_conflicts", lambda: [])
     report = hardware.inspect_hardware(sys_root=sys, proc_root=proc)

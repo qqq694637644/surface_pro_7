@@ -4,43 +4,15 @@ import json
 from importlib.resources import files
 from pathlib import Path
 
-import pytest
-
-from sp7_powerlab import agent_cli, cli
-
-
-def test_agent_cli_exposes_only_narrow_llm_surface():
-    help_text = agent_cli.parser().format_help()
-    assert "observe" in help_text
-    assert "hourly" in help_text
-    assert "submit-decision" in help_text
-    assert "root-helper" not in help_text
-    assert "trial start" not in help_text
-    assert "trial promote" not in help_text
-
-    with pytest.raises(SystemExit):
-        agent_cli.parser().parse_args(["trial", "start", "proposal.json"])
-    with pytest.raises(SystemExit):
-        agent_cli.parser().parse_args(["root-helper", "serve"])
-    with pytest.raises(SystemExit):
-        agent_cli.parser().parse_args(["--config", "other.toml", "hourly"])
-    with pytest.raises(SystemExit):
-        agent_cli.parser().parse_args(["hourly", "--output", "anywhere.json"])
-
-
-def test_human_cli_has_no_llm_approve_flag():
-    with pytest.raises(SystemExit):
-        cli.parser().parse_args(["llm-apply", "decision.json", "--approve"])
-
 
 def test_packaged_trial_schema_matches_repository_contract():
     root = Path(__file__).resolve().parents[1]
     repository = json.loads(
-        (root / "schemas/envelope-trial-v2.schema.json").read_text(encoding="utf-8")
+        (root / "schemas/envelope-trial.schema.json").read_text(encoding="utf-8")
     )
     packaged = json.loads(
         files("sp7_powerlab.schemas")
-        .joinpath("envelope-trial-v2.schema.json")
+        .joinpath("envelope-trial.schema.json")
         .read_text(encoding="utf-8")
     )
     assert packaged == repository
@@ -54,12 +26,33 @@ def test_root_helper_has_no_sys_admin_capability():
     assert "AmbientCapabilities=" in unit
 
 
-def test_agent_decision_path_is_confined_to_runtime(project_root: Path):
-    inside = agent_cli._runtime_decision_path(
-        "runtime/llm-decision.json",
-        root=project_root,
-    )
-    assert inside == (project_root / "runtime/llm-decision.json").resolve()
+def test_user_service_does_not_restart_forever_on_breaking_schema_mismatch():
+    root = Path(__file__).resolve().parents[1]
+    unit = (root / "systemd/sp7-powerlab.service.in").read_text(encoding="utf-8")
+    assert "RestartPreventExitStatus=78" in unit
 
-    with pytest.raises(SystemExit, match="runtime directory"):
-        agent_cli._runtime_decision_path("../outside.json", root=project_root)
+
+def test_fixed_good_runtime_is_a_boot_oneshot_not_a_daemon():
+    root = Path(__file__).resolve().parents[1]
+    unit = (root / "systemd/sp7-powerlab-fixed.service.in").read_text(encoding="utf-8")
+    assert "Type=oneshot" in unit
+    assert "RemainAfterExit=yes" in unit
+    assert "envelope apply-fixed" in unit
+    assert "Restart=" not in unit
+
+
+def test_user_units_do_not_order_after_the_target_that_wants_them():
+    root = Path(__file__).resolve().parents[1]
+    for name in ("sp7-powerlab.service.in", "sp7-powerlab-fixed.service.in"):
+        unit = (root / "systemd" / name).read_text(encoding="utf-8")
+        assert "WantedBy=default.target" in unit
+        assert "After=default.target" not in unit
+
+
+def test_user_service_installer_restarts_preserved_runtime_mode():
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "scripts/install-user-services.sh").read_text(encoding="utf-8")
+    assert "restart sp7-powerlab-fixed.service" in script
+    assert "is-active --quiet sp7-powerlab-fixed.service" in script
+    assert "restart sp7-powerlab.service" in script
+    assert "is-active --quiet sp7-powerlab.service" in script

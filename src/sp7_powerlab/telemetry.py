@@ -120,6 +120,11 @@ def _battery_snapshot(sys_root: Path = SYSFS) -> dict[str, Any]:
     }
 
 
+def battery_snapshot(sys_root: Path = SYSFS) -> dict[str, Any]:
+    """Read the live BAT identity/energy state without mutating runtime epochs."""
+    return _battery_snapshot(sys_root)
+
+
 def _psi(resource: str, proc_root: Path = PROC) -> float | None:
     text = _read(proc_root / "pressure" / resource)
     if not text:
@@ -530,6 +535,50 @@ class TelemetryCollector:
         self._last_process_rows: list[dict[str, Any]] = []
         self._thermald_cache: tuple[float, bool] = (0.0, False)
         self._device_cache: tuple[float, dict[str, Any]] = (0.0, {})
+        self._gpu_cache: tuple[float, dict[str, Any]] = (0.0, {})
+        self._activity_cache: tuple[float, dict[str, Any]] = (0.0, {})
+        self._runtime_mode = "NORMAL"
+        self._diagnostic_burst_until = 0.0
+
+    def set_runtime_mode(self, mode: str) -> None:
+        mode = mode.upper()
+        if mode not in {"NORMAL", "STABLE", "TRIAL"}:
+            raise ValueError(f"invalid telemetry runtime mode: {mode}")
+        self._runtime_mode = mode
+
+    def trigger_diagnostic_burst(self, *, seconds: float | None = None) -> None:
+        duration = float(
+            seconds
+            if seconds is not None
+            else self.config.get("collector.diagnostic_burst_seconds", 300.0)
+        )
+        self._diagnostic_burst_until = max(
+            self._diagnostic_burst_until,
+            float(self.clock()) + max(0.0, duration),
+        )
+
+    def runtime_mode(self, ts: float | None = None) -> str:
+        now = float(self.clock()) if ts is None else float(ts)
+        if now < self._diagnostic_burst_until:
+            return "DIAGNOSTIC_BURST"
+        return self._runtime_mode
+
+    def _mode_interval(self, base_key: str, mode: str) -> float:
+        if mode in {"TRIAL", "DIAGNOSTIC_BURST"}:
+            return float(
+                self.config.get(
+                    f"collector.{base_key}_trial",
+                    self.config.get(f"collector.{base_key}", 30.0),
+                )
+            )
+        if mode == "STABLE":
+            return float(
+                self.config.get(
+                    f"collector.{base_key}_stable",
+                    self.config.get(f"collector.{base_key}", 30.0),
+                )
+            )
+        return float(self.config.get(f"collector.{base_key}", 30.0))
 
     def _rapl(self, ts: float) -> tuple[float | None, dict[str, float | None]]:
         if self.rapl_path is None:
@@ -586,6 +635,7 @@ class TelemetryCollector:
 
     def sample(self) -> dict[str, Any]:
         ts = float(self.clock())
+        runtime_mode = self.runtime_mode(ts)
         max_gap = float(self.config.get("collector.max_gap_seconds", 45.0))
         gap = None if self._last_ts is None else ts - self._last_ts
         if gap is not None and gap > max_gap:
@@ -640,13 +690,21 @@ class TelemetryCollector:
             self._last_throttle = throttle
 
         cpu_usage = psutil.cpu_percent(interval=None)
-        gpu = _gpu_snapshot(self.sys_root)
+        gpu_cached_at, gpu = self._gpu_cache
+        gpu_interval = self._mode_interval("gpu_seconds", runtime_mode)
+        if ts - gpu_cached_at >= gpu_interval:
+            gpu = _gpu_snapshot(self.sys_root)
+            self._gpu_cache = (ts, gpu)
         media = _media_playing()
         active = _user_active()
-        activity = _activitywatch(self.config)
+        activity_cached_at, activity = self._activity_cache
+        activity_interval = self._mode_interval("activity_seconds", runtime_mode)
+        if ts - activity_cached_at >= activity_interval:
+            activity = _activitywatch(self.config)
+            self._activity_cache = (ts, activity)
 
         processes_fresh = False
-        process_interval = float(self.config.get("collector.process_seconds", 30.0))
+        process_interval = self._mode_interval("process_seconds", runtime_mode)
         if ts - self._last_process_ts >= process_interval:
             self._last_process_rows = self.process_sampler.sample()
             self._last_process_ts = ts
@@ -658,7 +716,8 @@ class TelemetryCollector:
             self._thermald_cache = (ts, thermald)
 
         device_cached_at, device_snapshot = self._device_cache
-        if ts - device_cached_at >= 60.0:
+        device_interval = self._mode_interval("device_seconds", runtime_mode)
+        if ts - device_cached_at >= device_interval:
             device_snapshot = {
                 "runtime_pm": _runtime_pm_snapshot(self.sys_root),
                 "rfkill": _rfkill_snapshot(self.sys_root),
@@ -726,4 +785,5 @@ class TelemetryCollector:
             "processes_fresh": processes_fresh,
             "remote_process_present": bool(self.process_sampler.remote_processes),
             "remote_processes": self.process_sampler.remote_processes,
+            "telemetry_mode": runtime_mode,
         }
