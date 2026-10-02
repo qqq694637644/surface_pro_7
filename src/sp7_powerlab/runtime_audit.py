@@ -25,6 +25,49 @@ class FixedContextTransientError(RuntimeError):
     pass
 
 
+def _live_battery_epoch_check(
+    db: Database,
+    *,
+    evidence_epoch: dict[str, Any] | None,
+    sys_root: Path,
+) -> dict[str, Any]:
+    battery_epoch = db.active_battery_epoch_record()
+    live_battery = battery_snapshot(sys_root)
+    reasons: list[str] = []
+
+    if not battery_epoch:
+        reasons.append("missing_active_battery_epoch")
+    else:
+        live_identity = str(live_battery.get("identity_hash") or "missing")
+        stored_identity = str(battery_epoch.get("identity_hash") or "")
+        if live_identity == "missing":
+            reasons.append("live_battery_identity_missing")
+        elif live_identity != stored_identity:
+            reasons.append("live_battery_identity_mismatch")
+
+        live_full = live_battery.get("energy_full_wh")
+        stored_full = battery_epoch.get("energy_full_wh")
+        if (
+            isinstance(live_full, (int, float))
+            and isinstance(stored_full, (int, float))
+            and stored_full > 0
+            and abs(float(live_full) - float(stored_full)) / max(float(stored_full), 0.1) > 0.20
+        ):
+            reasons.append("live_battery_energy_full_drift")
+
+        if evidence_epoch is not None and int(evidence_epoch.get("battery_epoch") or 0) != int(
+            battery_epoch.get("epoch") or 0
+        ):
+            reasons.append("evidence_battery_epoch_mismatch")
+
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "live_battery": live_battery,
+        "battery_epoch": battery_epoch,
+    }
+
+
 def validate_live_fixed_context_before_write(
     config: Config,
     db: Database,
@@ -34,8 +77,7 @@ def validate_live_fixed_context_before_write(
 ) -> dict[str, Any]:
     """Validate live hard/battery facts against stored evidence without creating epochs."""
     epoch = db.active_evidence_epoch()
-    battery_epoch = db.active_battery_epoch_record()
-    if not epoch or not battery_epoch:
+    if not epoch:
         raise FixedContextStaleError(
             "fixed-good evidence is stale: active evidence/battery epoch missing"
         )
@@ -75,33 +117,24 @@ def validate_live_fixed_context_before_write(
     ):
         raise FixedContextStaleError("fixed-good evidence is stale: evidence semantics changed")
 
-    live_battery = battery_snapshot(sys_root)
-    live_identity = str(live_battery.get("identity_hash") or "missing")
-    stored_identity = str(battery_epoch.get("identity_hash") or "")
-    if live_identity == "missing" or live_identity != stored_identity:
-        raise FixedContextStaleError("fixed-good evidence is stale: battery identity changed")
-    live_full = live_battery.get("energy_full_wh")
-    stored_full = battery_epoch.get("energy_full_wh")
-    if (
-        isinstance(live_full, (int, float))
-        and isinstance(stored_full, (int, float))
-        and stored_full > 0
-    ):
-        if abs(float(live_full) - float(stored_full)) / max(float(stored_full), 0.1) > 0.20:
-            raise FixedContextStaleError(
-                "fixed-good evidence is stale: battery energy_full changed >20%"
-            )
-    if int(epoch.get("battery_epoch") or 0) != int(battery_epoch.get("epoch") or 0):
-        raise FixedContextStaleError(
-            "fixed-good evidence is stale: evidence/battery epoch mismatch"
-        )
+    battery_check = _live_battery_epoch_check(db, evidence_epoch=epoch, sys_root=sys_root)
+    if battery_check["reasons"]:
+        reason = str(battery_check["reasons"][0])
+        message = {
+            "missing_active_battery_epoch": "active evidence/battery epoch missing",
+            "live_battery_identity_missing": "battery identity changed",
+            "live_battery_identity_mismatch": "battery identity changed",
+            "live_battery_energy_full_drift": "battery energy_full changed >20%",
+            "evidence_battery_epoch_mismatch": "evidence/battery epoch mismatch",
+        }.get(reason, reason)
+        raise FixedContextStaleError(f"fixed-good evidence is stale: {message}")
 
     return {
         "evidence_epoch_id": epoch.get("epoch_id"),
-        "battery_epoch": battery_epoch.get("epoch"),
+        "battery_epoch": (battery_check.get("battery_epoch") or {}).get("epoch"),
         "live_hard_identity_hash": live_hard_hash,
         "live_hard_identity": live_hard_payload,
-        "live_battery": live_battery,
+        "live_battery": battery_check["live_battery"],
     }
 
 
@@ -184,6 +217,12 @@ def audit_fixed_runtime(
     hourly_service_state = systemd_user_unit_state("sp7-powerlab-hourly.service")
 
     reasons: list[str] = []
+    battery_check = _live_battery_epoch_check(
+        db,
+        evidence_epoch=evidence_epoch,
+        sys_root=sys_root,
+    )
+    reasons.extend(battery_check["reasons"])
     if service_state != "inactive":
         reasons.append("main_service_not_inactive")
     selection = db.get_meta("fixed_good_selection", {})
@@ -250,6 +289,8 @@ def audit_fixed_runtime(
         "expected_hard_identity_hash": ((evidence_epoch or {}).get("hard_identity_hash")),
         "live_hard_identity_hash": live_hard_hash,
         "live_hard_identity": live_hard_payload,
+        "live_battery": battery_check["live_battery"],
+        "active_battery_epoch": battery_check["battery_epoch"],
         "fixed_baseline_envelope": fixed_baseline_envelope,
         "fixed_baseline_content_hash": fixed_baseline_content_hash,
         "fixed_baseline_verified": bool(envelope and envelope.get("status") == "VERIFIED"),

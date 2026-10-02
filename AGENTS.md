@@ -117,6 +117,9 @@ Control Safety、Learning Lifecycle、Investigation 三类 runtime state 正交�
 8. 软件任务完成前运行 `bash scripts/quality-gate.sh`。
 9. 报告区分 SOFTWARE-VALIDATED 与 REAL-HARDWARE-VALIDATED。
 10. 涉及远端时，以重新查询的 Git / PR / CI 状态为准。
+11. 对抗性软件审查只报告当前可达、会改变控制安全、证据结论或长期正确性的缺陷；无已知 P1/P2-high、CI 全绿且 unit/deployment smoke 合理后停止开放式找问题，进入真机阶段。
+
+审查长期围绕五条 invariant：HWP write 必须 live-valid；formal evidence 必须 scope/contract/treatment 一致；runtime mode switch 不允许半切换；persistent fixed boot 必须现场 evidence-valid 且本次 oneshot/readback 成功；STABLE 必须匹配当前 physical/runtime/evidence reality。
 
 ## 7. 自治边界
 

@@ -24,10 +24,14 @@ sed   -e "s|@ROOT@|$ROOT|g"   -e "s|@POWERLAB_BIN@|$BIN|g"   "$ROOT/systemd/sp7-
 systemctl --user daemon-reload
 if [[ "$FIXED_WAS_ENABLED" == "enabled" ]]; then
   systemctl --user disable --now sp7-powerlab.service 2>/dev/null || true
-  systemctl --user enable --now sp7-powerlab-fixed.service
+  systemctl --user enable sp7-powerlab-fixed.service
+  systemctl --user restart sp7-powerlab-fixed.service
+  systemctl --user is-active --quiet sp7-powerlab-fixed.service
 else
   systemctl --user disable --now sp7-powerlab-fixed.service 2>/dev/null || true
-  systemctl --user enable --now sp7-powerlab.service
+  systemctl --user enable sp7-powerlab.service
+  systemctl --user restart sp7-powerlab.service
+  systemctl --user is-active --quiet sp7-powerlab.service
 fi
 
 echo "PowerLab user services installed; the previously selected Dynamic/Fixed runtime mode was preserved."

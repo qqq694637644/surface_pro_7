@@ -283,7 +283,7 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - STABLE negative feedback 只阻塞当前保留策略的未解决负面证据；已 reject/rollback 的 candidate 不继续冷却当前策略
 - Net Benefit block 必须是单一 contiguous Discharging observation；Charging/resume/gap/epoch change 整块 fail-closed
 - Net Benefit 使用 time-weighted integrated BAT power，并对 data quality fail-closed
-- FIXED_GOOD 用 live systemd 状态 + one-shot runtime audit 证明 service inactive、thermald/ownership/hard identity/HWP 都正确；作为 STABLE selected policy 时还要求 main service disabled、fixed oneshot enabled 且持久选择与 baseline identity 一致
+- FIXED_GOOD 用 live systemd 状态 + one-shot runtime audit 证明 service inactive、thermald/ownership/hard identity/live BAT identity+energy_full/HWP 都正确；作为 STABLE selected policy 时还要求 main service disabled、fixed oneshot enabled/active 且持久选择与 baseline identity 一致
 - MinimalMeter 用 wall-vs-monotonic 检测短 suspend；formal block 任一 suspend/resume 整块 fail-closed
 - capture mode 验证真实 service state / Automation Level / ControlSafety；live Dynamic/Monitoring 还要求 daemon heartbeat 中的 loaded code/config identity 与当前磁盘/config 一致；FIXED 每点核对实际 HWP
 - 正式 capture 会拒绝残留旧 hourly unit 若其处于 active；当前安装不再部署 scheduled review unit
@@ -299,6 +299,8 @@ IMPLEMENTED + SOFTWARE-VALIDATED + BLOCKED-ON-HARDWARE
 - Formal Stage E cadence 由 `[net_benefit] sample_seconds/max_sample_gap_seconds/minimum_samples_per_block` 本地合同拥有；production meter 不暴露 interval/sys-root/proc-root 或 compare gap override
 - persistent fixed audit 要求 fixed oneshot 本 session 为 `active (exited)`，不仅是 enabled；oneshot 只对 helper/thermald 暂未就绪做有限重试
 - Dynamic/Fixed runtime activation 使用 preflight + rollback 顺序，失败不会先永久拆掉原 selected runtime
+- Dynamic activation 只接受本次启动时间之后的新 heartbeat，不能用 stop 前残留的短期 fresh heartbeat 提前宣布 ready
+- user unit 不再同时声明 `After=default.target` 与 `WantedBy=default.target`；installer 重写 unit 后会 restart 并验证当前 selected mode，而不只 `enable --now`
 - runtime code identity 始终 hash 当前实际 imported package；root helper identity 覆盖 helper.py、actuators/hwp.py、actuators/base.py
 - Net Benefit campaign 是 OPEN/COMPLETE/INVALID 实体；一个有效 Dynamic A1-B1-B2-A2 即可 COMPLETE
 - 两个 Dynamic candidate block 都必须达到 practical saving；只有一个达到时 NEED_MORE_DATA

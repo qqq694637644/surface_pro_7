@@ -39,3 +39,20 @@ def test_fixed_good_runtime_is_a_boot_oneshot_not_a_daemon():
     assert "RemainAfterExit=yes" in unit
     assert "envelope apply-fixed" in unit
     assert "Restart=" not in unit
+
+
+def test_user_units_do_not_order_after_the_target_that_wants_them():
+    root = Path(__file__).resolve().parents[1]
+    for name in ("sp7-powerlab.service.in", "sp7-powerlab-fixed.service.in"):
+        unit = (root / "systemd" / name).read_text(encoding="utf-8")
+        assert "WantedBy=default.target" in unit
+        assert "After=default.target" not in unit
+
+
+def test_user_service_installer_restarts_preserved_runtime_mode():
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "scripts/install-user-services.sh").read_text(encoding="utf-8")
+    assert "restart sp7-powerlab-fixed.service" in script
+    assert "is-active --quiet sp7-powerlab-fixed.service" in script
+    assert "restart sp7-powerlab.service" in script
+    assert "is-active --quiet sp7-powerlab.service" in script

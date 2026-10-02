@@ -212,6 +212,7 @@ def runtime_mode_status(
     return {
         "mode": mode,
         "service_heartbeat_fresh": heartbeat_fresh,
+        "service_heartbeat_ts": heartbeat_ts if heartbeat_fresh else None,
         "configured_automation_level": configured_level,
         "runtime_automation_level": runtime_level,
         "control_state": control_state or None,

@@ -55,9 +55,15 @@ def test_fixed_runtime_audit_proves_live_physical_state(project_root, monkeypatc
             thermal_config=load_thermal_config(project_root),
             calibration_version=int((machine.get("calibration") or {}).get("version") or 0),
         )
+        battery_state = {"identity_hash": "battery-a", "energy_full_wh": 40.0}
+        battery_epoch = db.ensure_battery_epoch(
+            identity_hash="battery-a",
+            energy_full_wh=40.0,
+            payload=dict(battery_state),
+        )
         epoch_id = db.ensure_evidence_epoch(
             hard_identity_hash=hard_hash,
-            battery_epoch=1,
+            battery_epoch=battery_epoch,
             calibration_version=int((machine.get("calibration") or {}).get("version") or 0),
             evidence_semantics_version=int(config.get("evidence.semantics_version", 1)),
             payload={},
@@ -66,6 +72,10 @@ def test_fixed_runtime_audit_proves_live_physical_state(project_root, monkeypatc
         assert epoch and epoch["epoch_id"] == epoch_id
 
         monkeypatch.setattr("sp7_powerlab.runtime_audit.inspect_hardware", lambda **_kwargs: report)
+        monkeypatch.setattr(
+            "sp7_powerlab.runtime_audit.battery_snapshot",
+            lambda _root: dict(battery_state),
+        )
         monkeypatch.setattr(
             "sp7_powerlab.runtime_audit.systemd_user_unit_state",
             lambda unit: (
@@ -238,9 +248,15 @@ def test_fixed_runtime_audit_fails_closed_on_live_physical_drift(project_root, m
             thermal_config=load_thermal_config(project_root),
             calibration_version=int((machine.get("calibration") or {}).get("version") or 0),
         )
+        battery_state = {"identity_hash": "battery-a", "energy_full_wh": 40.0}
+        battery_epoch = db.ensure_battery_epoch(
+            identity_hash="battery-a",
+            energy_full_wh=40.0,
+            payload=dict(battery_state),
+        )
         db.ensure_evidence_epoch(
             hard_identity_hash=hard_hash,
-            battery_epoch=1,
+            battery_epoch=battery_epoch,
             calibration_version=int((machine.get("calibration") or {}).get("version") or 0),
             evidence_semantics_version=int(config.get("evidence.semantics_version", 1)),
             payload={},
@@ -259,6 +275,10 @@ def test_fixed_runtime_audit_fails_closed_on_live_physical_drift(project_root, m
         monkeypatch.setattr(
             "sp7_powerlab.runtime_audit.inspect_hardware",
             lambda **_kwargs: report_state["value"],
+        )
+        monkeypatch.setattr(
+            "sp7_powerlab.runtime_audit.battery_snapshot",
+            lambda _root: dict(battery_state),
         )
         monkeypatch.setattr(
             "sp7_powerlab.runtime_audit.systemd_user_unit_state",
@@ -316,5 +336,20 @@ def test_fixed_runtime_audit_fails_closed_on_live_physical_drift(project_root, m
             fixed_baseline_content_hash=envelope["content_hash"],
         )
         assert "fixed_hwp_state_mismatch" in hwp_drift["reasons"]
+
+        hwp_state["value"] = {
+            "epp": {"policy0": envelope["epp"]},
+            "max_perf_pct": envelope["max_perf_pct"],
+            "turbo": envelope["turbo"],
+        }
+        battery_state["identity_hash"] = "battery-b"
+        battery_drift = audit_fixed_runtime(
+            config,
+            db,
+            evidence_epoch=epoch,
+            fixed_baseline_envelope=envelope["name"],
+            fixed_baseline_content_hash=envelope["content_hash"],
+        )
+        assert "live_battery_identity_mismatch" in battery_drift["reasons"]
     finally:
         db.close()

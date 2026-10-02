@@ -8,7 +8,10 @@ bash scripts/install-user-services.sh
 
 安装用户级 `sp7-powerlab.service` 和最小 `sp7-powerlab-fixed.service` oneshot。旧的 scheduled review
 hourly service/timer 已删除；installer 会停止并移除遗留 unit。fixed oneshot 只有 selected runtime 已经
-切到 FIXED_GOOD 时才 enable；重新运行 installer 会保留此前 Dynamic/Fixed 选择，不会无条件重新启用主 daemon。
+切到 FIXED_GOOD 时才 enable；重新运行 installer 会保留此前 Dynamic/Fixed 选择，并在重写 unit 后
+`restart` 当前 selected runtime、验证它实际 active，避免“unit 文件已更新但旧 daemon/旧 exited oneshot
+仍在运行”。两个 user unit 由 `WantedBy=default.target` 拉入 login transaction，不再反向声明
+`After=default.target`，避免 ordering cycle。
 
 主 service 负责 telemetry、demand、thermal、controller、trial tick、UnexpectedPower
 detection，以及在 automation level 3+ 下受 gate 约束的 Candidate Scheduler。

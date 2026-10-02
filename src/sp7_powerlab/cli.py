@@ -1221,6 +1221,21 @@ def _fixed_good_selection(db: Database) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _dynamic_activation_ready(
+    status: dict[str, Any],
+    *,
+    activation_start_ts: float,
+    expected_code: str,
+    expected_config: str,
+) -> bool:
+    return (
+        status.get("mode") == "DYNAMIC_CONTROLLER"
+        and float(status.get("service_heartbeat_ts") or 0.0) >= activation_start_ts
+        and str(status.get("runtime_code_identity") or "") == expected_code
+        and str(status.get("runtime_config_identity") or "") == expected_config
+    )
+
+
 def _preflight_verified_fixed_envelope(
     config: Any,
     db: Database,
@@ -1414,6 +1429,7 @@ def cmd_envelope_activate_dynamic(args: argparse.Namespace) -> int:
         previous_selection = db.get_meta("fixed_good_selection")
         _systemctl_user("disable", "--now", "sp7-powerlab-fixed.service")
         try:
+            activation_start_ts = time.time()
             _systemctl_user("enable", "--now", "sp7-powerlab.service")
             expected_code = str(dynamic_runtime_code_identity(config).get("aggregate_sha256") or "")
             expected_config = str(dynamic_runtime_config_identity(config).get("identity") or "")
@@ -1423,10 +1439,11 @@ def cmd_envelope_activate_dynamic(args: argparse.Namespace) -> int:
             ready = False
             while time.time() < deadline:
                 status = runtime_mode_status(config, db)
-                if (
-                    status.get("mode") == "DYNAMIC_CONTROLLER"
-                    and str(status.get("runtime_code_identity") or "") == expected_code
-                    and str(status.get("runtime_config_identity") or "") == expected_config
+                if _dynamic_activation_ready(
+                    status,
+                    activation_start_ts=activation_start_ts,
+                    expected_code=expected_code,
+                    expected_config=expected_config,
                 ):
                     ready = True
                     break

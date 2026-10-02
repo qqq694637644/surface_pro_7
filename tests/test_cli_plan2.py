@@ -650,6 +650,28 @@ def test_fixed_good_rejects_stale_heartbeat_if_service_is_actually_active(
         db.close()
 
 
+def test_dynamic_activation_requires_heartbeat_from_this_start():
+    status = {
+        "mode": "DYNAMIC_CONTROLLER",
+        "service_heartbeat_ts": 100.0,
+        "runtime_code_identity": "code-a",
+        "runtime_config_identity": "config-a",
+    }
+    assert not cli_module._dynamic_activation_ready(
+        status,
+        activation_start_ts=101.0,
+        expected_code="code-a",
+        expected_config="config-a",
+    )
+    status["service_heartbeat_ts"] = 101.0
+    assert cli_module._dynamic_activation_ready(
+        status,
+        activation_start_ts=101.0,
+        expected_code="code-a",
+        expected_config="config-a",
+    )
+
+
 def test_production_meter_does_not_expose_evidence_relaxation_or_fake_root_flags():
     parser = meter_cli_module.parser()
     with pytest.raises(SystemExit):

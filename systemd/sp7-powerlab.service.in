@@ -1,6 +1,5 @@
 [Unit]
 Description=Surface Pro 7 PowerLab v2 battery-life controller
-After=default.target
 
 [Service]
 Type=simple
