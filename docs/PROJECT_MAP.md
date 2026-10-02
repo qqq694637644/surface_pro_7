@@ -504,9 +504,10 @@ GPT-5.6 Sol 直接通过 Bash 使用主 CLI、SQLite、日志、sysfs 和源码�
 ### src/sp7_powerlab/runtime_audit.py
 
 FIXED_GOOD 的 one-shot 物理事实审计：main service、legacy scheduled units、thermald、ownership、live hard
-identity、现场 media compatibility、verified fixed baseline 和 actual HWP snapshot。用于 STABLE selected
-fixed policy 时还验证 main daemon 已 disabled、`sp7-powerlab-fixed.service` 已 enabled、持久选择与当前
-evidence epoch/baseline 一致，并要求 oneshot 当前为 `active (exited)`，证明本 session 已成功执行。
+identity、live BAT identity/energy_full 与 battery epoch、现场 media compatibility、verified fixed baseline
+和 actual HWP snapshot。用于 STABLE selected fixed policy 时还验证 main daemon 已 disabled、
+`sp7-powerlab-fixed.service` 已 enabled、持久选择与当前 evidence epoch/baseline 一致，并要求 oneshot
+当前为 `active (exited)`，证明本 session 已成功执行。
 
 ### src/sp7_powerlab/cli.py
 

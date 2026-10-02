@@ -37,7 +37,7 @@ bash scripts/install-root-helper.sh
 
 日常 Git checkout 的修改不会自动变成 root 代码。
 
-因此修改 `helper.py` / `actuators/hwp.py` 或升级包含它们的新提交后，必须重新运行：
+因此修改 `helper.py` / `actuators/base.py` / `actuators/hwp.py` 或升级包含它们的新提交后，必须重新运行：
 
 ~~~bash
 bash scripts/install-root-helper.sh

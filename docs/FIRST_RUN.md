@@ -424,8 +424,11 @@ MONITORING A1-B1-B2-A2。它只进入诊断 history，不决定 campaign 是否 
 
 在进入 STABLE 前，把 runtime 恢复到 recommendation 对应、已经验证过的 policy identity：
 
-- KEEP_DYNAMIC_CONTROLLER：Automation Level 1，main service live，CONTROL_ALLOWED；
-- FIXED_GOOD_ENVELOPE：main service stopped，并确保 actual HWP 是固定 VERIFIED baseline。
+- KEEP_DYNAMIC_CONTROLLER：Automation Level 1，执行 `sp7-powerlab envelope activate-dynamic`，等待 main service
+  进入 fresh Level-1 / CONTROL_ALLOWED 且 loaded code/config identity 匹配；
+- FIXED_GOOD_ENVELOPE：执行 `sp7-powerlab envelope activate-fixed-good`，由命令完成 live hard/battery/helper
+  preflight、应用并回读固定 VERIFIED baseline、disable main daemon，并启用本 session 已成功执行的
+  persistent fixed oneshot。
 
 随后再次运行 readiness。它会同时检查 selected policy fingerprint 和 actual runtime mode。如果只是尚未恢复
 selected mode/config，先 reconcile，不需要自动重做 Stage E。
@@ -446,14 +449,17 @@ sp7-powerlab lifecycle freeze --reason "Stage A-E and current policy net benefit
 
 STABLE 对 Dynamic 校验 selected runtime fingerprint；对 Fixed-good 每次 readiness / agent-context / freeze
 都执行 one-shot live audit：main service inactive、thermald active、无 ownership conflict、live hard identity
-仍匹配 evidence epoch、baseline 仍 VERIFIED/hash 一致、actual HWP 仍匹配 fixed envelope。若 fixed-good 是
-最终 selected runtime，还要求 main service disabled、fixed oneshot enabled 且当前为 active/exited，证明本
-session 已成功应用；enabled 本身不算成功证据。
+和 live BAT identity/energy_full 仍匹配 evidence/battery epoch、现场 media compatibility 仍匹配、baseline
+仍 VERIFIED/hash 一致、actual HWP 仍匹配 fixed envelope。若 fixed-good 是最终 selected runtime，还要求
+main service disabled、fixed oneshot enabled 且当前为 active/exited，证明本 session 已成功应用；enabled
+本身不算成功证据。
 
 进入 STABLE 后：
 
 - KEEP_DYNAMIC_CONTROLLER：main service 继续 core telemetry / drift / UnexpectedPower；
-- FIXED_GOOD_ENVELOPE：main service 可以保持停止，按需运行 observe/agent-context/review-pack；
+- FIXED_GOOD_ENVELOPE：main service 可以保持停止；按需使用 `agent-context` / `lifecycle readiness`
+  检查现场 fixed runtime，用 `review-pack` 读取历史摘要。不要把 daemon 停止前的 `latest_sample` 当成
+  当前实时 telemetry；
 - qualified fixed-good 会保留 freeze 时的 entry coverage，只要 epoch/policy/mode 不变，不因 rolling window 自然过期要求常驻采样；
 - 不部署 scheduled review timer；
 - Scheduler 默认睡眠；
