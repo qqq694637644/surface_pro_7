@@ -7,9 +7,10 @@
 - 当前机器状态：`sp7-powerlab agent-context`
 - 当前成熟度：`docs/PROJECT_STATUS.md`
 - 正式设计合同：`PLAN2.md`
+- Agent 决策纪律：`docs/AI_LOOP.md`
 - 详细操作：`docs/OPERATIONS.md`
 
-AI 首次进入仓库先读根目录 `AGENTS.md`。
+AI 首次进入仓库先读 `AGENTS.md`。
 
 ## 1. 架构导航
 
@@ -34,7 +35,6 @@ BAT / telemetry
   -> Candidate Scheduler
   -> Trial
   -> deterministic Evidence
-  -> VERIFIED / REJECTED / EQUIVALENT / INCONCLUSIVE
 ```
 
 异常链：
@@ -44,13 +44,12 @@ UnexpectedPower / Drift
   -> Investigation
   -> Attribution
   -> verification
-  -> expected / insufficient / regression / actionable waste
 ```
 
 收敛链：
 
 ```text
-Stage D real-usage validation
+Stage D validation
   + Stage E Dynamic vs Fixed-good
   -> StableReadiness
   -> STABLE
@@ -58,9 +57,9 @@ Stage D real-usage validation
 
 详细语义见 `PLAN2.md`。
 
-## 2. 三类 runtime state
+## 2. Runtime state 导航
 
-这三个状态正交，不要压成一个“系统状态”。
+PowerLab 有三类正交状态：
 
 | 状态轴 | 典型状态 | 主要实现 |
 | --- | --- | --- |
@@ -68,24 +67,11 @@ Stage D real-usage validation
 | Learning Lifecycle | CALIBRATING / BASELINE_OBSERVATION / COARSE_OPTIMIZATION / VALIDATING / STABLE / REOPENED | `lifecycle.py`, `longterm.py` |
 | Investigation | open / resolved / classified | `unexpected_power.py`, `attribution.py`, `storage.py` |
 
-当前值看 `agent-context`，不要从 Markdown 推断。
+当前值看 `agent-context`。
 
-## 3. Evidence identity 导航
+Evidence identity 的设计由 `PLAN2.md` 定义；当前 battery/hard/compatibility/envelope/trial/Stage E identity 看 `agent-context` 或 SQLite。
 
-复用历史 evidence 时可能需要检查：
-
-- battery epoch；
-- hard evidence epoch；
-- relevant compatibility generation；
-- envelope content hash；
-- trial `evidence_scope_key`；
-- Stage E contract identity；
-- runtime policy fingerprint；
-- Net Benefit campaign。
-
-这些字段“为什么存在”见 `PLAN2.md`；“当前是什么”看 `agent-context` / SQLite。
-
-## 4. 源码地图
+## 3. 源码地图
 
 | 文件 | 主要职责 |
 | --- | --- |
@@ -118,22 +104,20 @@ Stage D real-usage validation
 | `actuators/hwp.py` | HWP inspect/snapshot/apply/restore |
 | `actuators/base.py` | actuator shared errors/contracts |
 
-修改模块行为前，先从调用方和 tests 确认真实数据流，不要只看文件名猜架构。
+修改模块行为前，从调用方和 tests 确认真实数据流，不要只看文件名猜架构。
 
-## 5. 配置地图
+## 4. 配置地图
 
 | 文件 | 用途 |
 | --- | --- |
-| `config/powerlab.toml` | runtime cadence、automation、evidence、trial、Net Benefit、STABLE 等主配置 |
+| `config/powerlab.toml` | runtime cadence、automation、evidence、trial、Net Benefit、STABLE |
 | `config/machine.toml` | 当前机器 calibration / learned baselines |
 | `config/envelopes.toml` | envelope candidate 定义；不等于 VERIFIED evidence |
-| `config/thermal.toml` | thermal mapping / guardrail 配置 |
+| `config/thermal.toml` | thermal mapping / guardrail |
 
 配置语义属于 `PLAN2.md`；真实运行值同时受 SQLite durable state 和 live OS 状态影响。
 
-## 6. SQLite 事实模型
-
-主要表按领域分组。
+## 5. SQLite 事实模型
 
 ### Telemetry / rollup
 
@@ -172,30 +156,22 @@ Stage D real-usage validation
 - `compatibility_tags`
 - `system_fingerprints`
 
-### Reference / noise
+### Reference / investigation / Stage E
 
 - `reference_baselines`
 - `recent_noise_distributions`
-
-### Investigation
-
 - `investigations`
 - `unexpected_power_events`
-
-### Stage E
-
 - `net_benefit_campaigns`
 - `net_benefit_results`
 - `minimal_meter_runs`
 - `minimal_meter_samples`
 
-### Misc
+其他 durable metadata 存于 `metadata`。
 
-- `metadata`
+SQLite 是 runtime durable truth；高频 runtime DB 不提交 Git。
 
-SQLite 是当前 runtime durable truth，不提交高频 runtime DB 到 Git。
-
-## 7. CLI 导航
+## 6. CLI 导航
 
 顶层命令：
 
@@ -221,87 +197,64 @@ review-pack
 service
 ```
 
-常见问题对应入口：
+常见问题：
 
-| 问题 | 首选命令 |
+| 想知道 / 做什么 | 入口 |
 | --- | --- |
-| 现在整体处于什么状态？ | `sp7-powerlab agent-context` |
-| 硬件是否满足合同？ | `sp7-powerlab doctor` |
-| Control Safety？ | `sp7-powerlab safety status` |
-| 生命周期 / STABLE blocker？ | `sp7-powerlab lifecycle status/readiness/coverage` |
-| Measurement Trust / noise？ | `sp7-powerlab evidence ...` |
-| Scheduler 为什么不能搜索？ | `sp7-powerlab scheduler status` |
-| 有哪些 candidate？ | `sp7-powerlab scheduler candidates <baseline>` |
-| Trial 状态？ | `sp7-powerlab trial status` |
-| 当前 envelope？ | `sp7-powerlab envelope list` |
-| UnexpectedPower？ | `sp7-powerlab unexpected-power list` |
-| Investigation？ | `sp7-powerlab investigation list` |
-| Stage E？ | `sp7-powerlab net-benefit ...` |
-| fixed-good 现场审计？ | `sp7-powerlab fixed audit` / `lifecycle readiness` |
-| 历史摘要？ | `sp7-powerlab review-pack` |
+| 整体当前状态 | `sp7-powerlab agent-context` |
+| 硬件合同 | `sp7-powerlab doctor` |
+| Control Safety | `sp7-powerlab safety status` |
+| lifecycle / STABLE blocker | `sp7-powerlab lifecycle ...` |
+| Measurement Trust / noise | `sp7-powerlab evidence ...` |
+| Scheduler eligibility / candidate | `sp7-powerlab scheduler ...` |
+| Trial | `sp7-powerlab trial ...` |
+| Envelope / final runtime | `sp7-powerlab envelope ...` |
+| UnexpectedPower | `sp7-powerlab unexpected-power ...` |
+| Investigation | `sp7-powerlab investigation ...` |
+| Stage E | `sp7-powerlab net-benefit ...` |
+| fixed-good audit | `sp7-powerlab fixed audit` / `lifecycle readiness` |
+| 历史摘要 | `sp7-powerlab review-pack` |
 
 完整参数和操作顺序以 `--help` 与 `docs/OPERATIONS.md` 为准。
 
-## 8. 常见调查路线
+## 7. 调查导航
 
-### 电池掉得快
+| 问题 | 先看哪里 | 再看哪里 |
+| --- | --- | --- |
+| 电池异常掉电 | `agent-context`、UnexpectedPower | `AI_LOOP.md` 调查纪律、`OPERATIONS.md` §3 |
+| 用户卡顿 | active trial / feedback / PSI | `OPERATIONS.md` §9–10 |
+| 浏览器 / 视频功耗高 | media compatibility、GPU/process attribution | `AI_LOOP.md` 外部事实纪律 |
+| Scheduler blocked | Measurement Trust、Reference/Noise、lifecycle | `OPERATIONS.md` §5–8 |
+| Stage E / STABLE | coverage、campaign、selected runtime、readiness | `OPERATIONS.md` §16–18 |
+| systemd / root helper | `DEPLOYMENT.md` | `doctor` / journal |
 
-1. `agent-context`
-2. Measurement Trust / current evidence context
-3. UnexpectedPower / investigation
-4. review pack 或最小必要 telemetry
-5. attribution：process / browser / GPU / device / wakeup / network / thermal
-6. 只有形成高价值控制假设才进入 Scheduler/Trial
+本文件不复制调查 procedure。
 
-### 用户说卡
+## 8. 文档地图
 
-1. feedback / active trial
-2. PSI、latency、thermal、media continuity
-3. candidate-caused bad outcome 必须保留
-4. 必要时 rollback / reject，不用更低 BAT W 覆盖 UX 失败
-
-### 浏览器 / 视频功耗高
-
-1. media compatibility generation
-2. hardware decode / GPU activity / process attribution
-3. Firefox/Mesa/kernel 外部事实需要可核实来源
-4. 本机是否受影响仍需本机验证
-
-### Stage E / STABLE
-
-1. Stage D representative usage 是否达标
-2. formal campaign 是否 COMPLETE/current
-3. selected runtime 是否已恢复
-4. `lifecycle readiness`
-5. 只有 deterministic readiness ready 才 freeze
-
-详细命令见 `docs/OPERATIONS.md`。
-
-## 9. 文档地图
-
-- `../AGENTS.md`：AI 第一入口、truth hierarchy、不变量
+- `../AGENTS.md`：AI 第一入口、truth hierarchy、硬 contracts
 - `../README.md`：人类 landing page
 - `../PLAN2.md`：正式设计合同
 - `PROJECT_STATUS.md`：软件成熟度 / 真机缺口
-- `AI_LOOP.md`：Agent 调查、实验和长期工作纪律
-- `FIRST_RUN.md`：首次部署 / 新电池唯一 Stage 顺序
+- `AI_LOOP.md`：Agent 每轮决策纪律
+- `FIRST_RUN.md`：首次部署 / 新电池 Stage 顺序
 - `OPERATIONS.md`：唯一详细 runbook
 - `DEPLOYMENT.md`：systemd / root helper / breaking runtime
 
 按任务读，不要机械加载所有文档。
 
-## 10. 什么时候读 PLAN2
+## 9. 什么时候读 PLAN2
 
 涉及以下设计语义时读对应章节：
 
 - Measurement Trust / evidence semantics；
 - trial protocol / Evidence Engine；
 - lifecycle / StableReadiness；
-- Scheduler 搜索空间或 budget；
+- Scheduler search / budget；
 - hard epoch / compatibility；
 - thermal / control safety；
 - Stage E / Net Benefit；
 - actuator / automation level；
 - 新控制维度。
 
-普通 CLI 使用、日志调查或小 bug 优先从本地图和 `OPERATIONS.md` 定位，不需要把整个 PLAN2 塞进上下文。
+普通 CLI 使用、日志调查或小 bug 优先从本地图和 `OPERATIONS.md` 定位。

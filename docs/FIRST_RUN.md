@@ -1,17 +1,17 @@
 # First Run — Surface Pro 7 PowerLab
 
-本文件只负责**第一次部署 / 新电池从空白 evidence 走到 STABLE 的顺序**。
+本文件只负责**第一次部署 / 新电池从空白 evidence 走到 STABLE 的顺序和 checkpoint**。
 
 它不是详细命令手册：
 
-- 当前状态：`sp7-powerlab agent-context`
+- 当前机器事实：`sp7-powerlab agent-context`
 - 详细命令与 recovery：`docs/OPERATIONS.md`
 - systemd / root helper：`docs/DEPLOYMENT.md`
-- 正式设计语义：`PLAN2.md`
+- 设计语义：`PLAN2.md`
 
 不要从本文推断当前机器已经完成哪个 Stage。
 
-## 1. 安装并确认硬件契约
+## 1. 安装并确认硬件合同
 
 安装：
 
@@ -31,43 +31,34 @@ sp7-powerlab doctor
 sp7-powerlab agent-context
 ```
 
-进入真实学习前至少确认：
-
-- Surface Pro 7 / i5-1035G4；
-- intel_pstate active；
-- HWP/EPP 与 Turbo control；
-- BAT、RAPL、package thermal sensor；
-- thermald active；
-- 没有持续冲突 power writer；
-- root helper protocol / implementation identity 匹配。
+进入真实学习前确认目标 SP7、intel_pstate/HWP、BAT、thermal、thermald、ownership 和 root helper 都满足当前合同。
 
 不满足硬件合同可以继续只读调查和软件维护，但不要开始 HWP trial。
 
 ## 2. 新电池先建立新的 battery epoch
 
-更换电池后，先让 main service 产生至少一条属于新电池的 telemetry，再运行：
-
-```bash
-sp7-powerlab calibrate new-battery
-sp7-powerlab agent-context
-```
+更换电池后，先让 main service 产生属于新电池的 telemetry，再按 `OPERATIONS.md` 建立新 battery epoch。
 
 不要拿旧电池最后一条 sample 创建新 epoch，也不要把旧电池 calibration/evidence 直接复用于新电池。
 
-battery epoch 的检查和 recovery 细节见 `docs/OPERATIONS.md`。
+完成后重新运行：
+
+```bash
+sp7-powerlab agent-context
+```
 
 ## 3. Stage A — Measurement Trust + Calibration
 
-### 3.1 先只读收集真实 Discharging
-
-保持默认：
+默认保持：
 
 ```toml
 [automation]
 level = 0
 ```
 
-覆盖真实日常使用：
+### 3.1 收集真实 Discharging
+
+覆盖自然日常使用：
 
 - idle；
 - normal interactive；
@@ -75,20 +66,18 @@ level = 0
 - media；
 - remote work。
 
-不要为了“加速学习”故意持续本地满载。
+不要为了“加速学习”持续本地满载。
 
 ### 3.2 Preliminary Measurement Trust
 
-至少检查：
+检查 BAT gauge 与 Measurement Trust：
 
 ```bash
 sp7-powerlab evidence gauge --hours 6
 sp7-powerlab evidence trust --hours 6
 ```
 
-preliminary READY 要来自真实连续 Discharging consistency，而不是把 Charging/suspend/gap 前后的短片段拼起来。
-
-如果仍 BLOCKED，继续收集真实数据并按 `OPERATIONS.md` 的 Measurement Trust 章节排查；不要进入 candidate search。
+如果仍 BLOCKED，继续收集真实数据并按 `OPERATIONS.md` §5 排查；不要进入 candidate search。
 
 ### 3.3 Calibration
 
@@ -99,15 +88,11 @@ preliminary trust READY 后完成：
 - media；
 - bounded_burst。
 
-具体 start/finish 命令见 `docs/OPERATIONS.md`。
-
-bounded_burst 只用于观察短时行为和热惯性，不是 sustained benchmark。
+具体 start/finish 命令只看 `OPERATIONS.md`。
 
 ### 3.4 重新建立 current-epoch Measurement Trust
 
-Calibration 会改变 hard evidence context，因此 preliminary trust 不能继续授权新的 current epoch。
-
-重新运行：
+Calibration 改变 hard evidence context 后，重新建立 current-epoch trust：
 
 ```bash
 sp7-powerlab evidence gauge --hours 6
@@ -115,22 +100,17 @@ sp7-powerlab evidence trust --hours 6
 sp7-powerlab agent-context
 ```
 
-只有 current-epoch Measurement Trust READY 后才进入 Stage B。
+只有 current-epoch Measurement Trust READY 后进入 Stage B。
 
 ## 4. Stage B — Verified Baseline + Natural Reference / Noise
 
-### 4.1 收编第一条真实 baseline
+第一条 baseline 应来自机器真实 HWP snapshot，不要把候选配置文件里的参数直接宣布 VERIFIED。
 
-不要把 `config/envelopes.toml` 的候选参数直接宣布 VERIFIED。
-
-在 current hardware/calibration/trust/helper 都正常时，从机器真实 HWP snapshot 收编 baseline。常用入口：
+常用入口：
 
 ```bash
 sp7-powerlab envelope adopt-current INTERACTIVE_EFFICIENT   --note "current real HWP baseline"
-sp7-powerlab envelope list
 ```
-
-### 4.2 自然积累 Reference / Noise
 
 继续真实日常使用，观察：
 
@@ -141,15 +121,13 @@ sp7-powerlab lifecycle coverage
 sp7-powerlab agent-context
 ```
 
-此阶段目标不是“快点出 winner”，而是建立可信的自然 baseline/noise。
-
-Reference/Noise 的 clean-discharge、envelope revision 和 compatibility 规则见 `PLAN2.md`；实际排障命令见 `OPERATIONS.md`。
+Stage B 的退出条件不是“等够时间”，而是 current reference/noise 足以支持后续 bounded search。具体 evidence 语义见 `PLAN2.md`。
 
 ## 5. Stage C — Bounded Coarse Search
 
-只有 Stage B 已建立 current reference/noise 且 Scheduler eligible 时才开始。
+只有 Stage B 已有 current reference/noise，且 Scheduler eligible 时才开始。
 
-建议先使用 Level 2：
+建议首次真实学习只使用 Level 2：
 
 ```toml
 [automation]
@@ -162,20 +140,19 @@ auto_promote = false
 ```bash
 sp7-powerlab lifecycle optimize --reason "begin coarse search"
 sp7-powerlab scheduler status
-sp7-powerlab scheduler candidates INTERACTIVE_EFFICIENT
 ```
 
-Level 2 默认只提出 candidate。proposal、trial start/status、promotion、feedback 和 rollback 的唯一详细流程见 `docs/OPERATIONS.md`。
+candidate、trial、feedback、promotion、rollback 的详细命令只看 `OPERATIONS.md` §8–12。
 
-Stage C 接受这些正常终点：
+Stage C 可以正常结束为：
 
-- VERIFIED winner；
-- REJECTED / LOSE；
-- PRACTICALLY_EQUIVALENT；
-- INCONCLUSIVE；
-- 没有 practical headroom 后停止搜索。
+- verified winner；
+- rejection；
+- practical equivalence；
+- inconclusive；
+- 没有 practical headroom。
 
-candidate 自己造成的 thermal / PSI / media / UX 坏结果必须保留。
+不要把“必须找到 winner”当作阶段成功条件。
 
 ## 6. Stage D — Independent Validation + Real-Usage Burn-in
 
@@ -187,54 +164,26 @@ sp7-powerlab lifecycle coverage
 sp7-powerlab lifecycle readiness
 ```
 
-Stage D 要证明的是“真实使用中可持续”，不是先 freeze STABLE。
-
-关注：
+Stage D 验证的是：
 
 - independent revalidation；
-- representative usage；
-- total valid / trusted usage；
-- trusted fraction；
-- distinct usage days；
-- observation span；
-- 当前策略 UX；
+- representative real usage；
+- trusted/valid usage；
+- current-policy UX；
 - unresolved UnexpectedPower / investigation；
 - drift。
 
-此时 readiness 因 `net_benefit_validation_incomplete` 保持 BLOCKED 是正常的，因为 Stage E 尚未完成。
+此时 readiness 因 Stage E 尚未完成而 BLOCKED 是正常的。不要提前 freeze STABLE。
+
+详细 coverage/readiness 操作见 `OPERATIONS.md` §16。
 
 ## 7. Stage E — Dynamic vs Fixed-good
 
-正式 Stage E 只比较：
+Formal Stage E 只回答：
 
-- A = FIXED_GOOD；
-- B = DYNAMIC_CONTROLLER（Automation Level 1）。
+> Level-1 Dynamic 长期运行是否比 verified fixed-good 有可重复的实际净收益？
 
-MONITORING 只在需要解释 observer overhead 时做可选诊断，不参与 formal StableReadiness。
-
-正式实验使用一个 bounded A1-B1-B2-A2 campaign：
-
-```text
-A1  fixed-good
-B1  Dynamic
-B2  Dynamic
-A2  same fixed-good
-```
-
-**不要在 FIRST_RUN 复制完整 meter/runbook。** 按 `docs/OPERATIONS.md` 的 “Stage E — Net Benefit / Complexity Selection” 章节执行，那里是唯一正式命令来源。
-
-Stage E 会验证当前：
-
-- hard/battery/calibration/evidence context；
-- fixed baseline identity；
-- formal cadence / gap / sample floor；
-- runtime policy fingerprint；
-- daemon loaded code/config identity；
-- Stage E contract identity；
-- media compatibility generation；
-- investigation / UnexpectedPower / control-safety contamination；
-- brightness/activity/media/remote/network comparability；
-- reference drift 和 B1/B2 repeatability。
+正式实验、A1-B1-B2-A2 capture、campaign、comparison 和 summary **全部按 `OPERATIONS.md` §17 执行**；本文不复制第二套 procedure 或 contract 字段列表。
 
 可能结论：
 
@@ -242,25 +191,25 @@ Stage E 会验证当前：
 - `FIXED_GOOD_ENVELOPE`
 - `NEED_MORE_DATA`
 
-B1/B2 都达到 practical saving 才保留 Dynamic；只有一个达到时不强行选择。
+MONITORING 只在需要解释 observer overhead 时做可选诊断，不参与 formal StableReadiness。
 
 ## 8. 恢复最终 selected runtime
 
-在检查 STABLE readiness 前，先把机器恢复到 Stage E recommendation 对应的真实 runtime。
+Stage E 得到可执行 recommendation 后，使用正式 runtime 切换命令。
 
-如果选择 Dynamic：
+Dynamic：
 
 ```bash
 sp7-powerlab envelope activate-dynamic
 ```
 
-如果选择 fixed-good：
+Fixed-good：
 
 ```bash
 sp7-powerlab envelope activate-fixed-good
 ```
 
-这些命令负责相应的 live preflight、daemon/oneshot 切换和 identity/readiness 验证；不要用手工 stop/start 替代正式最终切换。
+不要用手工 stop/start 代替最终切换。
 
 然后：
 
@@ -269,7 +218,9 @@ sp7-powerlab agent-context
 sp7-powerlab lifecycle readiness
 ```
 
-## 9. A–E 全部完成后才进入 STABLE
+如果 selected runtime 与 evidence/current physical reality 不一致，先解决 blocker，不要 freeze。
+
+## 9. A–E 完成后才进入 STABLE
 
 只有 deterministic readiness 为 ready 才：
 
@@ -279,11 +230,10 @@ sp7-powerlab lifecycle freeze --reason "Stage A-E and current policy net benefit
 
 进入 STABLE 后：
 
-- Dynamic：main service 保留 core telemetry / drift / UnexpectedPower；
-- Fixed-good：main daemon 保持 disabled，login/reboot 只运行最小 fixed oneshot；
-- 不部署 scheduled Agent review timer；
+- Dynamic：保留 Level-1 core runtime；
+- Fixed-good：main daemon disabled，login/reboot 使用最小 fixed one-shot；
 - Scheduler 默认睡眠；
-- 不主动制造新 trial；
+- 不部署 scheduled Agent review；
 - 正常 Agent 结论应经常是 `NO_CHANGE`。
 
 fixed-good 下按需用 `agent-context` / `lifecycle readiness` 做现场 audit；不要把 daemon 停止前的 `latest_sample` 当成实时 telemetry。
@@ -292,26 +242,18 @@ fixed-good 下按需用 `agent-context` / `lifecycle readiness` 做现场 audit�
 
 Level 3/4 已实现，但尚未经过真实 SP7 长期验证。
 
-首次新电池流程优先证明：
+首次新电池流程优先证明 Level 0–2、Measurement Trust、rollback、thermal preemption、Reference/Noise、independent validation 和 Stage E。
 
-- Measurement Trust；
-- transactional HWP / rollback；
-- thermal preemption；
-- Reference/Noise；
-- independent revalidation；
-- Scheduler stop rules；
-- Stage D usage；
-- Stage E Net Benefit。
-
-真实数据证明 Level 0–2 已可靠、且更高自动化确实有价值后，再决定是否保留/启用 Level 3/4。
+是否保留/启用 Level 3/4 留给真机数据决定。
 
 ## 11. 真机完成前不要声称
 
 在实际新电池 Stage A–E 完成前，不要声称：
 
-- 已找到最优省电参数；
-- 当前 noise/MUE 已充分真机校准；
-- Dynamic Controller 一定省电；
+- 已找到最省电参数；
+- noise/MUE 已充分真机校准；
+- minimum arm duration 已真机确认；
+- Dynamic Controller 一定优于 fixed-good；
 - Level 3/4 已适合长期无人监督。
 
 当前软件成熟度见 `docs/PROJECT_STATUS.md`。
