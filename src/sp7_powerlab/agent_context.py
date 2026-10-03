@@ -70,7 +70,6 @@ def _documentation_context() -> dict[str, str]:
         "project_map": "docs/PROJECT_MAP.md",
         "implementation_status": "docs/PROJECT_STATUS.md",
         "design_contract": "PLAN2.md",
-        "agent_behavior": "docs/LLM_BEHAVIOR.md",
         "first_run": "docs/FIRST_RUN.md",
         "operations": "docs/OPERATIONS.md",
         "deployment": "docs/DEPLOYMENT.md",
