@@ -20,7 +20,7 @@ PowerLab 只针对 Microsoft Surface Pro 7 / Intel Core i5-1035G4 / Linux + inte
 不要为让开发机 `agent-context` 变绿而 reset runtime、伪造机器状态或放宽硬件 gate。
 
 ### 真实 SP7 运维 / 优化
-依次读 `AGENTS.md`、`docs/PROJECT_STATUS.md`，运行 `sp7-powerlab agent-context`，再读 `docs/LLM_BEHAVIOR.md` 和对应 `docs/OPERATIONS.md` / `PLAN2.md`。
+依次读 `AGENTS.md`、`docs/PROJECT_STATUS.md`，运行 `sp7-powerlab agent-context`，再读 `docs/AI_LOOP.md` 和对应 `docs/OPERATIONS.md` / `PLAN2.md`。
 
 ### 首次部署 / 新电池 / 重建证据
 跟随 `docs/FIRST_RUN.md`。
@@ -46,7 +46,7 @@ PowerLab 只针对 Microsoft Surface Pro 7 / Intel Core i5-1035G4 / Linux + inte
 4. `docs/PROJECT_STATUS.md`
 5. `PLAN2.md`
 
-`PROJECT_STATUS.md` 是成熟度快照，不是 live Git 状态。
+`docs/PROJECT_STATUS.md` 是成熟度快照，不是 live Git 状态。
 
 ### 设计合同
 `PLAN2.md` 定义系统应该如何工作。实现、测试、配置和 PLAN2 冲突时，明确判断哪一方需要改变并同步真正受影响内容；不要用 fallback 掩盖语义冲突。
@@ -136,10 +136,9 @@ Automation Level 约束 daemon/Scheduler 默认行为，不是同 UID Agent 的�
 - `docs/PROJECT_MAP.md`：源码 / 数据 / CLI 导航
 - `docs/PROJECT_STATUS.md`：实现成熟度与真机验证缺口
 - `PLAN2.md`：正式设计合同
-- `docs/LLM_BEHAVIOR.md`：调查/实验行为纪律
+- `docs/AI_LOOP.md`：Agent 调查、实验和长期 runtime 闭环
 - `docs/FIRST_RUN.md`：首次部署 / 新电池 Stage A→STABLE
 - `docs/OPERATIONS.md`：已部署系统日常运维
 - `docs/DEPLOYMENT.md`：systemd / root helper / breaking runtime
-- `docs/AI_LOOP.md`：长期 Agent/runtime 闭环
 
 不要用 Markdown 中的旧测试数、旧 commit 或旧 runtime 数字冒充当前事实。

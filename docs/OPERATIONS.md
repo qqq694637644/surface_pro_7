@@ -1,5 +1,8 @@
 # Operations
 
+本文件是已部署 PowerLab 的**唯一详细 runbook**。首次运行顺序看 `FIRST_RUN.md`，设计原因看
+`PLAN2.md`；其他文档不要复制这里的完整命令流程。
+
 本文件描述**已经部署的真实 Surface Pro 7** 的日常运维、调查、实验、Stage D/E validation 和 STABLE 操作。
 
 如果你是 AI，先读根目录 AGENTS.md。纯仓库工程/代码维护不要把本文件当作启动检查单；非 SP7 开发机的 runtime/hardware BLOCKED 也不是仓库维护 blocker。
@@ -579,7 +582,7 @@ bash scripts/quality-gate.sh
 
 AI 调教/调查纪律：
 
-- docs/LLM_BEHAVIOR.md
+- docs/AI_LOOP.md
 
 首次新电池/从零建证据：
 

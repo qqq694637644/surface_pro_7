@@ -7,7 +7,7 @@ PLAN2 是 PowerLab 的正式设计合同。
 - 当前机器事实：运行 `sp7-powerlab agent-context`
 - 当前实现成熟度：`docs/PROJECT_STATUS.md`
 - 源码/CLI 导航：`docs/PROJECT_MAP.md`
-- Agent 行为纪律：`docs/LLM_BEHAVIOR.md`
+- Agent 行为纪律与长期闭环：`docs/AI_LOOP.md`
 
 ---
 
@@ -891,7 +891,7 @@ GPT-5.6 或其他高能力 Agent 可以拥有用户提供的 Bash/workspace/MCP�
 
 Agent 不做实时 DVFS controller。
 
-具体工作纪律见 `docs/LLM_BEHAVIOR.md`。
+具体工作纪律见 `docs/AI_LOOP.md`。
 
 ### 10.2 真正保留的硬边界
 

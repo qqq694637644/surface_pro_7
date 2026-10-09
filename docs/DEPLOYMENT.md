@@ -103,17 +103,11 @@ thermald 不 active 时，自动 trial 禁止，controller 写入降级并记录
 
 doctor 会报告已知冲突。
 
-## 自动化等级
+## 自动化与 Agent
 
-- Level 0：只读。
-- Level 1：只切 verified envelope。
-- Level 2：Scheduler 可以提出 candidate；默认由用户审核后执行 trial / promotion。
-- Level 3：全部 safety/evidence/budget gate 通过后，daemon 可自动开始低风险 trial。
-- Level 4：满足条件且 `auto_promote=true` 时允许 auto-promotion。
+Automation Level 的语义属于设计/运维合同，见 `PLAN2.md` 和 `docs/OPERATIONS.md`；部署层不再复制
+Level 0–4 的定义。
 
-个人设备建议先停留在 0–2，等 Measurement Trust、rollback、thermal preemption、
-independent revalidation 和 stop rules 都经过真机验证后再提高。
-
-个人使用时由 GPT-5.6 Sol 直接通过 Bash/workspace 使用主 CLI、SQLite、journal 和 sysfs；仓库不再维护
+个人使用时由 GPT-5.6 Sol 直接通过 Bash/workspace 使用主 CLI、SQLite、journal 和 sysfs；仓库不维护
 第二套 Agent action DSL。无论 Agent 具有什么用户态能力，root helper 仍只暴露有限 HWP 操作，不提供
 unrestricted root shell。

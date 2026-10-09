@@ -1,355 +1,280 @@
 # AI Loop
 
-PowerLab Agent 是慢速研究、调查、实验、工程维护和复杂度决策层，不是实时 DVFS controller。
+本文件只定义 GPT-5.6 Sol 在 PowerLab 中的**长期决策纪律**：什么时候观察、调查、实验、停止，以及每轮如何最小化上下文。
 
-根目录 AGENTS.md 定义统一入口、事实优先级、Stage A–E、evidence identity 和自治边界。本文件只回答：
+它不重新定义：
 
-> Agent 在不同任务模式下，如何与 PowerLab runtime 形成长期闭环？
+- 任务路由、truth hierarchy、权限和不可绕过 contracts：见 `AGENTS.md`
+- 系统设计和 evidence 语义：见 `PLAN2.md`
+- 第一次运行顺序：见 `docs/FIRST_RUN.md`
+- 具体命令和 recovery：见 `docs/OPERATIONS.md`
 
-## 1. 先判断任务模式
+PowerLab Agent 是慢速研究、调查、实验和工程决策层，不是实时 DVFS controller。
 
-### 1.1 仓库工程 / 代码维护
+## 1. 决策目标
 
-优先：
+总目标：
 
-1. AGENTS.md
-2. docs/PROJECT_STATUS.md
-3. docs/PROJECT_MAP.md
-4. 当前源码 / tests / Git / CI
-5. 设计语义变更时读 PLAN2.md
+> 在保持用户体验、系统稳定和可持续热状态的前提下，提高真实整机净续航。
 
-这类任务**不要求**先把本地 agent-context 变成 healthy。
+Agent 的决策优先级：
 
-在非 SP7 开发机上：
+1. 安全与可恢复；
+2. 测量可信；
+3. 用户体验；
+4. 调查异常功耗；
+5. 续航收益；
+6. 删除没有实际价值的复杂度。
 
-- unsupported hardware；
-- READ_ONLY / UNKNOWN；
-- 本地旧 runtime DB schema mismatch；
+持续本地高负载不是主要目标；适合远程执行的重计算优先移到远程机器。
 
-都可能是正常开发环境现象，不是代码维护 blocker，也不授权 Agent reset runtime 或放宽硬件合同。
+## 2. 最小上下文原则
 
-### 1.2 真实 SP7 运维 / 优化
-
-优先：
-
-1. AGENTS.md
-2. docs/PROJECT_STATUS.md
-3. `sp7-powerlab agent-context`
-4. docs/LLM_BEHAVIOR.md
-5. 按当前问题读 OPERATIONS / FIRST_RUN / PLAN2
-
-### 1.3 首次部署 / 新电池
-
-跟随 docs/FIRST_RUN.md 的 Stage A → B → C → D → E → STABLE 顺序。
-
-## 2. agent-context 是动态摘要，不是万能事实源
-
-真实 SP7 上：
+真实 SP7 运维时先运行：
 
 ```bash
 sp7-powerlab agent-context
 ```
 
-用于快速建立当前机器事实，包括：
+它用于建立当前：
 
-- Git / schema / evidence semantics
-- hardware contract
-- Control Safety
-- Learning Lifecycle
-- Investigation state
-- battery epoch / calibration
-- Measurement Trust
-- current evidence epoch / compatibility
-- current verified envelopes
-- Reference / Noise
-- active trial / investigation
-- Scheduler blockers
-- usage coverage
-- StableReadiness
-- Net Benefit campaign/policy identity
-- current Stage
-- recommended next actions
-- documentation map
+- hardware / Control Safety；
+- battery / evidence context；
+- Measurement Trust / calibration；
+- Reference / Noise；
+- active trial / investigation；
+- Scheduler blockers；
+- usage coverage；
+- Net Benefit / StableReadiness；
+- current Stage 与 next actions。
 
-它应该是**真实 runtime 调教 turn** 的第一动态入口。
-
-它不是：
-
-- 设计合同；
-- 当前实现成熟度报告；
-- destructive action 的批准；
-- 非 SP7 开发机代码维护的 gate。
-
-如果 agent-context 与 Markdown 在实时状态上冲突，以当前 OS/SQLite/CLI 为准；如果是设计语义冲突，回到 PLAN2 + implementation/tests 明确处理。
-
-## 3. review pack 只在需要历史时加载
+只有需要历史趋势时再运行：
 
 ```bash
 sp7-powerlab review-pack
 ```
 
-适用于：
+不要每轮同时加载全部 SQLite、journal、源码、文档和 review pack。
 
-- recent BAT/rollups
-- thermal/demand
-- control actions
-- evidence decisions
-- investigations
-- UnexpectedPower
-- trials
-- feedback
-- rejection memory
-- coverage
-- Net Benefit
-- versions
+如果任务是代码维护而非真实 SP7 运维，按 `AGENTS.md` 的任务路由工作；非 SP7 开发机上的 hardware BLOCKED 不是代码维护 blocker。
 
-不要每轮把全部 SQLite、journal、源码、文档和 review pack 一起塞进模型。
-
-先用 agent-context 定位当前缺口，再读取最小必要历史。
-
-## 4. Agent cadence
+## 3. Agent cadence
 
 ### Event-driven
 
-当出现：
+这些事件值得主动调查：
 
-- UnexpectedPower
-- sustained drift
-- thermal incident
-- user complaint
-- failed trial
-- rollback integrity problem
-- system/software compatibility change
-- current policy identity change
+- UnexpectedPower；
+- sustained drift；
+- thermal incident；
+- user complaint；
+- failed trial / rollback integrity issue；
+- hardware/software compatibility change；
+- current policy identity change。
 
-触发调查或 evidence revalidation。
+### Slow review
 
-### Slow periodic review
-
-用于：
+按需用于：
 
 - 检查长期 drift；
-- 汇总当前 evidence；
-- 判断 Stage D burn-in 是否足够；
-- 判断 Stage E Net Benefit 是否仍代表当前 policy；
+- 汇总 evidence；
+- 判断 Stage D burn-in；
+- 检查 Stage E 是否仍代表当前 policy；
 - 判断是否可以 STABLE；
 - 判断复杂度是否值得保留。
 
+仓库不部署 scheduled Agent review timer。
+
 ### User-driven
 
-用户主动要求：
+用户主动要求研究、解释、实验、代码/config 修改、部署或 review 时再行动。
 
-- 研究
-- 解释
-- 实验
-- 修改代码/配置
-- review
-- 部署/运维
-- 删除复杂度
+## 4. 每轮先问三个问题
 
-仓库不再部署 scheduled review timer。需要慢速复盘时由 Agent 按需运行 `sp7-powerlab review-pack`。
-
-## 5. 每轮先问三个问题
-
-### 5.1 测量可信吗？
+### 测量可信吗？
 
 Measurement Trust 不 READY 时：
 
 - 不把短窗口 BAT W 当成真实收益；
 - 不启动 candidate search；
-- 优先解决 gauge cadence/quantization/integration consistency/minimum duration。
+- 优先解决 gauge cadence、quantization、energy consistency 和 minimum duration；
+- 不用漂亮平均值覆盖 data-quality failure。
 
-### 5.2 当前 evidence identity 兼容吗？
+### 当前 evidence 还能复用吗？
 
-复用任何历史结果前检查：
+复用历史 evidence 前，根据任务确认相关 identity 仍 current，例如：
 
-- battery epoch
-- hard evidence epoch
-- relevant compatibility generation
-- envelope content hash
-- trial evidence_scope_key
-- Stage E runtime policy fingerprint
-- Net Benefit campaign
+- battery / hard evidence context；
+- compatibility generation；
+- envelope content hash；
+- trial evidence scope；
+- Stage E contract / runtime policy identity。
 
-同名对象不能代替 identity 检查。
+具体字段和兼容规则属于 `PLAN2.md`。Agent 不因为“名字一样”就假设兼容。
 
-### 5.3 这是优化问题，还是调查/停止问题？
+### 这是调查、优化，还是应该停止？
 
-优先级：
+默认顺序：
 
 1. Safety / rollback integrity
 2. Measurement Trust
 3. UnexpectedPower / regression investigation
 4. user experience
-5. 使用已有 VERIFIED policy
+5. 使用现有 VERIFIED policy
 6. bounded candidate tuning
 7. complexity deletion / convergence
 
-不要因为“有参数可以调”就把每个问题转成 HWP search。
+不要因为“还有参数可以调”就继续搜索。
 
-## 6. Stage A–E Agent 行为
+## 5. Evidence 使用纪律
 
-### Stage A — Measurement Trust + Calibration
+正式 verdict 由 deterministic Evidence 产生，Agent 不另建一套裁判。
 
-Agent 应帮助：
+Agent 应遵守：
 
-- 建 battery epoch；
-- 观察真实 Discharging；
-- preliminary Measurement Trust；
-- calibration；
-- current-epoch Measurement Trust。
+- BAT 整机放电是主能量证据；
+- RAPL/CPU/GPU/PSI/process attribution 主要用于解释和约束；
+- candidate 自己造成的 thermal / PSI / media / UX 坏结果必须留下；
+- independent revalidation 失败不能被前一阶段的大胜平均掉；
+- data-quality failure 表示无法判定，不自动等于 candidate LOSE；
+- active trial 期间不为了让 candidate 通过而移动 noise/MUE/data-quality/hard-veto 裁判线。
 
-不要提前讨论“最优 envelope”。
+具体 Trial/Evidence contract 见 `PLAN2.md`；具体操作见 `OPERATIONS.md`。
 
-### Stage B — Verified Baseline + Reference / Noise
+## 6. UnexpectedPower 先调查
 
-Agent 应：
+UnexpectedPower 不等于 waste。
 
-- 确认第一条 baseline 来自真实 HWP snapshot；
-- 等待 clean natural rollups；
-- 确认 Reference/Noise 按 envelope content hash 隔离；
-- 判断 noise / MUE 是否足以支持实验。
+发现 UnexpectedPower 或 sustained drift 时：
 
-### Stage C — Bounded Coarse Search
+1. 不直接降低 CPU；
+2. 不直接启动新的 candidate search；
+3. 进入 Investigation；
+4. 优先检查 background process、browser/media acceleration、GPU/device runtime PM、wakeups、network、thermal 和 software regression；
+5. 形成可验证的本机假设；
+6. 只有确认 regression，或形成明确且值得实验的新控制假设时，才 reopen optimization。
 
-Agent 应：
+本机相关性和外部事实分开：
 
-- 看 Scheduler eligibility；
-- 只探索有限邻域；
-- 保留 candidate 造成的坏结果；
-- 接受 equivalent / inconclusive；
-- 没有 practical headroom 时停止。
+- “停止进程 X 后 BAT 下降”可以成为本机假设，但验证前不要写成 confirmed root cause；
+- “某 Firefox/Mesa/kernel 版本有 regression”应使用 upstream issue、release note、commit 或官方文档核实；
+- 外部事实成立不等于本机一定受影响。
 
-### Stage D — Independent Validation + Real-Usage Burn-in
+## 7. Lifecycle posture
 
-Agent 应：
+这里不重复 FIRST_RUN 的操作流程，只定义 Agent 在不同 Stage 的决策姿态。
 
-- 切到 VALIDATING；
-- 收集 representative usage；
-- 看 total valid/trusted seconds；
-- 看 distinct usage days / observation span；
-- 处理用户反馈、UnexpectedPower 和 drift；
-- 不提前 freeze STABLE。
+### Stage A
 
-### Stage E — End-to-End Net Benefit / Complexity Selection
+目标是 Measurement Trust + Calibration。
 
-Agent 应：
+不要提前讨论“最优 envelope”，也不要为了推进 Stage 人为制造 workload。
 
-- 使用同一 bounded OPEN campaign；
-- 正式只运行一次 Dynamic vs Fixed-good A1-B1-B2-A2；
-- 检查 runtime policy fingerprint；
-- 检查 actual runtime mode，并拒绝遗留 scheduled review unit 干扰；
-- 拒绝 Charging/resume/gap 后重连 block；
-- 拒绝跨时间/context/policy 拼接；
-- B1/B2 两个 Dynamic block 都达到 practical saving 才保留 Dynamic；只有一个达到时 NEED_MORE_DATA；
-- MONITORING 仅在需要解释 observer overhead 时另做可选诊断。
+### Stage B
+
+目标是可信的 verified baseline、natural Reference 和 Recent Noise。
+
+noise/reference 不足时接受 Scheduler blocked，不用人为绕过。
+
+### Stage C
+
+只做 bounded search。
+
+接受：
+
+- winner；
+- rejection；
+- practical equivalence；
+- inconclusive；
+- 没有 practical headroom 后停止。
+
+不要因为搜索空间存在就扩大到 continuous EPP、Bayesian Optimization、RL 等更复杂方法。
+
+### Stage D
+
+目标是 independent validation + representative real usage。
+
+关注真实 UX、usage coverage、UnexpectedPower 和 drift；不要提前 freeze STABLE。
+
+### Stage E
+
+目标不是“继续优化”，而是回答：
+
+> Dynamic 这层长期复杂度是否真的比 fixed-good 值得保留？
+
+正式 comparison 和 command sequence 只看 `OPERATIONS.md`；Agent 不重新发明另一套 Stage E procedure。
 
 ### STABLE
 
-只有 deterministic readiness 全部通过后进入。
+正常结果应该经常是：
 
-STABLE 的正常循环是：
+`NO_CHANGE`
 
-```
-agent-context
-  -> no meaningful drift/regression
-  -> NO_CHANGE
-```
+没有 meaningful drift/regression 时不要制造 candidate。只有具体新证据触发时才 reopen。
 
-不是继续制造 candidate。
+## 8. 调参、热和 UX 的行为准则
 
-## 7. UnexpectedPower 闭环
+调参时优先：
 
-```
-UnexpectedPower / Drift
-  -> Investigation
-  -> local attribution
-  -> testable hypothesis
-  -> verification
-  -> classification
-```
+1. 消除确认的异常功耗；
+2. 使用现有 VERIFIED policy；
+3. 在有限邻域做最小必要实验；
+4. UX 全部通过时才接受节能结果；
+5. 没有 practical improvement 就停止。
 
-优先调查：
+热约束下：
 
-- background process
-- browser/media acceleration
-- GPU/device/runtime PM
-- wakeups
-- network
-- thermal
-- software/driver regression
+- 不把 sustained local compute 当常态目标；
+- bounded burst 不用于极限 benchmark；
+- thermal safety 可以抢占任何 trial；
+- 应远程执行的重计算优先远程执行。
 
-只有 confirmed configuration regression 或新的高价值控制假设才 reopen optimization。
+UX 是硬约束。重点看：
 
-外部事实（例如某 kernel/Firefox/Mesa regression）需要可核实来源；本机是否受影响仍需本机验证。
+- interaction latency / 卡顿；
+- PSI；
+- browser input/scroll；
+- remote interaction；
+- media continuity；
+- stability。
 
-## 8. GPT + Bash 直接使用 deterministic contracts
+当前 selected policy 的未解决负面反馈可以 veto；已 reject/rollback 的坏 candidate 不应永久阻塞当前策略。
 
-项目不维护专用 LLM action language。GPT-5.6 Sol 可以直接调用主 CLI、读取 SQLite/journal/sysfs、修改
-仓库代码；但无论使用哪种用户态接口，都不能绕过：
+## 9. Convergence 与 complexity deletion
 
-- thermal safety
-- transactional HWP / read-back / rollback
-- current evidence identity
-- active trial deterministic Evidence contract
-- STABLE readiness
-- explicit authorization for destructive runtime reset
+长期目标是收敛，不是永久调参。
 
-## 9. 不要制造永久忙碌
+出现以下情况时，应认真考虑停止、冻结或删除复杂度：
 
-长期目标是收敛。
-
-如果：
-
-- measurement noise 吃掉 candidate effect；
-- 搜索邻域已耗尽；
+- effect 小于 practical threshold / noise；
+- candidate budget 用尽；
 - candidate 反复 equivalent/inconclusive；
-- dynamic controller 没实际净收益；
-- optional monitoring 诊断表明 observer overhead 接近收益；
-- fixed-good 已足够；
-
-Agent 应建议停止、冻结或删除复杂度。
+- Dynamic 没有可重复净收益；
+- optional monitoring 表明 observer overhead 接近收益；
+- fixed-good 已足够。
 
 正确工程结果包括：
 
-- KEEP_DYNAMIC_CONTROLLER
-- FIXED_GOOD_ENVELOPE
-- NEED_MORE_DATA
-- NO_CHANGE
+- `KEEP_DYNAMIC_CONTROLLER`
+- `FIXED_GOOD_ENVELOPE`
+- `NEED_MORE_DATA`
+- `NO_CHANGE`
 
-“系统越复杂”不是成功指标。
+系统更复杂不是成功指标。
 
-## 10. 工程变更后的 Agent 闭环
+## 10. Agent 输出纪律
 
-Agent 修改以下任何一项时：
+每次汇报优先保留：
 
-- Evidence semantics
-- lifecycle/readiness
-- Stage order
-- evidence identity
-- Agent entry/context
-- schema
-- trial protocol
-- Scheduler
-- control/safety
-- Net Benefit
-- deployment
+- 当前结论；
+- 支撑结论的关键证据；
+- 重要不确定性；
+- 是否来自真实 SP7；
+- 当前 blocker；
+- 下一动作或停止理由。
 
-必须同时检查受影响的：
+删除重复背景、泛泛解释和无关细节，但不要删掉决定行动所需的信息。
 
-- PLAN2
-- AGENTS
-- PROJECT_MAP
-- PROJECT_STATUS
-- FIRST_RUN / OPERATIONS
-- LLM_BEHAVIOR
-- tests
-- agent-context output
+仓库工程修改时遵循 `AGENTS.md` 的工程闭环；不要在本文件维护第二套 contributor workflow。
 
-架构级变更完成后运行：
-
-```bash
-bash scripts/quality-gate.sh
-```
-
-软件测试通过只能说明 SOFTWARE-VALIDATED；不能替代真实 Surface Pro 7 的 Stage A–E evidence。
+SOFTWARE-VALIDATED 不能替代真实 Surface Pro 7 Stage A–E evidence。
